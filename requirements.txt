@@ -1,0 +1,10 @@
+# TTS local (tire torch automatiquement)
+kokoro>=0.9.4
+# Lecture audio (PortAudio)
+sounddevice>=0.5
+# Tableaux audio
+numpy>=1.26
+# Tests
+pytest>=8.0
+# Écriture de WAV pour vérifier la synthèse sans haut-parleur
+soundfile>=0.13

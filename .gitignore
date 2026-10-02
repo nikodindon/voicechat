@@ -1,0 +1,22 @@
+# Environnements virtuels
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+
+# Configuration locale (peut contenir des clés)
+.env
+
+# Audio de travail / conversations
+*.wav
+*.flac
+conversations/
+*.json.log
+
+# Outils
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+build/
+dist/
