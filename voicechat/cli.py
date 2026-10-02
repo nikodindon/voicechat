@@ -7,6 +7,7 @@ import itertools
 import sys
 import threading
 import time
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from . import __version__, store, text as txt
@@ -25,6 +26,7 @@ from .editor import ClavierGeneration, LineEditor
 from .llm import (
     Connexion,
     LLMError,
+    Usage,
     contexte_du_serveur,
     list_models,
     premier_serveur,
@@ -82,7 +84,7 @@ COMMANDES: list[tuple[str, str]] = [
     ("/help", "cette aide"),
     ("/quit", "quitter (alias /exit, /q)"),
     ("/reset", "vide l'historique de conversation"),
-    ("/resume", "compacte les vieux échanges en un résumé (au lieu de les perdre)"),
+    ("/dialogue <A> <B> <sujet>", "deux personas se répondent, chacun avec sa voix"),
     ("/contexte", "où en est le contexte : tokens utilisés, place restante"),
     ("/voice <nom>", "voix Kokoro, ou mélange : « ff_siwis:3+ef_dora:1 » (ex. /voice af_heart)"),
     ("/lang <code>", "langue Kokoro : a en, b en-GB, f fr, e es, i it, p pt, j ja, z zh, h hi"),
@@ -430,12 +432,29 @@ def do_list_voices() -> int:
     return 0
 
 
+@dataclass
+class Tour:
+    """Ce qui vient de se passer pendant un tour de modèle.
+
+    Rassemblé en un objet le jour où le mode dialogue a eu besoin des mêmes informations
+    pour chaque persona : sans ça, `tour_modele` aurait rendu un quintuplet, et chaque
+    appelant aurait dû se souvenir de l'ordre.
+    """
+
+    reponse: str = ""
+    usage: Usage = field(default_factory=Usage)
+    interrompu: bool = False
+    coupee: bool = False
+    erreur: bool = False
+    frappes: str = ""
+
+
 # --------------------------------------------------------------------- la session
 class ChatSession:
     def __init__(self, cfg: Config) -> None:
         self.cfg = cfg
         # Déclarés avant tout le reste : l'application du profil (juste en dessous)
-        # passe par `_reglages_profil`, qui regarde `self.tts` pour savoir si le TTS
+        # passe par `appliquer_reglages`, qui regarde `self.tts` pour savoir si le TTS
         # est déjà chargé. Sans ça, --profil plantait sur un AttributeError.
         self.tts: Synthetiseur | None = None
         self.speaker: Speaker | None = None
@@ -448,7 +467,7 @@ class ChatSession:
                 if not profil.prompt:
                     raise ValueError(f"le profil « {cfg.profil} » ne contient aucun prompt")
                 cfg.system = profil.prompt
-                self._reglages_profil(profil)  # voix / vitesse / langue, si fournis
+                self.appliquer_reglages(profil)  # voix / vitesse / langue, si fournis
                 self.profil = store.nom_fichier(cfg.profil)
             except (FileNotFoundError, ValueError) as exc:
                 print(f"[profil] {exc}")
@@ -553,7 +572,7 @@ class ChatSession:
         self.speech.start()
 
     # ------------------------------------------------------------------ profils
-    def _reglages_profil(self, profil: store.Profil) -> None:
+    def appliquer_reglages(self, profil: store.Profil) -> None:
         """Applique les réglages d'un profil : voix, vitesse, langue.
 
         Au démarrage, le TTS n'existe pas encore : on ne renseigne que la
@@ -582,7 +601,7 @@ class ChatSession:
         profil = store.lire_profil(nom)
         if not profil.prompt:
             raise ValueError(f"le profil « {nom} » ne contient aucun prompt")
-        self._reglages_profil(profil)
+        self.appliquer_reglages(profil)
         self.cfg.system = profil.prompt
         self.messages[0] = {"role": "system", "content": profil.prompt}
         self.profil = store.nom_fichier(nom)
@@ -593,6 +612,41 @@ class ChatSession:
             print(f"  voix    : {decrire_voix(profil.voix)}")
         if profil.vitesse:
             print(f"  vitesse : {profil.vitesse}")
+
+    def _commande_dialogue(self, arg: str) -> None:
+        """``/dialogue <profilA> <profilB> <sujet>`` — deux personas qui se répondent.
+
+        L'import est local : `dialogue.py` a besoin de connaître `ChatSession` pour ses
+        annotations, donc l'importer en haut de ce fichier ferait un cycle.
+        """
+        from .dialogue import Dialogue, Persona
+
+        morceaux = arg.split(maxsplit=2)
+        if len(morceaux) < 3:
+            print("usage : /dialogue <profilA> <profilB> <sujet>")
+            print("  ex.  : /dialogue alice bob le sens de la vie")
+            connus = store.lister_profils()
+            print(f"  profils : {', '.join(connus) if connus else 'aucun'}")
+            print("  (un persona vit dans un profil : /profil save <nom>, avec")
+            print("   « voix: <nom_kokoro> » en en-tête — sinon les deux se ressemblent)")
+            return
+
+        nom_a, nom_b, sujet = morceaux
+        try:
+            a = Persona.charger(nom_a)
+            b = Persona.charger(nom_b)
+        except (FileNotFoundError, ValueError) as exc:
+            print(f"[dialogue] {exc}")
+            return
+
+        dialogue = Dialogue(self, a, b, sujet)
+        dialogue.annoncer()
+        if not dialogue.voix_effectives()[0]:
+            print("  [attention] aucune voix : le dialogue sera muet (--no-tts ?)")
+        print("─" * 60)
+        dialogue.derouler()
+        print("─" * 60)
+        print(f"fin du dialogue : {len(dialogue.repliques)} réplique(s)")
 
     # ------------------------------------------------------------- entrée vocale
     def _assurer_stt(self) -> bool:
@@ -758,6 +812,8 @@ class ChatSession:
             return [c["nom"] for c in store.lister()]
         if commande == "/profil":
             return store.lister_profils() + ["save"]
+        if commande == "/dialogue":
+            return store.lister_profils()
         if commande == "/tts":
             return ["on", "off"]
         if commande == "/lang":
@@ -768,18 +824,48 @@ class ChatSession:
 
     # ------------------------------------------------------------------- un tour
     def ask(self, question: str) -> None:
-        assert self.cfg.model
         self.messages.append({"role": "user", "content": question})
         self._trim_history()
         # Taille de l'historique telle qu'elle part : le serveur va nous en donner le
         # compte exact en tokens, et c'est sur ce couple qu'on s'ancrera ensuite.
         self._ancrage_messages = len(self.messages)
 
+        tour = self.tour_modele(self.messages)
+
+        self._avis_voix_manquante()
+        if tour.usage.prompt_tokens:
+            # Compte exact, donné par le serveur pour la liste qu'on vient d'envoyer :
+            # il servira d'ancrage aux tours suivants.
+            self._ancrage_jetons = tour.usage.prompt_tokens
+        self._avis_contexte(tour.usage)
+        self.frappes = tour.frappes
+        self._maj_stats(tour.usage, tour.interrompu, tour.coupee)
+
+    def tour_modele(
+        self, messages: list[dict], etiquette: str = "ia › ", modele: str | None = None
+    ) -> Tour:
+        """Un tour de modèle : envoie ``messages``, affiche au fil de l'eau, parle.
+
+        Extrait de ``ask()`` le jour où le mode dialogue en a eu besoin pour **chaque
+        persona**. Deux versions de ce chemin finiraient par diverger, et il porte trop de
+        choses pour être écrit deux fois : la bascule de serveur, Échap, la file de la
+        voix, la réponse partielle qu'on garde parce que c'est ce que l'utilisateur a lu.
+
+        Le message entrant doit **déjà** être dans ``messages`` ; la réponse y est ajoutée
+        en cas de succès, et retirée en cas d'échec — on ne garde pas une question sans
+        réponse dans un contexte.
+
+        ``modele`` sert au mode dialogue, où chaque persona peut tourner sur un modèle
+        différent (`modele:` en en-tête de son profil). Sans lui, on garde celui de la
+        session.
+        """
+        modele = modele or self.cfg.model
+        assert modele
         connexion = Connexion()
         flux, usage = stream_with_usage(
             base_url=self.cfg.cibles,
-            model=self.cfg.model,
-            messages=self.messages,
+            model=modele,
+            messages=messages,
             api_key=self.cfg.api_key,
             temperature=self.cfg.temperature,
             timeout=self.cfg.timeout,
@@ -800,7 +886,7 @@ class ChatSession:
             print(f"[réseau] {self.cfg.base_url} n'a pas répondu → réponse de {connexion.url}")
             self.serveur_actif = connexion.url
 
-        print("ia › ", end="", flush=True)
+        print(etiquette, end="", flush=True)
         tampon = ""
         reponse = ""
         interrompu = False
@@ -844,7 +930,7 @@ class ChatSession:
             except LLMError as exc:
                 erreur = True
                 print(f"\n[ERREUR] {exc}")
-                self.messages.pop()  # on retire la question pour garder un contexte propre
+                messages.pop()  # on retire la question pour garder un contexte propre
             finally:
                 reponse = "".join(recus) or reponse
                 # On ne présume pas du type : `stream_with_usage` annonce un itérateur,
@@ -874,17 +960,16 @@ class ChatSession:
 
             # On conserve une réponse partielle : c'est ce que l'utilisateur a lu.
             if reponse.strip() and not erreur:
-                self.messages.append({"role": "assistant", "content": reponse})
+                messages.append({"role": "assistant", "content": reponse})
 
-        self._avis_voix_manquante()
-        if usage.prompt_tokens:
-            # Compte exact, donné par le serveur pour la liste qu'on vient d'envoyer :
-            # il servira d'ancrage aux tours suivants.
-            self._ancrage_jetons = usage.prompt_tokens
-        self._avis_contexte(usage)
-
-        self.frappes = clavier.tampon
-        self._maj_stats(usage, interrompu, coupee)
+        return Tour(
+            reponse=reponse,
+            usage=usage,
+            interrompu=interrompu,
+            coupee=coupee,
+            erreur=erreur,
+            frappes=clavier.tampon,
+        )
 
     def _maj_stats(self, usage, interrompu: bool, coupee: bool) -> None:
         self.last_stats = usage.resume()
@@ -1177,6 +1262,9 @@ class ChatSession:
 
         elif cmd == "/resume":
             self._compacter_contexte()
+
+        elif cmd == "/dialogue":
+            self._commande_dialogue(arg)
 
         elif cmd == "/contexte":
             self._montrer_contexte()

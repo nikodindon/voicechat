@@ -286,7 +286,7 @@ def charger_profil(nom: str) -> str:
 
 # Clés reconnues en en-tête d'un profil. Une clé inconnue n'est pas consommée :
 # elle fait partie du prompt, pour ne jamais perdre de texte par inadvertance.
-_CLES_PROFIL = ("voix", "vitesse", "langue")
+_CLES_PROFIL = ("voix", "vitesse", "langue", "modele")
 _ENTETE_RE = re.compile(r"^\s*([A-Za-z_]+)\s*:\s*(.*)$")
 
 
@@ -306,11 +306,14 @@ class Profil:
     voix: str | None = None
     vitesse: float | None = None
     langue: str | None = None
+    # Modèle à utiliser pour ce persona. Utile au mode dialogue : deux personas peuvent
+    # tourner sur deux modèles différents (un vif et un réfléchi, par exemple).
+    modele: str | None = None
 
 
 def analyser_profil(texte: str) -> Profil:
     """Sépare l'en-tête de réglages du prompt. Fonction pure."""
-    voix = vitesse = langue = None
+    voix = vitesse = langue = modele = None
     lignes = texte.splitlines()
     i = 0
     while i < len(lignes):
@@ -326,6 +329,8 @@ def analyser_profil(texte: str) -> Profil:
             voix = valeur or None
         elif cle == "langue":
             langue = valeur or None
+        elif cle == "modele":
+            modele = valeur or None
         elif cle == "vitesse":
             try:
                 vitesse = float(valeur)
@@ -341,6 +346,7 @@ def analyser_profil(texte: str) -> Profil:
         voix=voix,
         vitesse=vitesse,
         langue=langue,
+        modele=modele,
     )
 
 
@@ -361,6 +367,7 @@ def enregistrer_profil(
     voix: str | None = None,
     vitesse: float | None = None,
     langue: str | None = None,
+    modele: str | None = None,
 ) -> Path:
     """Écrit un profil de prompt système, avec ses réglages en en-tête.
 
@@ -376,6 +383,8 @@ def enregistrer_profil(
         entete += f"voix: {voix}\n"
     if vitesse:
         entete += f"vitesse: {vitesse}\n"
+    if modele:
+        entete += f"modele: {modele}\n"
     if entete:
         entete += "\n"
     chemin = dossier_profils() / f"{nom_fichier(nom)}.md"

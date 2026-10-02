@@ -48,6 +48,7 @@ sur la machine avec laquelle on parle. On ne dépend donc jamais d'un service TT
 | **Interface web** (`--web`) : la conversation dans un navigateur, texte + audio | ✅ implémenté et vérifié (v1.2) — 10 contrôles, audio retranscrit à 100 %, cf. §16 |
 | **Service STT distant** (`--serveur-stt`, `--stt-distant`) : audio → texte | ✅ implémenté et vérifié (v1.3) — boucle texte→audio→texte bouclée, webm/opus accepté, cf. §17 |
 | **Micro dans la page** (parler au lieu de taper) | ✅ implémenté et vérifié (v1.4) — 13 contrôles, webm/opus d'un navigateur, transcription pendant la réponse, cf. §16.6 |
+| **Mode dialogue à deux voix** (`/dialogue alice bob <sujet>`) | ✅ implémenté et vérifié (v1.5) — 7 contrôles, voix relevée à chaque synthèse, cf. §18 |
 | **`--dire` / `--dire-fichier`** : lire un texte sans le LLM | ✅ implémenté et vérifié (v1.1) — par son WAV dans la réserve, cf. §14.1 |
 | **`/cherche <mot>`** dans les conversations sauvées (accents compris) | ✅ implémenté et vérifié (v1.1) — 17 tests, cf. §14.2 |
 | **`/resume`** : compacter les vieux échanges au lieu de les perdre | ✅ implémenté et vérifié (v1.1) — 1,1× à 1,6× selon la densité du texte, cf. §14.3 |
@@ -509,6 +510,7 @@ Trois scripts de vérification bout en bout pilotent le vrai CLI dans un pseudo-
 .venv/bin/python tests/verif_web.py           # page, flux SSE et audio, de bout en bout
 .venv/bin/python tests/verif_stt.py           # service STT : texte → audio → texte
 .venv/bin/python tests/verif_micro.py         # le micro de la page : webm → texte
+.venv/bin/python tests/verif_dialogue.py      # deux personas, deux voix (audio en temps réel)
 .venv/bin/python tests/verif_config.py        # précédence TOML/env/arguments
 ```
 
@@ -616,14 +618,15 @@ meilleur endroit pour les montrer.
       téléphone n'a ni GPU ni Whisper — c'est le poste GPU qui transcrit. Vérifié, y
       compris une transcription **pendant** que le modèle répond (cf. §16.6).
 
-### Deux voix (reporté, assumé)
+### Deux voix — le mode dialogue ✅ (livré en v1.5)
 
-Le « waouh » pour le moins d'effort : la plomberie existe déjà (mélange de voix pondéré,
-voix portée par le profil, réserve d'audio, serveur TTS). Reporté après le web, où ça
-se montrera bien mieux que dans une console.
+Le « waouh » pour le moins d'effort : la plomberie existait déjà (mélange de voix pondéré,
+voix portée par le profil, réserve d'audio, serveur TTS). Reporté après le web, où ça se
+montre bien mieux que dans une console — et c'est là qu'il est arrivé.
 
-- [ ] **Mode dialogue** : deux voix alternées — question/réponse, ou deux personas qui
+- [x] **Mode dialogue** : deux voix alternées — question/réponse, ou deux personas qui
       se relancent. Chaque voix garde son profil (voix, vitesse, prompt, modèle).
+      Vérifié sur un vrai dialogue, voix relevée à chaque synthèse (cf. §18).
 - [ ] **`/enregistre`** : la session entière en un seul fichier audio. La réserve contient
       déjà chaque phrase en WAV, il suffit de les recoller dans l'ordre.
 - [ ] **Voix automatique selon la langue** : Kokoro couvre 8 langues, mais `lang` est figé
@@ -2818,6 +2821,181 @@ dit rien.
 
 ---
 
-## 18. Licence
+## 18. Mode dialogue (v1.5)
+
+Deux personas qui se répondent, chacun avec **sa** voix. Tout le reste existait déjà (les
+profils, la voix portée par le profil, la réserve d'audio) : il ne manquait que l'alternance.
+
+```bash
+/dialogue alice bob Faut-il préférer une réponse courte et sûre, ou longue et incertaine ?
+```
+
+Un persona, c'est un profil — donc rien de neuf à apprendre :
+
+```bash
+# ~/.config/voicechat/profils/alice.md
+voix: ff_siwis
+vitesse: 1.05
+
+Tu es Alice, tu parles en deux phrases courtes, avec des idées nettes et tranchées.
+```
+
+```
+dialogue : alice ↔ bob — 4 réplique(s)
+  alice : voix ff_siwis
+  bob : voix ef_dora
+────────────────────────────────────────────────────────
+alice › La clarté l'emporte toujours sur le bavardage. Un oui ou un non qui tient la
+        route vaut mieux qu'un pavé qui embrouille. Bob, à toi.
+bob › Exactement, un message clair vaut mieux qu'un flot de mots. Comme quand je dis
+      simplement « on se voit demain » plutôt que d'inventer un long discours…
+alice › Exact. Moins de mots, plus de sens. Le silence assumé dit souvent plus…
+bob › C'est vrai, parfois ne rien dire est plus parlant qu'une phrase ratée…
+────────────────────────────────────────────────────────
+fin du dialogue : 4 réplique(s)
+```
+
+Écrire « Bob, à toi. » n'est pas un hasard : Alice sait **à qui** elle parle, et c'est tout
+l'objet de §18.3.
+
+### 18.1 Deux personas, deux histoires
+
+Chaque persona a **sa** liste de messages, où l'autre joue « l'utilisateur ». C'est ce qui
+permet de réutiliser tel quel le chemin normal d'un tour : le modèle voit une conversation
+ordinaire où il tient toujours le même rôle, au lieu d'un historique unique où les rôles
+s'inverseraient à chaque tour.
+
+Alice voit donc : son prompt, la consigne de départ, **sa** réplique, celle de Bob, **sa**
+réplique suivante. Bob, lui, n'a jamais vu la consigne — il entre dans la conversation par
+la première réplique d'Alice.
+
+### 18.2 Le refactor qui a rendu ça possible
+
+`ask()` faisait cent dix lignes : bascule de serveur, Échap, file de la voix, réponse
+partielle conservée. Le mode dialogue avait besoin d'exactement la même chose pour chaque
+persona.
+
+Plutôt que d'écrire une deuxième version de ce chemin — la dette que le README traînait
+déjà pour le client web — il est descendu dans `ChatSession.tour_modele()`, qui rend un
+`Tour` (réponse, tokens, interruption, coupure, frappes). `ask()` fait maintenant trois
+lignes de plus que l'appel, et le dialogue réutilise le tout.
+
+Les vérifications de la console (`verif_interruption`, `verif_completion`) sont passées
+**sans modification** : Ctrl+C coupe toujours tout, Échap ne coupe que la voix, Tab et
+Ctrl+R fonctionnent.
+
+### 18.3 Ce que la vérification a appris sur les prompts — deux fois
+
+Premier essai, chacun sa liste de messages, rien de plus :
+
+```
+bob › Exactement, Bob, je préfère une réponse claire qu'un long flot de mots flous.
+```
+
+Bob **s'appelle Bob** : il lisait la réplique d'Alice sans savoir qu'elle venait d'Alice.
+
+Deuxième essai, le nom de l'auteur en préfixe du message (`alice : …`) : le modèle a
+**imité le format** et commencé ses réponses par son propre nom.
+
+```
+bob › Bob : Compris, je garde mes réponses courtes et claires.
+```
+
+Préfixe qui partait ensuite à la voix — on aurait entendu « Bob, deux points, compris… ».
+
+Troisième version, la bonne : le nom va dans le **prompt système** (« Tu discutes avec
+alice. Réponds-lui directement. »), et le texte des messages reste du texte. Un prompt ne
+donne pas de format à copier.
+
+### 18.4 Le piège qui n'en était pas un
+
+`SpeechPipeline` synthétise dans un thread et lit `tts.voice` au **dépilement**, pas à
+l'empilement. Le raisonnement était donc : changer de voix avec des phrases encore en
+attente ferait dire à une persona les répliques de l'autre. D'où un `speech.wait()` avant
+chaque bascule — présenté comme la ligne maîtresse du module.
+
+**Puis j'ai essayé de le prouver en retirant cette attente : la vérification est passée
+quand même.** Explication : `tour_modele` attend déjà la fin de la voix à la fin de chaque
+tour, donc la file est vide quand on arrive à la bascule. Le vidage est une assurance pour
+les chemins qui ne se terminent pas par une attente (voix coupée, interruption, panne), et
+il ne coûte rien quand la file est vide. Ce n'est pas la pièce maîtresse — la ligne qui
+compte est d'appliquer le profil du persona avant son tour.
+
+Le commentaire du code dit maintenant cela, et pas ce que j'avais supposé.
+
+### 18.5 Le contrôle complice
+
+La première version du contrôle central comparait la voix au moment de la synthèse à la
+voix **en place** au début du tour. Autrement dit : il vérifiait que ce qui est chargé est
+bien ce qui est chargé. En retirant l'application du profil — donc en supprimant tout
+changement de voix — il passait encore au vert.
+
+Il compare maintenant à la voix que **le profil demande** pour ce persona. Validé en
+remettant le bug :
+
+```
+=== contrôles ===  (sans appliquer le profil du persona)
+  OK  le dialogue a produit ses 4 répliques
+  OK  les deux personas alternent
+  KO  chaque phrase est dite par la voix du persona dont c'était le tour
+  KO  les deux voix ont réellement parlé
+```
+
+C'est la même leçon que le bug du verrou web (§16.5) : **une vérification qui ne reproduit
+pas le geste réel valide ce qu'elle veut**. Celle-ci compare désormais à une référence
+extérieure — les profils — et non à l'état qu'elle prétend contrôler.
+
+### 18.6 Vérification
+
+`tests/verif_dialogue.py` : vrai Kokoro sur le GPU, vrai serveur LLM, vrais profils. Une
+seule pièce est remplacée — le haut-parleur — et **pas pour aller plus vite** : il encaisse
+l'audio au lieu de le jouer, mais prend le même temps qu'un vrai.
+
+C'est ce qui rend la mesure utile. Avec un haut-parleur instantané, il ne resterait jamais
+de phrase en file et le défaut recherché (des phrases synthétisées avec la voix du tour
+suivant) resterait invisible. En lisant en temps réel, la file contient toujours quelque
+chose au moment de la bascule — comme dans la vraie vie.
+
+La voix est relevée **à chaque appel de `synth`**, c'est-à-dire là où le thread de synthèse
+la lit réellement, et comparée à la voix que le profil du persona demande.
+
+```
+$ .venv/bin/python tests/verif_dialogue.py
+  voix attendues, d'après les profils : {'alice': 'ff_siwis', 'bob': 'ef_dora'}
+  Kokoro : ff_siwis sur cuda
+  haut-parleur : factice (le son est capturé, pas joué)
+
+alice › La clarté l'emporte toujours sur le bavardage…
+bob › Exactement, un message clair vaut mieux qu'un flot de mots…
+alice › Exact. Moins de mots, plus de sens…
+bob › C'est vrai, parfois ne rien dire est plus parlant qu'une phrase ratée…
+
+  voix qui ont réellement synthétisé : ['ef_dora', 'ff_siwis']
+  phrases synthétisées : 10
+  même phrase, deux voix : corrélation -0.016 (1.000 = identiques)
+
+  audio produit : 30.5 s en 46.3 s (10 tampons)
+  RTF de synthèse : 0.14
+
+=== contrôles ===
+  OK  le dialogue a produit ses 4 répliques
+  OK  les deux personas alternent
+  OK  aucune réplique vide
+  OK  chaque phrase est dite par la voix du persona dont c'était le tour
+  OK  les deux voix ont réellement parlé
+  OK  la session a retrouvé sa voix
+  OK  les deux voix donnent vraiment deux sons
+```
+
+La corrélation de −0,016 entre la même phrase dite par les deux voix est ce qui prouve
+qu'elles sont réellement distinctes : deux voix identiques donneraient 1,000.
+
+Deux choses non mesurées, et dites comme telles : **l'écoute** (la vérification juge la
+voix utilisée, pas si le résultat est agréable — ça, seule une oreille le dit), et le
+**nombre de répliques idéal**, qui dépend entièrement des personas.
+
+---
+
+## 19. Licence
 
 MIT — voir le fichier `LICENSE`. Faire ce qu'on veut, sans garantie.
