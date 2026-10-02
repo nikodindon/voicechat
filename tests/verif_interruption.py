@@ -8,6 +8,7 @@ from __future__ import annotations
 import os
 import pty
 import select
+import socket
 import signal
 import subprocess
 import sys
@@ -16,7 +17,13 @@ from pathlib import Path
 
 PROJ = Path(__file__).resolve().parent.parent
 PY = str(PROJ / ".venv" / "bin" / "python")
-PORT = "8097"
+
+
+def port_libre() -> int:
+    """Un port libre, pour ne pas dépendre d'un numéro fixe déjà occupé par autre chose."""
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return int(s.getsockname()[1])
 
 
 def lire(fd: int, duree: float) -> str:
@@ -44,16 +51,20 @@ def taper(maitre: int, texte: str, delai: float = 0.08) -> None:
 
 
 def main() -> int:
+    port = port_libre()
     serveur = subprocess.Popen(
-        [PY, "tests/fake_llm_server.py", PORT],
+        [PY, "tests/fake_llm_server.py", str(port)],
         cwd=PROJ, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
     )
     time.sleep(1.0)
+    if serveur.poll() is not None:
+        print(f"le faux serveur n'a pas démarré (port {port})")
+        return 2
 
     maitre, esclave = pty.openpty()
     cli = subprocess.Popen(
         [PY, "-m", "voicechat", "--no-tts", "--debug",
-         "--base-url", f"http://127.0.0.1:{PORT}/v1"],
+         "--base-url", f"http://127.0.0.1:{port}/v1"],
         cwd=PROJ, stdin=esclave, stdout=esclave, stderr=subprocess.DEVNULL,
         close_fds=True,
     )

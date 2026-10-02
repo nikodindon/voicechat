@@ -80,10 +80,18 @@ def _jeton(s: str) -> tuple[str | None, str]:
 class LineEditor:
     """Lit un message. Entrée envoie ; un collage ne déclenche jamais rien."""
 
-    def __init__(self, prompt: str = PROMPT, history_limit: int = 200) -> None:
+    def __init__(
+        self,
+        prompt: str = PROMPT,
+        history_limit: int = 200,
+        completeur=None,
+    ) -> None:
         self.prompt = prompt
         self.history: list[str] = []
         self.history_limit = history_limit
+        # callable(texte_avant_curseur) -> list[str], fourni par l'appelant pour la
+        # touche Tab. L'éditeur n'a aucune idée de ce qui est complétable.
+        self.completeur = completeur
         # Passe à True dès qu'un marqueur de collage est vu : à partir de là on peut
         # faire confiance aux marqueurs et ignorer l'heuristique de timing.
         self._balise_paste = False
@@ -111,6 +119,11 @@ class LineEditor:
         en_attente = ""
         precedent = 0.0
         decodeur = codecs.getincrementaldecoder("utf-8")("replace")
+        # recherche incrémentale (Ctrl+R)
+        recherche = False
+        motif = ""
+        depart = 0
+        sauvegarde = ""
 
         try:
             self._mode_brut(fd, ancien)
@@ -121,7 +134,13 @@ class LineEditor:
                 timeout = ESC_TIMEOUT if (en_attente and _est_prefixe(en_attente)) else None
                 pret, _, _ = select.select([fd], [], [], timeout)
                 if not pret:
-                    en_attente = ""  # séquence \x1b incomplète et rien n'arrive
+                    # Séquence \x1b incomplète et rien n'arrive : c'est un Échap seul.
+                    en_attente = ""
+                    if recherche:
+                        recherche = False
+                        buf[:] = list(sauvegarde)
+                        curseur = len(sauvegarde)
+                        self._afficher(buf, curseur)
                     continue
 
                 data = os.read(fd, 4096)
@@ -150,6 +169,47 @@ class LineEditor:
                         self._afficher(buf, curseur)
                         continue
 
+                    # ---------------------------------------- recherche (Ctrl+R)
+                    if recherche:
+                        if jeton == "\x12":  # occurrence plus ancienne
+                            trouve, depart = self._chercher(motif, depart)
+                            if trouve is not None:
+                                buf[:] = list(trouve)
+                                curseur = len(trouve)
+                            self._afficher_recherche(motif, trouve)
+                            continue
+                        if jeton in ("\x07",):  # Ctrl+G : on abandonne
+                            recherche = False
+                            buf[:] = list(sauvegarde)
+                            curseur = len(sauvegarde)
+                            self._afficher(buf, curseur)
+                            continue
+                        if jeton in ("\x7f", "\x08"):  # raccourcit le motif
+                            motif = motif[:-1]
+                            if motif:
+                                trouve, depart = self._chercher(motif, len(self.history))
+                                if trouve is not None:
+                                    buf[:] = list(trouve)
+                                    curseur = len(trouve)
+                                self._afficher_recherche(motif, trouve)
+                            else:
+                                buf[:] = list(sauvegarde)
+                                curseur = len(sauvegarde)
+                                self._afficher_recherche("", None)
+                            continue
+                        if jeton.isprintable():
+                            motif += jeton
+                            trouve, depart = self._chercher(motif, len(self.history))
+                            if trouve is not None:
+                                buf[:] = list(trouve)
+                                curseur = len(trouve)
+                            self._afficher_recherche(motif, trouve)
+                            continue
+                        # Toute autre touche quitte la recherche en gardant le résultat
+                        # trouvé : on retombe sur le traitement normal (Entrée enverra).
+                        recherche = False
+                        self._afficher(buf, curseur)
+
                     # ---------------------------------------------- envoi
                     if jeton in ("\r", "\n"):
                         if collage:
@@ -159,6 +219,20 @@ class LineEditor:
                         else:
                             # Repli : saut de ligne reçu en rafale = collage.
                             curseur = self._inserer(buf, curseur, "\n")
+                        continue
+
+                    # ---------------------------------------------- recherche
+                    if jeton == "\x12":  # Ctrl+R — entrer en recherche
+                        sauvegarde = "".join(buf)
+                        recherche = True
+                        motif = ""
+                        depart = len(self.history)
+                        self._afficher_recherche(motif, None)
+                        continue
+
+                    # ---------------------------------------------- complétion
+                    if jeton == "\t":
+                        curseur = self._completer(buf, curseur)
                         continue
 
                     # ---------------------------------------------- contrôle
@@ -246,6 +320,89 @@ class LineEditor:
             if len(plat) > marge:
                 apercu = apercu.rstrip() + "…"
             sys.stdout.write(f"\r\x1b[J{base}{apercu}  {indication}")
+        sys.stdout.flush()
+
+    # -------------------------------------------------------------- recherche
+    def _chercher(self, motif: str, depart: int) -> tuple[str | None, int]:
+        """Cherche ``motif`` dans l'historique, du plus récent au plus ancien.
+
+        ``depart`` est la borne haute **exclusive** ; il est renvoyé mis à jour avec
+        l'index trouvé, pour que l'appel suivant (encore Ctrl+R) descende plus loin.
+        """
+        if not motif:
+            return None, -1
+        for i in range(min(depart, len(self.history)) - 1, -1, -1):
+            if motif in self.history[i]:
+                return self.history[i], i
+        return None, -1
+
+    def _afficher_recherche(self, motif: str, trouve: str | None) -> None:
+        """Ligne de recherche incrémentale, à la manière de readline."""
+        largeur = shutil.get_terminal_size().columns
+        if trouve is None:
+            contenu = "aucune correspondance" if motif else "tapez pour chercher"
+        else:
+            contenu = " ".join(trouve.split())
+        texte = f"(recherche inversée)«{motif}» : {contenu}"
+        sys.stdout.write(("\r\x1b[J" + texte)[: max(1, largeur - 1)])
+        sys.stdout.flush()
+
+    # -------------------------------------------------------------- complétion
+    def _completer(self, buf: list[str], curseur: int) -> int:
+        """Complète le mot sous le curseur avec les candidats de l'appelant.
+
+        Retourne la nouvelle position du curseur.
+        """
+        if self.completeur is None:
+            return curseur
+
+        avant = "".join(buf[:curseur])
+        # On complète le dernier mot. Pour une commande (« /vo ») il n'y a pas encore
+        # d'espace : le mot est alors tout le texte.
+        debut = avant.rfind(" ") + 1
+        prefixe = avant[debut:]
+        try:
+            propositions = self.completeur(avant)
+        except Exception:  # un completeur défaillant ne doit pas casser la saisie
+            return curseur
+
+        candidats = sorted({c for c in (propositions or []) if c.startswith(prefixe)})
+        if not candidats:
+            return curseur
+
+        if len(candidats) == 1:
+            remplacement = candidats[0]
+            if debut == 0 and not remplacement.endswith(" "):
+                remplacement += " "  # commande complétée : on enchaîne sur l'argument
+        else:
+            commun = os.path.commonprefix(candidats)
+            if len(commun) <= len(prefixe):
+                # Aucun progrès possible : on montre les choix et on redessine.
+                self._afficher_candidats(candidats)
+                self._afficher(buf, curseur)
+                return curseur
+            remplacement = commun
+
+        del buf[debut:curseur]
+        curseur = self._inserer(buf, debut, remplacement)
+        self._afficher(buf, curseur)
+        return curseur
+
+    def _afficher_candidats(self, candidats: list[str]) -> None:
+        """Liste les candidats sur les lignes suivantes, comme le fait readline."""
+        largeur = shutil.get_terminal_size().columns
+        lignes: list[str] = []
+        courant = ""
+        for candidat in candidats:
+            morceau = f"{courant}  {candidat}" if courant else candidat
+            if courant and len(morceau) > largeur - 1:
+                lignes.append(courant)
+                courant = candidat
+            else:
+                courant = morceau
+        if courant:
+            lignes.append(courant)
+        sys.stdout.write("\n" + "\n".join(lignes) + "\n")
         sys.stdout.flush()
 
     # --------------------------------------------------------------- outils

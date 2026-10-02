@@ -63,6 +63,7 @@ class Config:
     temperature: float = 0.7
     max_tokens: int = 0  # 0 = laisser le serveur décider
     timeout: float = 300.0  # un modèle local peut être lent au 1er token
+    profil: str = ""  # profil de prompt système à charger au démarrage
 
     show_stats: bool = False
     history_limit: int = 24  # nb de messages (hors système) gardés en contexte
@@ -79,6 +80,7 @@ class Config:
             speed=_env_float("VOICECHAT_SPEED", 1.0),
             device=_env("VOICECHAT_DEVICE", "auto").lower(),
             tts=_env_bool("VOICECHAT_TTS", True),
+            profil=_env("VOICECHAT_PROFIL"),
         )
 
     def with_overrides(self, **kwargs) -> "Config":

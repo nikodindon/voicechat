@@ -1,15 +1,22 @@
-"""Lecture audio : une file d'attente consommée par un thread dédié.
+"""Lecture audio : un flux de sortie continu, alimenté par une file de tampons.
 
-Pourquoi un thread ? Parce que le son doit continuer à sortir pendant qu'on
-lit la suite du flux LLM. Le thread de lecture est le seul à toucher à la
-carte son, ce qui évite les accès concurrents à PortAudio.
+Pourquoi un flux persistant ? ``sounddevice.play()`` ouvre puis referme un flux à chaque
+appel : sur ce matériel c'est ~10-30 ms de silence entre deux phrases — précisément le
+« trou » que l'on cherche à supprimer. Ici le flux reste ouvert pour toute la session et
+un rappel (callback) tire les échantillons au fil de l'eau : la lecture est continue, et
+il n'y a plus de latence de mise en route à chaque phrase.
+
+Corollaire utile : on sait exactement combien d'échantillons sont sortis, donc « attendre
+la fin de la voix » ne repose plus sur une approximation.
 """
 
 from __future__ import annotations
 
-import queue
 import threading
 import time
+from collections import deque
+
+import numpy as np
 
 try:  # sounddevice est optionnel : sans lui, le mode --no-tts reste utilisable
     import sounddevice as sd
@@ -19,88 +26,139 @@ except Exception as exc:  # pragma: no cover - dépend du système
     sd = None  # type: ignore[assignment]
     _SD_IMPORT_ERROR = str(exc)
 
+BLOCSIZE = 1024  # échantillons par appel du rappel (~43 ms à 24 kHz)
+
 
 class Speaker:
-    """File de tampons audio joués dans l'ordre, un par un."""
+    """Flux de sortie persistant : on empile des tampons, le rappel les joue."""
 
     def __init__(self, samplerate: int = 24000, device: int | str | None = None) -> None:
         self.samplerate = samplerate
         self.device = device
-        self._q: queue.Queue = queue.Queue()
-        self._thread: threading.Thread | None = None
-        self._stop = threading.Event()
-        self._current: object | None = None
-        self._lock = threading.Lock()
-        self.played_s = 0.0
+        self._blocs: deque = deque()
+        self._courant: np.ndarray | None = None
+        self._pos = 0
+        self._verrou = threading.Lock()
+        self._flux = None
+        self._frames_pousses = 0
+        self._frames_joues = 0
+        self._condition = threading.Condition()
         self.last_error: str | None = None
 
     # ---------------------------------------------------------------- cycle de vie
     @property
     def available(self) -> bool:
+        """La bibliothèque audio est-elle présente ?"""
         return sd is not None
 
+    @property
+    def pret(self) -> bool:
+        """Le flux de sortie est-il ouvert et utilisable ?"""
+        return self._flux is not None
+
     def start(self) -> None:
-        if not self.available or self._thread is not None:
+        if sd is None or self._flux is not None:
             return
-        self._stop.clear()
-        self._thread = threading.Thread(target=self._run, name="speaker", daemon=True)
-        self._thread.start()
+        try:
+            self._flux = sd.OutputStream(
+                samplerate=self.samplerate,
+                channels=1,
+                dtype="float32",
+                blocksize=BLOCSIZE,
+                device=self.device,  # type: ignore[arg-type]
+                callback=self._rappel,
+            )
+            self._flux.start()
+        except Exception as exc:
+            self.last_error = f"sortie audio indisponible : {exc}"
+            self._flux = None
 
     def play(self, audio) -> None:
-        """Met un tampon audio en file (retour immédiat)."""
-        if not self.available or audio is None or len(audio) == 0:
+        """Empile un tampon (retour immédiat : c'est le rappel qui le joue)."""
+        if self._flux is None or audio is None:
             return
-        self._q.put(audio)
+        bloc = np.asarray(audio, dtype=np.float32).reshape(-1)
+        if bloc.size == 0:
+            return
+        with self._verrou:
+            self._blocs.append(bloc)
+            self._frames_pousses += bloc.size
+        with self._condition:
+            self._condition.notify_all()
 
     def wait(self) -> None:
-        """Bloque jusqu'à ce que tout ce qui est en file ait été joué."""
-        self._q.join()
+        """Attend que tout ce qui a été empilé soit réellement sorti."""
+        if self._flux is None:
+            return
+        with self._condition:
+            while self._frames_joues < self._frames_pousses:
+                self._condition.wait(timeout=0.1)
+        # Le rappel a livré les échantillons, mais le matériel en garde encore en tampon.
+        try:
+            latence = float(self._flux.latency)
+        except Exception:  # pragma: no cover
+            latence = 0.0
+        if latence > 0:
+            time.sleep(latence)
 
     def flush(self) -> None:
-        """Vide la file et coupe le son en cours (Ctrl+C / nouvelle question)."""
+        """Coupe net : jette la file **et** ce que le matériel a déjà en tampon.
+
+        ``stop()`` laisserait finir ce qui est en mémoire ; ``abort()`` le jette, ce qui
+        est exactement ce qu'on veut pour un Ctrl+C.
+        """
+        with self._verrou:
+            self._blocs.clear()
+            self._courant = None
+            self._pos = 0
+            self._frames_pousses = self._frames_joues
+        if self._flux is None:
+            return
         try:
-            while True:
-                self._q.get_nowait()
-                self._q.task_done()
-        except queue.Empty:
-            pass
-        if sd is not None:
-            try:
-                sd.stop()
-            except Exception:  # pragma: no cover
-                pass
+            self._flux.abort()
+            self._flux.start()  # abort() a terminé le flux : il faut le relancer
+        except Exception as exc:
+            self.last_error = f"coupure audio : {exc}"
 
     def close(self) -> None:
-        self._stop.set()
         self.flush()
-        self._q.put(None)
-        if self._thread is not None:
-            self._thread.join(timeout=3.0)
-            self._thread = None
+        if self._flux is not None:
+            try:
+                self._flux.stop()
+                self._flux.close()
+            except Exception:  # pragma: no cover
+                pass
+            self._flux = None
+
+    @property
+    def played_s(self) -> float:
+        """Durée d'audio réellement sortie sur le périphérique."""
+        return self._frames_joues / self.samplerate
 
     # ------------------------------------------------------------------- interne
-    def _run(self) -> None:
-        assert sd is not None
-        while not self._stop.is_set():
-            item = self._q.get()
-            try:
-                if item is None:
-                    return
-                with self._lock:
-                    self._current = item
-                duree = float(len(item)) / self.samplerate
-                try:
-                    sd.play(item, samplerate=self.samplerate, device=self.device)
-                    sd.wait()
-                    self.played_s += duree
-                except Exception as exc:  # carte son absente, périphérique occupé…
-                    self.last_error = f"lecture audio impossible : {exc}"
-                finally:
-                    with self._lock:
-                        self._current = None
-            finally:
-                self._q.task_done()
-            time.sleep(0)  # laisse respirer le GIL entre deux phrases
+    def _rappel(self, outdata, frames, time_info, status) -> None:  # noqa: ARG002
+        """Appelé par PortAudio : remplit ``outdata`` depuis la file."""
+        ecrit = 0
+        with self._verrou:
+            while ecrit < frames:
+                if self._courant is None:
+                    if not self._blocs:
+                        break
+                    self._courant = self._blocs.popleft()
+                    self._pos = 0
+                prendre = min(self._courant.size - self._pos, frames - ecrit)
+                # outdata est de forme (frames, canaux) ; on ouvre toujours en mono.
+                outdata[ecrit : ecrit + prendre, 0] = self._courant[self._pos : self._pos + prendre]
+                self._pos += prendre
+                ecrit += prendre
+                if self._pos >= self._courant.size:
+                    self._courant = None
+            if ecrit < frames:
+                outdata[ecrit:, 0] = 0.0  # silence si la voix est en retard
+            self._frames_joues += ecrit
+        if ecrit:
+            with self._condition:
+                self._condition.notify_all()
 
     # ------------------------------------------------------------------- debug
     def describe_devices(self) -> str:

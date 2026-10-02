@@ -29,9 +29,13 @@ sur la machine avec laquelle on parle. On ne dépend donc jamais d'un service TT
 | **Tokens et débit réels** (usage + timings du serveur) | ✅ implémenté et vérifié (v0.2) |
 | **Conversations** (`/save`, `/load`, `--continue`) | ✅ implémenté et vérifié (v0.2) |
 | Nom de modèle court à l'affichage | ✅ implémenté et vérifié (v0.2) |
+| **Recherche `Ctrl+R` + complétion `Tab`** | ✅ implémenté et vérifié (v0.3) |
+| **Lecture audio continue** (flux persistant) | ✅ implémenté et vérifié (v0.3) — ~32 ms gagnées par phrase |
+| **Profils de prompt système** (`--profil`, `/profil`) | ✅ implémenté et vérifié (v0.3) |
+| **Export markdown** (`/export`) | ✅ implémenté et vérifié (v0.3) |
 | Sélection GPU `auto/cuda/cpu` | ✅ **GPU opérationnel** — RTF 0,09 (cf. §8 pour l'obligation de build cu126 sur Pascal) |
 | Serveur LLM `100.91.114.49:8080` (niko-1650-super) | ✅ **joignable** — Ornith-1.5-35B-A3B Q4_K_M |
-| Suite de tests hors ligne | ✅ 72 tests passent |
+| Suite de tests hors ligne | ✅ 110 tests passent |
 
 > **Cible réelle du serveur LLM** — `100.91.114.49` = `niko-1650-super` dans le tailnet,
 > llama.cpp exposant une API OpenAI-compatible :
@@ -147,6 +151,8 @@ de commande (l'option gagne). Aucune clé n'est obligatoire : llama.cpp ignore `
 | `VOICECHAT_SYSTEM` | *(court prompt FR)* | prompt système |
 | `VOICECHAT_TTS` | `1` | `0` pour désactiver la voix |
 | `VOICECHAT_DATA` | `~/.local/share/voicechat` | dossier des conversations sauvegardées |
+| `VOICECHAT_PROFILS` | `~/.config/voicechat/profils` | dossier des profils de prompt système |
+| `VOICECHAT_PROFIL` | *(vide)* | profil à charger au démarrage |
 
 ---
 
@@ -167,6 +173,9 @@ de commande (l'option gagne). Aucune clé n'est obligatoire : llama.cpp ignore `
 
 # Reprendre la dernière conversation sauvegardée
 .venv/bin/python -m voicechat --continue
+
+# Charger un profil de prompt système
+.venv/bin/python -m voicechat --profil brain-wash
 
 # Changer de cible (utile pour tester contre un autre llama-server)
 .venv/bin/python -m voicechat --base-url http://192.168.1.32:8080/v1
@@ -191,10 +200,13 @@ de commande (l'option gagne). Aucune clé n'est obligatoire : llama.cpp ignore `
 | `/tts on\|off` | active/coupe la voix |
 | `/model <nom>` | change de modèle pour les tours suivants |
 | `/system <texte>` | remplace le prompt système |
+| `/profil [nom]` | liste les profils, ou en charge un |
+| `/profil save <nom>` | enregistre le prompt système courant comme profil |
 | `/save [nom]` | enregistre la conversation (défaut : `derniere`) |
 | `/load <nom>` | recharge une conversation sauvegardée |
 | `/conversations` | liste les conversations sauvegardées |
 | `/forget <nom>` | supprime une conversation sauvegardée |
+| `/export [fichier]` | écrit la conversation en markdown |
 | `/voices` | liste les voix Kokoro |
 | `/device` | liste les sorties audio détectées |
 | `/stats` | latences (TTFT, débit en tokens, RTF TTS) |
@@ -227,6 +239,33 @@ vous › /load projet
 Un fichier JSON par conversation, écrit de façon atomique (jamais de fichier à moitié
 écrit). Le nom est assaini : `/save ../../etc/passwd` ne peut pas sortir du dossier de
 données. Au lancement, `--continue` reprend la plus récente.
+
+### Profils de prompt système
+
+Un profil est un simple fichier texte dans `~/.config/voicechat/profils/`. Le but : ne plus
+retaper un prompt système long à chaque session.
+
+```bash
+vous › /system Tu réponds en français, en phrases courtes, sans markdown.
+vous › /profil save court        # → ~/.config/voicechat/profils/court.md
+
+# la fois suivante :
+$ voicechat --profil court
+Profil : court
+```
+
+`/profil` seul liste les profils disponibles en marquant celui qui est actif. `/profil <nom>`
+en charge un à chaud (le message système est remplacé immédiatement). `Tab` complète les noms.
+
+### Export markdown
+
+```bash
+vous › /export projet            # → ./projet.md
+exporté : /home/niko/projet.md  (7 messages)
+```
+
+Le fichier contient la date, le modèle, la voix, le prompt système puis les échanges
+alternés en `**Vous**` / `**Assistant**` — directement lisible ou collable ailleurs.
 
 ### Stats de la dernière réponse
 
@@ -264,10 +303,19 @@ prompt:   -> tour 1 : 'Ligne un'
 |---|---|
 | `Entrée` | envoyer le message |
 | `↑` / `↓` | historique des messages |
+| `Ctrl+R` | rechercher dans l'historique — `Ctrl+R` à nouveau remonte plus loin, `Ctrl+G` abandonne |
+| `Tab` | compléter les commandes **et leurs arguments** |
 | `←` / `→` | déplacer le curseur |
 | `Ctrl+U` / `Ctrl+W` | effacer la ligne / le mot précédent |
 | `Ctrl+C` | effacer le brouillon (sur ligne vide : quitter) |
 | `Ctrl+D` | quitter |
+
+La complétion connaît le contexte : `Tab` après `/voice ` propose les voix Kokoro, après
+`/load ` les conversations sauvegardées, après `/profil ` les profils. La liste des
+commandes utilisée par `Tab` est **générée depuis le même tableau que `/help`** : les deux
+ne peuvent pas diverger. Un `Tab` qui n'a qu'un candidat complète et ajoute l'espace ; s'il
+y en a plusieurs, on complète jusqu'au plus long préfixe commun, et un second `Tab` affiche
+les choix.
 
 Un texte collé est résumé à l'écran plutôt que redessiné frappe par frappe :
 
@@ -282,9 +330,9 @@ ligne entière livrée d'un seul bloc (ce que fait un script, pas un clavier) es
 collage, donc son saut de ligne est conservé et il faut refaire `Entrée`. C'est bénin — aucune
 donnée n'est perdue — mais ça explique pourquoi un collage et une frappe ne se ressemblent pas.
 
-**Limites assumées** : pas de `Ctrl+R` (recherche dans l'historique) ; au-delà d'une
-ligne écran le message est résumé au lieu d'être redessiné — l'édition (retour arrière,
-`Ctrl+U`) reste exacte, seul l'affichage est condensé.
+**Limite assumée** : au-delà d'une ligne écran le message est résumé au lieu d'être
+redessiné — l'édition (retour arrière, `Ctrl+U`) reste exacte, seul l'affichage est
+condensé.
 
 En entrée **non** interactive (tube, redirection), le comportement est inchangé : une
 ligne = un message. Un script qui écrit plusieurs lignes attend plusieurs tours de
@@ -305,7 +353,7 @@ voicechat/
 ├── editor.py       # lecture clavier en mode brut : frappe / collage / Entrée
 ├── store.py        # conversations sauvegardées (JSON, écriture atomique)
 └── cli.py          # boucle console, routage des commandes, orchestration
-tests/              # pytest hors ligne + fake_llm_server.py (faux serveur OpenAI)
+tests/              # pytest hors ligne, faux serveur OpenAI, vérifications en pseudo-terminal
 ```
 
 **Pourquoi cette découpe ?** Le pipeline voix doit se déclencher **pendant** la génération,
@@ -315,17 +363,36 @@ donc découpé en phrases au vol (`text.split_sentences`), chaque phrase part da
 `audio.Speaker`. Un seul thread de synthèse → les phrases restent dans l'ordre, et le GPU
 n'est jamais appelé en concurrence.
 
+**Pourquoi un flux audio persistant ?** `sounddevice.play()` ouvre puis referme un flux
+PortAudio à chaque appel, soit ~35 ms de silence **par phrase** — c'est exactement le « trou »
+qu'on entend entre deux phrases. `audio.Speaker` ouvre donc un flux unique pour toute la
+session et le remplit par un rappel (*callback*). Deux bénéfices : plus de latence de mise en
+route, et une comptabilité exacte des échantillons réellement sortis — « attendre la fin de la
+voix » ne repose plus sur une approximation. Le coût de la contrepartie (un flux toujours
+ouvert) est mesuré en §9 : 0,35 % d'un cœur au repos.
+
 ### Tests (sans réseau, sans audio)
 
 ```bash
 .venv/bin/python -m pytest tests/ -q
 ```
 
-Pour valider la v0.1 sans dépendre de `niko-tv`, un faux serveur OpenAI-compatible est fourni :
+Pour valider la v0.1 sans dépendre du serveur distant, un faux serveur OpenAI-compatible
+est fourni :
 
 ```bash
 python3 tests/fake_llm_server.py 8099          # terminal 1
 .venv/bin/python -m voicechat --base-url http://127.0.0.1:8099/v1 --no-tts   # terminal 2
+```
+
+Trois scripts de vérification bout en bout pilotent le vrai CLI dans un pseudo-terminal
+(ils choisissent eux-mêmes un port libre et démarrent leur propre faux serveur) :
+
+```bash
+.venv/bin/python tests/verif_collage.py       # un collage = un seul message
+.venv/bin/python tests/verif_interruption.py  # Ctrl+C / Échap
+.venv/bin/python tests/verif_completion.py    # Tab / Ctrl+R
+.venv/bin/python tests/bench_audio.py         # surcoût de lecture par phrase
 ```
 
 ---
@@ -351,11 +418,11 @@ python3 tests/fake_llm_server.py 8099          # terminal 1
 - [x] `/save`, `/load`, `/conversations`, `/forget` et reprise au lancement (`--continue`)
 - [x] Les frappes faites pendant une réponse sont conservées et rendues au prompt suivant
 
-### v0.3 — confort restant
-- [ ] Historique de saisie : recherche `Ctrl+R` et complétion des `/commandes` (Tab)
-- [ ] Streaming audio par morceaux (moins de trou entre deux phrases)
-- [ ] Profils de prompt système (`--profil brain-wash`) pour ne pas les retaper
-- [ ] Export d'une conversation en markdown
+### v0.3 — confort restant ✅ (ce commit)
+- [x] Historique de saisie : recherche `Ctrl+R` et complétion des `/commandes` (Tab)
+- [x] Streaming audio par morceaux : flux de sortie persistant (plus de trou entre phrases)
+- [x] Profils de prompt système (`--profil`, `/profil`, `/profil save`)
+- [x] Export d'une conversation en markdown (`/export`)
 
 ### v0.4 — entrée vocale (mode mains libres)
 - [ ] Capture micro (`sounddevice`) + VAD (détection d'activité vocale)
@@ -682,15 +749,16 @@ prompt:   -> tour 1 : 'Ligne un'
   -> tour 3 : 'Ligne trois'
 ```
 
-`tests/test_editor.py` verrouille tout ça (25 tests) via de vrais pseudo-terminaux :
+`tests/test_editor.py` verrouille tout ça (39 tests) via de vrais pseudo-terminaux :
 collage balisé, collage non balisé détecté par rafale, frappe lente qui ne doit **pas**
-ressembler à un collage, retours arrière, `Ctrl+U`, historique, Échap pendant une
-génération, et entrée non interactive.
+ressembler à un collage, retours arrière, `Ctrl+U`, historique, recherche `Ctrl+R`,
+complétion `Tab`, Échap pendant une génération, et entrée non interactive.
 
 ```
 $ .venv/bin/python -m pytest tests/ -q
-........................................................................ [100%]
-72 passed in 7.84s
+........................................................................ [ 65%]
+......................................                                   [100%]
+110 passed in 11.85s
 ```
 
 ### Interruption à chaud : vérifiée sur le vrai CLI
@@ -725,6 +793,55 @@ Deux détails volontaires dans ces sorties :
   fermée avant que le serveur n'envoie son bloc `usage`. Le repli fonctionne, il ne ment pas
   en affichant « 0 tok » ;
 - au cas 3, `Fin du message.` est bien présent : `Échap` n'a **pas** entamé la génération.
+
+### Lecture audio : d'où venait le trou entre les phrases
+
+`tests/bench_audio.py` joue 10 tampons d'une seconde et compare les deux méthodes :
+
+```
+$ .venv/bin/python tests/bench_audio.py
+10 tampons de 1 s = 10 s d'audio à jouer
+
+flux persistant   : 10.028 s de temps réel  (surcoût +0.028 s)  |  joué 10.00 s
+sd.play par tampon: 10.352 s de temps réel  (surcoût +0.352 s)
+
+>>> environ 32.4 ms de silence économisées par phrase
+```
+
+Soit ~35 ms de latence d'ouverture de flux **par phrase** avec l'ancienne méthode : c'est
+exactement ce qu'on entendait entre deux phrases. La contrepartie est un flux toujours ouvert,
+dont le coût est mesuré plutôt que supposé :
+
+```
+au repos 10 s, flux ouvert : 35.4 ms de CPU  (0.354 % d'un cœur)
+```
+
+Et la coupure reste nette, ce qui valide `abort()` comme choix pour `Échap`/`Ctrl+C` :
+
+```
+apres flush: joue +0.00 s en 0.6 s (un flux non coupe aurait joue ~0.6 s)
+```
+
+### Ctrl+R et Tab dans le vrai CLI
+
+`tests/verif_completion.py` tape sur un vrai pseudo-terminal, dans l'application complète :
+
+```
+=== 1. Tab complète une commande unique ===
+   écran : vous › /vous › /svous › /savous › /save
+   -> /save
+
+=== 2. Tab s'arrête au plus long préfixe commun ===
+   -> /voice (les deux candidats /voice et /voices partagent ce préfixe)
+
+=== 3. Deux Tab montrent les choix ===
+   -> liste affichée
+
+=== 4. Ctrl+R rappelle un message précédent ===
+   -> message retrouvé et renvoyé
+
+>>> OK : Tab complète, Ctrl+R recherche, dans le vrai CLI
+```
 
 ### Voix disponibles
 

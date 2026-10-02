@@ -316,3 +316,114 @@ def test_clavier_generation_sans_tty_ne_plante_pas(monkeypatch):
     monkeypatch.setattr(sys, "stdin", io.StringIO(""))
     with ClavierGeneration() as clavier:
         assert clavier.sonder() is False
+
+
+# ------------------------------------------------- recherche dans l'historique
+def test_recherche_ctrl_r(pty_env):
+    maitre, _ = pty_env
+    editeur = LineEditor()
+    editeur.history = ["le chat dort", "le chien aboie", "autre chose"]
+    assert jouer(maitre, editeur, [b"\x12", b"chien", b"\r"]) == "le chien aboie"
+
+
+def test_recherche_ctrl_r_descend_vers_le_plus_ancien(pty_env):
+    """Ctrl+R relancé doit trouver une occurrence plus ancienne, pas rester sur place."""
+    maitre, _ = pty_env
+    editeur = LineEditor()
+    editeur.history = ["le chat", "le chien", "le cheval"]
+    assert jouer(maitre, editeur, [b"\x12", b"le ch", b"\x12", b"\r"]) == "le chien"
+
+
+def test_recherche_ctrl_g_restaure_le_brouillon(pty_env):
+    maitre, _ = pty_env
+    editeur = LineEditor()
+    editeur.history = ["trouve moi ca"]
+    assert jouer(maitre, editeur, [b"brouillon", b"\x12", b"trouve", b"\x07", b"\r"]) == "brouillon"
+
+
+def test_recherche_sans_correspondance_laisse_le_brouillon(pty_env):
+    maitre, _ = pty_env
+    editeur = LineEditor()
+    editeur.history = ["quelque chose"]
+    assert jouer(maitre, editeur, [b"abc", b"\x12", b"zzz", b"\r"]) == "abc"
+
+
+def test_recherche_retour_arriere_raccourcit_le_motif(pty_env):
+    maitre, _ = pty_env
+    editeur = LineEditor()
+    editeur.history = ["pomme", "poire"]
+    # « poi » ne trouve rien, mais après un retour arrière « po » trouve « poire »
+    assert jouer(maitre, editeur, [b"\x12", b"poiz", b"\x7f", b"\r"]) == "poire"
+
+
+def test_recherche_historique_vide_ne_plante_pas(pty_env):
+    """Sans historique, la recherche ne trouve rien — comme readline — mais ne casse pas."""
+    maitre, _ = pty_env
+    assert jouer(maitre, LineEditor(), [b"\x12", b"abc", b"\r"]) == ""
+
+
+def test_recherche_motif_vide_naffiche_pas_de_resultat(pty_env):
+    """Ctrl+R seul affiche l'invite de recherche, sans vider le brouillon."""
+    maitre, _ = pty_env
+    editeur = LineEditor()
+    editeur.history = ["quelque chose"]
+    sortie = io.StringIO()
+    assert jouer(maitre, editeur, [b"\x12", b"\x07", b"\r"], sortie=sortie) == ""
+    assert "recherche inversée" in sortie.getvalue()
+
+
+# ------------------------------------------------------------ complétion (Tab)
+def test_completion_commande_unique(pty_env):
+    maitre, _ = pty_env
+    editeur = LineEditor(completeur=lambda t: ["/quit", "/voice"])
+    assert jouer(maitre, editeur, [b"/qu", b"\t", b"\r"]) == "/quit"
+
+
+def test_completion_prefixe_commun(pty_env):
+    """Deux candidats : on complète jusqu'au plus long préfixe commun."""
+    maitre, _ = pty_env
+    editeur = LineEditor(completeur=lambda t: ["/voice", "/voices"])
+    assert jouer(maitre, editeur, [b"/vo", b"\t", b"\r"]) == "/voice"
+
+
+def test_completion_argument(pty_env):
+    maitre, _ = pty_env
+
+    def comp(avant: str) -> list[str]:
+        if avant.startswith("/voice "):
+            return ["af_heart", "ff_siwis", "if_sara"]
+        return ["/voice"]
+
+    editeur = LineEditor(completeur=comp)
+    assert jouer(maitre, editeur, [b"/voice f", b"\t", b"\r"]) == "/voice ff_siwis"
+
+
+def test_completion_sans_candidat_ne_touche_a_rien(pty_env):
+    maitre, _ = pty_env
+    editeur = LineEditor(completeur=lambda t: ["/quit"])
+    assert jouer(maitre, editeur, [b"/xyz", b"\t", b"\r"]) == "/xyz"
+
+
+def test_completion_affiche_les_choix_quand_aucun_progres(pty_env):
+    maitre, _ = pty_env
+    editeur = LineEditor(completeur=lambda t: ["/voice", "/voices"])
+    sortie = io.StringIO()
+    # après la première complétion on est sur « /voice » : Tab ne peut plus avancer
+    jouer(maitre, editeur, [b"/vo", b"\t", b"\t", b"\r"], sortie=sortie)
+    assert "/voices" in sortie.getvalue()
+
+
+def test_completeur_absent_ignore_la_touche_tab(pty_env):
+    maitre, _ = pty_env
+    assert jouer(maitre, LineEditor(), [b"/vo", b"\t", b"\r"]) == "/vo"
+
+
+def test_completeur_en_erreur_ne_casse_pas_la_saisie(pty_env):
+    """Un completeur qui lève ne doit pas faire perdre ce qui est tapé."""
+    maitre, _ = pty_env
+
+    def casse(_: str) -> list[str]:
+        raise RuntimeError("boum")
+
+    editeur = LineEditor(completeur=casse)
+    assert jouer(maitre, editeur, [b"/vo", b"\t", b"\r"]) == "/vo"

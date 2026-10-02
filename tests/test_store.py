@@ -150,3 +150,93 @@ def test_enregistrer_deux_fois_ecrase():
 def test_variable_env_prise_en_compte(tmp_path, monkeypatch):
     monkeypatch.setenv("VOICECHAT_DATA", str(tmp_path / "ailleurs"))
     assert store.dossier() == tmp_path / "ailleurs" / "conversations"
+
+
+# --------------------------------------------------------------------- profils
+@pytest.fixture()
+def profils_isoles(tmp_path, monkeypatch):
+    monkeypatch.setenv("VOICECHAT_PROFILS", str(tmp_path / "profils"))
+
+
+def test_profil_enregistrer_puis_charger(profils_isoles):
+    chemin = store.enregistrer_profil("brain-wash", "Tu réponds en français, court.")
+    assert chemin.exists()
+    assert store.charger_profil("brain-wash") == "Tu réponds en français, court."
+
+
+def test_profil_liste(profils_isoles):
+    store.enregistrer_profil("un", "a")
+    store.enregistrer_profil("deux", "b")
+    assert store.lister_profils() == ["deux", "un"]
+
+
+def test_profil_inexistant(profils_isoles):
+    with pytest.raises(FileNotFoundError, match="aucun profil"):
+        store.charger_profil("jamais-ecrit")
+
+
+def test_profil_vide_refuse(profils_isoles):
+    with pytest.raises(ValueError):
+        store.enregistrer_profil("vide", "   ")
+
+
+def test_profil_txt_accepte(profils_isoles):
+    dossier = store.dossier_profils()
+    dossier.mkdir(parents=True, exist_ok=True)
+    (dossier / "brut.txt").write_text("prompt brut", encoding="utf-8")
+    assert store.lister_profils() == ["brut"]
+    assert store.charger_profil("brut") == "prompt brut"
+
+
+def test_profil_nom_assaini(profils_isoles):
+    chemin = store.enregistrer_profil("../../etc/passwd", "contenu")
+    assert chemin.parent == store.dossier_profils()
+    assert store.lister_profils() == ["etc-passwd"]
+
+
+def test_lister_profils_sans_dossier(profils_isoles):
+    assert store.lister_profils() == []
+
+
+# ---------------------------------------------------------------------- export
+def test_export_markdown(tmp_path):
+    chemin = store.exporter_markdown(
+        MESSAGES, tmp_path / "conv.md", titre="Ma session", modele="m.gguf", voix="ff_siwis"
+    )
+    texte = chemin.read_text(encoding="utf-8")
+    assert texte.startswith("# Ma session")
+    assert "**Modèle** : m.gguf" in texte
+    assert "**Voix** : ff_siwis" in texte
+    assert "## Prompt système" in texte
+    assert "Tu es concis." in texte
+    assert "**Vous**" in texte and "Bonjour" in texte
+    assert "**Assistant**" in texte and "Salut !" in texte
+
+
+def test_export_cree_les_dossiers(tmp_path):
+    chemin = store.exporter_markdown(MESSAGES, tmp_path / "sous" / "dossier" / "conv.md")
+    assert chemin.exists()
+
+
+def test_export_ignore_les_messages_hors_echange(tmp_path):
+    messages = [
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": "question"},
+        {"role": "tool", "content": "résultat technique"},  # rôle non géré
+        {"role": "assistant", "content": "   "},  # vide
+        {"role": "assistant", "content": "réponse"},
+    ]
+    texte = store.exporter_markdown(messages, tmp_path / "c.md").read_text(encoding="utf-8")
+    assert "résultat technique" not in texte
+    assert "question" in texte and "réponse" in texte
+
+
+def test_export_conversation_vide(tmp_path):
+    chemin = store.exporter_markdown([], tmp_path / "vide.md")
+    assert chemin.exists()
+    assert "## Échanges" in chemin.read_text(encoding="utf-8")
+
+
+def test_export_sans_voix_n_affiche_pas_la_ligne(tmp_path):
+    texte = store.exporter_markdown(MESSAGES, tmp_path / "c.md").read_text(encoding="utf-8")
+    assert "**Voix**" not in texte

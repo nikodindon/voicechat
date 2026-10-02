@@ -6,6 +6,7 @@ import argparse
 import sys
 import threading
 import time
+from pathlib import Path
 
 from . import __version__, store, text as txt
 from .audio import Speaker
@@ -22,25 +23,33 @@ BANNER = r"""
     \_/ \___/|_|\___\___||_| |_| |_|\__,_|\__,_|
 """
 
-HELP = """Commandes disponibles :
-  /help              cette aide
-  /quit  /exit  /q   quitter
-  /reset             vide l'historique de conversation
-  /voice <nom>       change la voix Kokoro (ex. /voice af_heart)
-  /lang <code>       change la langue (a en, b en-GB, f fr, e es, i it, p pt, j ja, z zh, h hi)
-  /speed <x>         vitesse de lecture (ex. /speed 1.15)
-  /tts on|off        active ou coupe la voix
-  /model <nom>       change de modèle pour les tours suivants
-  /system <texte>    remplace le prompt système
-  /save [nom]        enregistre la conversation (défaut : derniere)
-  /load <nom>        recharge une conversation sauvegardée
-  /conversations     liste les conversations sauvegardées
-  /forget <nom>      supprime une conversation sauvegardée
-  /voices            liste les voix Kokoro (nécessite Hugging Face)
-  /device            liste les sorties audio détectées
-  /stats             dernières mesures (latence, débit, RTF du TTS)
-  /debug             bascule l'affichage des stats à chaque tour
+# Source unique de vérité : sert à la fois à /help et à la complétion de Tab.
+COMMANDES: list[tuple[str, str]] = [
+    ("/help", "cette aide"),
+    ("/quit", "quitter (alias /exit, /q)"),
+    ("/reset", "vide l'historique de conversation"),
+    ("/voice <nom>", "change la voix Kokoro (ex. /voice af_heart)"),
+    ("/lang <code>", "langue Kokoro : a en, b en-GB, f fr, e es, i it, p pt, j ja, z zh, h hi"),
+    ("/speed <x>", "vitesse de lecture (ex. /speed 1.15)"),
+    ("/tts on|off", "active ou coupe la voix"),
+    ("/model <nom>", "change de modèle pour les tours suivants"),
+    ("/system <texte>", "remplace le prompt système"),
+    ("/profil [nom]", "liste les profils de prompt système, ou en charge un"),
+    ("/profil save <nom>", "enregistre le prompt système courant comme profil"),
+    ("/save [nom]", "enregistre la conversation (défaut : derniere)"),
+    ("/load <nom>", "recharge une conversation sauvegardée"),
+    ("/conversations", "liste les conversations sauvegardées"),
+    ("/forget <nom>", "supprime une conversation sauvegardée"),
+    ("/export [fichier]", "écrit la conversation en markdown"),
+    ("/voices", "liste les voix Kokoro (nécessite Hugging Face)"),
+    ("/device", "liste les sorties audio détectées"),
+    ("/stats", "dernières mesures (latence, débit, RTF du TTS)"),
+    ("/debug", "bascule l'affichage des stats à chaque tour"),
+]
 
+NOMS_COMMANDES: list[str] = sorted({nom.split()[0] for nom, _ in COMMANDES})
+
+_AIDE_CLAVIER = """
 Pendant une réponse :
   Échap              couper la voix, mais garder la réponse à l'écran
   Ctrl+C             tout couper : génération, synthèse et lecture
@@ -51,9 +60,19 @@ Clavier :
                                  tant que vous n'avez pas frappé Entrée
   ⏎ Entrée        envoyer le message
   ↑ / ↓            historique des messages
+  Ctrl+R           rechercher dans l'historique (Ctrl+R à nouveau : plus ancien,
+                   Ctrl+G pour abandonner)
+  Tab              compléter les commandes et leurs arguments
   ← / →            déplacer le curseur · Ctrl+U effacer · Ctrl+W effacer le mot
   Ctrl+C           effacer le brouillon (sur ligne vide : quitter)
   Ctrl+D           quitter"""
+
+HELP = (
+    "Commandes disponibles :\n"
+    + "\n".join(f"  {nom:<20} {aide}" for nom, aide in COMMANDES)
+    + "\n"
+    + _AIDE_CLAVIER
+)
 
 
 
@@ -79,6 +98,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--list-voices", action="store_true", help="lister les voix Kokoro et sortir")
     p.add_argument("--continue", dest="reprendre", action="store_true",
                    help="reprendre la dernière conversation sauvegardée")
+    p.add_argument("--profil", help="profil de prompt système à charger au démarrage")
     p.add_argument("--debug", action="store_true", help="afficher les statistiques à chaque tour")
     p.add_argument("--version", action="version", version=f"voicechat {__version__}")
     return p
@@ -105,6 +125,7 @@ def config_from_args(args: argparse.Namespace) -> Config:
         tts=False if args.no_tts else None,
         temperature=args.temperature,
         timeout=args.timeout,
+        profil=args.profil,
         show_stats=True if args.debug else None,
     )
 
@@ -144,15 +165,24 @@ def do_list_voices() -> int:
 class ChatSession:
     def __init__(self, cfg: Config) -> None:
         self.cfg = cfg
+        self.profil = ""
+        if cfg.profil:  # --profil : le prompt système vient d'un fichier
+            try:
+                cfg.system = store.charger_profil(cfg.profil)
+                self.profil = store.nom_fichier(cfg.profil)
+            except (FileNotFoundError, ValueError) as exc:
+                print(f"[profil] {exc}")
         self.messages: list[dict] = [{"role": "system", "content": cfg.system}]
         self.tts: KokoroTTS | None = None
         self.speaker: Speaker | None = None
         self.speech: SpeechPipeline | None = None
-        self.editor = LineEditor()
+        self.editor = LineEditor(completeur=self._completeur)
         self.last_stats = ""
         self.conversation = ""  # nom de la conversation courante, pour /save
         self.debut = time.time()
         self.frappes = ""  # frappes faites pendant la réponse, rendues au prochain prompt
+        self.modeles: list[str] = []  # noms connus du serveur, pour Tab
+        self._voix: list[str] | None = None  # voix Kokoro, récupérées une seule fois
 
     # ------------------------------------------------------------------ démarrage
     def setup_voice(self) -> None:
@@ -167,6 +197,10 @@ class ChatSession:
             self.cfg.tts = False
             return
         self.speaker.start()
+        if not self.speaker.pret:
+            print(f"Voix   : {self.speaker.last_error} → chat muet")
+            self.cfg.tts = False
+            return
 
         print(f"Voix   : chargement de Kokoro « {cfg.voice} »…")
         self.tts = KokoroTTS(voice=cfg.voice, lang_code=cfg.lang, speed=cfg.speed, device=cfg.device)
@@ -194,9 +228,46 @@ class ChatSession:
             print("[ERREUR] /v1/models ne liste aucun modèle. Passer --model <nom>.")
             return False
         self.cfg.model = modeles[0]
+        self.modeles = list(modeles)
         extra = f" ({len(modeles)} disponibles)" if len(modeles) > 1 else ""
         print(f"Modèle : {nom_court(self.cfg.model)}{extra}")
         return True
+
+    # ------------------------------------------------------------ complétion
+    def _voix_disponibles(self) -> list[str]:
+        """Voix Kokoro, récupérées une seule fois (l'appel passe par le réseau)."""
+        if self._voix is None:
+            try:
+                self._voix = list_voices()
+            except Exception:
+                self._voix = []
+            if not self._voix:  # hors ligne : on reste utile avec la voix courante
+                self._voix = [self.cfg.voice]
+        return self._voix
+
+    def _completeur(self, avant: str) -> list[str]:
+        """Candidats pour la touche Tab, selon ce qui est déjà tapé.
+
+        Appelé par l'éditeur, qui ne sait rien de nos commandes.
+        """
+        if not avant.startswith("/"):
+            return []
+        if " " not in avant:
+            return NOMS_COMMANDES  # on complète le nom de la commande
+        commande = avant.partition(" ")[0]
+        if commande == "/voice":
+            return self._voix_disponibles()
+        if commande in ("/load", "/forget"):
+            return [c["nom"] for c in store.lister()]
+        if commande == "/profil":
+            return store.lister_profils() + ["save"]
+        if commande == "/tts":
+            return ["on", "off"]
+        if commande == "/lang":
+            return ["a", "b", "e", "f", "h", "i", "j", "p", "z"]
+        if commande == "/model":
+            return list(self.modeles)
+        return []
 
     # ------------------------------------------------------------------- un tour
     def ask(self, question: str) -> None:
@@ -458,6 +529,62 @@ class ChatSession:
             else:
                 print(f"aucune conversation nommée « {arg} »")
 
+        elif cmd == "/profil":
+            sous = arg.split(maxsplit=1)
+            if not arg:
+                profils = store.lister_profils()
+                dossier_p = store.dossier_profils()
+                if not profils:
+                    print(f"aucun profil dans {dossier_p}")
+                    print("  créer le courant avec : /profil save <nom>")
+                else:
+                    print(f"profils dans {dossier_p} :")
+                    for nom in profils:
+                        marque = "   ← actif" if nom == self.profil else ""
+                        print(f"  {nom}{marque}")
+
+            elif sous[0] == "save":
+                nom = sous[1].strip() if len(sous) > 1 else ""
+                if not nom:
+                    print("usage : /profil save <nom>")
+                else:
+                    try:
+                        chemin = store.enregistrer_profil(nom, self.cfg.system)
+                    except (ValueError, OSError) as exc:
+                        print(f"échec : {exc}")
+                    else:
+                        self.profil = chemin.stem
+                        print(f"profil « {chemin.stem} » enregistré")
+                        print(f"  {chemin}")
+
+            else:
+                try:
+                    prompt = store.charger_profil(arg)
+                except (FileNotFoundError, ValueError) as exc:
+                    print(f"échec : {exc}")
+                else:
+                    self.cfg.system = prompt
+                    self.profil = store.nom_fichier(arg)
+                    self.messages[0] = {"role": "system", "content": prompt}
+                    print(f"profil « {self.profil} » chargé ({len(prompt)} caractères)")
+
+        elif cmd == "/export":
+            nom_fichier = arg or f"conversation-{time.strftime('%Y%m%d-%H%M')}.md"
+            if not nom_fichier.endswith(".md"):
+                nom_fichier += ".md"
+            try:
+                chemin = store.exporter_markdown(
+                    self.messages,
+                    Path(nom_fichier),
+                    titre=self.conversation or "Conversation",
+                    modele=nom_court(self.cfg.model),
+                    voix=self.cfg.voice if self.cfg.tts else "",
+                )
+            except OSError as exc:
+                print(f"échec de l'export : {exc}")
+            else:
+                print(f"exporté : {chemin}  ({len(self.messages) - 1} messages)")
+
         elif cmd == "/stats":
             print(self.last_stats or "aucune mesure pour l'instant")
 
@@ -478,6 +605,9 @@ class ChatSession:
 
         if not self.resolve_model():
             return 2
+
+        if self.profil:
+            print(f"Profil : {self.profil}")
 
         if reprendre:
             self.reprendre()

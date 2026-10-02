@@ -183,3 +183,81 @@ def supprimer(nom: str) -> bool:
         return True
     except FileNotFoundError:
         return False
+
+
+# --------------------------------------------------------------------- profils
+def dossier_profils() -> Path:
+    """Profils de prompt système : ``$VOICECHAT_PROFILS``, sinon XDG_CONFIG_HOME."""
+    force = os.environ.get("VOICECHAT_PROFILS")
+    if force:
+        return Path(force).expanduser()
+    config = os.environ.get("XDG_CONFIG_HOME")
+    base = Path(config).expanduser() if config else Path.home() / ".config"
+    return base / "voicechat" / "profils"
+
+
+def lister_profils() -> list[str]:
+    """Noms des profils disponibles (fichiers .md ou .txt du dossier des profils)."""
+    dossier_cible = dossier_profils()
+    if not dossier_cible.is_dir():
+        return []
+    trouves = {p.stem for p in dossier_cible.iterdir() if p.suffix in (".md", ".txt")}
+    return sorted(trouves)
+
+
+def charger_profil(nom: str) -> str:
+    """Contenu d'un profil de prompt. Lève FileNotFoundError s'il n'existe pas."""
+    fichier = nom_fichier(nom)
+    dossier_cible = dossier_profils()
+    for extension in (".md", ".txt"):
+        chemin = dossier_cible / f"{fichier}{extension}"
+        if chemin.is_file():
+            return chemin.read_text(encoding="utf-8").strip()
+    raise FileNotFoundError(f"aucun profil « {nom} » dans {dossier_cible}")
+
+
+def enregistrer_profil(nom: str, prompt: str) -> Path:
+    """Écrit un profil de prompt système."""
+    if not prompt.strip():
+        raise ValueError("prompt vide")
+    chemin = dossier_profils() / f"{nom_fichier(nom)}.md"
+    chemin.parent.mkdir(parents=True, exist_ok=True)
+    chemin.write_text(prompt.strip() + "\n", encoding="utf-8")
+    return chemin
+
+
+# ---------------------------------------------------------------------- export
+def exporter_markdown(
+    messages: list[dict],
+    chemin: Path,
+    *,
+    titre: str = "Conversation",
+    modele: str = "",
+    voix: str = "",
+) -> Path:
+    """Écrit la conversation en markdown lisible et retourne le chemin du fichier."""
+    lignes = [f"# {titre}", ""]
+    entetes = [f"- **Date** : {time.strftime('%d/%m/%Y %H:%M', time.localtime())}"]
+    if modele:
+        entetes.append(f"- **Modèle** : {modele}")
+    if voix:
+        entetes.append(f"- **Voix** : {voix}")
+    lignes += entetes + [""]
+
+    systeme = next((m.get("content", "") for m in messages if m.get("role") == "system"), "")
+    if systeme:
+        lignes += ["## Prompt système", "", systeme, "", "---", ""]
+
+    lignes += ["## Échanges", ""]
+    for message in messages:
+        role = message.get("role")
+        contenu = (message.get("content") or "").strip()
+        if not contenu or role not in ("user", "assistant"):
+            continue
+        lignes += ["**Vous**" if role == "user" else "**Assistant**", "", contenu, ""]
+
+    chemin = Path(chemin).expanduser()
+    if chemin.parent != Path(""):
+        chemin.parent.mkdir(parents=True, exist_ok=True)
+    chemin.write_text("\n".join(lignes).rstrip() + "\n", encoding="utf-8")
+    return chemin
