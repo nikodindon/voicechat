@@ -44,11 +44,25 @@ BANNER = r"""
     \_/ \___/|_|\___\___||_| |_| |_|\__,_|\__,_|
 """
 
+# Consigne donnée au modèle quand on lui demande de compacter l'historique (/resume).
+# Elle insiste sur « n'invente rien » : un résumé qui brode ferait entrer dans le
+# contexte des faits que l'utilisateur n'a jamais dits, et le modèle les tiendrait
+# ensuite pour vrais.
+PROMPT_RESUME = (
+    "Tu résumes une conversation pour en garder la mémoire. Écris en français, à la "
+    "troisième personne, en paragraphes continus — sans titres, sans listes à puces, "
+    "sans gras : ces artifices consomment des tokens sans rien apprendre. Conserve : "
+    "les sujets abordés, les décisions prises, les préférences exprimées, les noms "
+    "propres et les faits techniques (chiffres, chemins, versions). Sois dense et "
+    "factuel. N'invente rien — ce qui n'a pas été dit ne doit pas apparaître."
+)
+
 # Source unique de vérité : sert à la fois à /help et à la complétion de Tab.
 COMMANDES: list[tuple[str, str]] = [
     ("/help", "cette aide"),
     ("/quit", "quitter (alias /exit, /q)"),
     ("/reset", "vide l'historique de conversation"),
+    ("/resume", "compacte les vieux échanges en un résumé (au lieu de les perdre)"),
     ("/voice <nom>", "voix Kokoro, ou mélange : « ff_siwis:3+ef_dora:1 » (ex. /voice af_heart)"),
     ("/lang <code>", "langue Kokoro : a en, b en-GB, f fr, e es, i it, p pt, j ja, z zh, h hi"),
     ("/speed <x>", "vitesse de lecture (ex. /speed 1.15)"),
@@ -60,6 +74,7 @@ COMMANDES: list[tuple[str, str]] = [
     ("/save [nom]", "enregistre la conversation (défaut : derniere)"),
     ("/load <nom>", "recharge une conversation sauvegardée"),
     ("/conversations", "liste les conversations sauvegardées"),
+    ("/cherche <mot>", "cherche un passage dans les conversations sauvegardées (insensible aux accents)"),
     ("/forget <nom>", "supprime une conversation sauvegardée"),
     ("/export [fichier]", "écrit la conversation en markdown"),
     ("/voices", "liste les voix Kokoro (nécessite Hugging Face)"),
@@ -150,6 +165,12 @@ def build_parser() -> argparse.ArgumentParser:
                    help="transcrire un fichier audio et sortir (pas de conversation)")
     p.add_argument("--diag-micro", action="store_true",
                    help="contrôler le micro (niveau, saturation, réaction du VAD) et sortir")
+    p.add_argument("--dire", metavar="TEXTE",
+                   help="lire un texte à voix haute sans le LLM, puis sortir")
+    p.add_argument("--dire-fichier", metavar="FICHIER",
+                   help="lire un fichier texte à voix haute, puis sortir")
+    p.add_argument("-q", "--question", metavar="TEXTE",
+                   help="poser une seule question, répondre et sortir (mode scriptable)")
     p.add_argument("--debug", action="store_true", help="afficher les statistiques à chaque tour")
     p.add_argument("--version", action="version", version=f"voicechat {__version__}")
     return p
@@ -386,6 +407,9 @@ class ChatSession:
         self.ecouteur: Ecouteur | None = None
         self._stt_indisponible = False
         self.mains_libres = cfg.micro
+        # Un seul avertissement par « vague » d'oublis : sinon l'historique plein
+        # répéterait le même message à chaque tour.
+        self._oubli_signale = False
 
     # ------------------------------------------------------------------ démarrage
     def setup_voice(self) -> None:
@@ -794,10 +818,108 @@ class ChatSession:
             self.speech.say(phrase)
 
     def _trim_history(self) -> None:
-        """Garde le message système + les N derniers messages."""
+        """Garde le message système + les N derniers messages.
+
+        Ce qui sort n'est pas résumé, seulement jeté : c'est pourquoi on le **dit**.
+        Un historique qui rétrécit en silence donne l'impression que le modèle devient
+        bête, alors qu'il a simplement cessé de recevoir le début.
+        """
         limite = max(2, self.cfg.history_limit)
         if len(self.messages) > limite + 1:
+            oublies = len(self.messages) - limite - 1
             self.messages = [self.messages[0]] + self.messages[-limite:]
+            if not self._oubli_signale:
+                self._oubli_signale = True
+                print(
+                    f"\n[contexte] {oublies} message(s) ancien(s) ne sont plus envoyés "
+                    f"(limite : {limite})."
+                )
+                print("           /resume pour les compacter en un résumé, au lieu de les perdre.")
+
+    def _compacter_contexte(self) -> bool:
+        """Remplace les échanges anciens par un résumé produit par le modèle.
+
+        Ce qu'on garde intact : le prompt système et le dernier échange (question +
+        réponse). Tout le reste part dans un résumé qui prend la place des messages
+        d'origine. Si le modèle échoue, l'historique n'est **pas** touché — mieux vaut
+        un contexte long qu'un contexte perdu.
+        """
+        anciens = self.messages[1:]
+        if len(anciens) <= 2:
+            print("[contexte] rien à compacter : la conversation est trop courte")
+            return False
+
+        gardes = anciens[-2:]
+        a_resumer = anciens[:-2]
+        conversation = "\n\n".join(
+            f"{'Utilisateur' if m.get('role') == 'user' else 'Assistant'} : {m.get('content', '')}"
+            for m in a_resumer
+        )
+        print(f"[contexte] compactage de {len(a_resumer)} message(s)…")
+
+        # Plafond de longueur. Il borne la durée de l'appel sur un long historique, mais
+        # il ne doit pas couper le résumé en pleine phrase : un résumé tronqué perd
+        # justement ce qu'on cherche à garder.
+        #
+        # Mesures sur ce modèle (Ornith-1.5-35B) : sur un échange technique de 1572
+        # caractères, il produit un résumé de 1001 caractères (1,6x) et s'arrête au
+        # plafond s'il est trop bas — d'où un plancher généreux. Ce modèle n'est pas
+        # compressif : mieux vaut un résumé un peu long qu'un résumé amputé.
+        plafond = max(512, min(2000, len(conversation) // 6))
+
+        resume = ""
+        usage = None
+        try:
+            flux, usage = stream_with_usage(
+                base_url=self.cfg.cibles,
+                model=self.cfg.model,
+                messages=[
+                    {"role": "system", "content": PROMPT_RESUME},
+                    {"role": "user", "content": conversation},
+                ],
+                api_key=self.cfg.api_key,
+                temperature=0.2,
+                timeout=self.cfg.timeout,
+                max_tokens=plafond,
+            )
+            for morceau in flux:
+                resume += morceau
+        except KeyboardInterrupt:
+            print("\n[contexte] compactage interrompu — historique inchangé")
+            return False
+        except LLMError as exc:
+            print(f"[contexte] compactage impossible : {exc}")
+            print("           historique inchangé (rien n'a été perdu).")
+            return False
+
+        resume = resume.strip()
+        if not resume:
+            print("[contexte] résumé vide — historique inchangé")
+            return False
+
+        self.messages = [
+            self.messages[0],
+            {"role": "system", "content": f"[Résumé des échanges précédents]\n{resume}"},
+            *gardes,
+        ]
+        self._oubli_signale = False
+        print(
+            f"[contexte] {len(conversation)} caractères résumés en {len(resume)} ; "
+            f"{len(self.messages)} message(s) en contexte."
+        )
+        if len(resume) >= len(conversation) * 0.9:
+            print(
+                "           (le résumé n'est pas plus court que le texte d'origine : "
+                "il n'y a pas grand-chose à y gagner sur cet échange)"
+            )
+        elif usage is not None and usage.completion_tokens >= plafond:
+            # Ne jamais taire une troncature : le résumé a l'air complet alors qu'il
+            # s'arrête au milieu, et c'est tout le début de la conversation qui est en jeu.
+            print(
+                f"           (ATTENTION : le résumé a atteint son plafond de {plafond} tokens "
+                "et s'arrête peut-être en pleine phrase)"
+            )
+        return True
 
     # ------------------------------------------------------------ conversations
     def _appliquer(self, conv: store.Conversation) -> None:
@@ -834,7 +956,11 @@ class ChatSession:
 
         elif cmd == "/reset":
             self.messages = [{"role": "system", "content": self.cfg.system}]
+            self._oubli_signale = False
             print("historique vidé")
+
+        elif cmd == "/resume":
+            self._compacter_contexte()
 
         elif cmd == "/voices":
             for v in list_voices():
@@ -963,6 +1089,23 @@ class ChatSession:
                     if conv.modele:
                         print(f"(conversation enregistrée avec {nom_court(conv.modele)})")
                     print(f"chargé « {conv.nom} » : {conv.echanges} messages")
+
+        elif cmd == "/cherche":
+            if not arg.strip():
+                print("usage : /cherche <motif>   (cherche dans toutes les conversations)")
+            else:
+                trouvailles = store.chercher(arg)
+                if not trouvailles:
+                    print(f"rien trouvé pour « {arg.strip()} »")
+                else:
+                    print(f"{len(trouvailles)} passage(s) pour « {arg.strip()} » :")
+                    for t in trouvailles:
+                        quand = time.strftime("%d/%m %H:%M", time.localtime(t.date))
+                        print(
+                            f"  [{t.conversation}] {quand} · {t.role_lisible()} · msg {t.message}"
+                        )
+                        print(f"      {t.extrait}")
+                    print("  (reprendre une conversation : /load <nom>)")
 
         elif cmd == "/conversations":
             sauvegardes = store.lister()
@@ -1198,6 +1341,74 @@ def do_serveur_tts(cfg: Config, port: int) -> int:
     return 0
 
 
+def do_dire(cfg: Config, texte: str) -> int:
+    """Lit un texte à voix haute, sans passer par le LLM.
+
+    Sert à deux choses : comparer deux voix côte à côte sans dépendre du serveur LLM
+    (``--voice ff_siwis:3+ef_dora:1 --dire "Bonjour tout le monde."``), et se faire lire
+    un document. Le texte passe par le même nettoyage et la même file que les réponses,
+    donc ce qu'on entend ici est exactement ce qu'on entendrait d'une réponse.
+    """
+    if not texte.strip():
+        print("[ERREUR] rien à lire")
+        return 2
+
+    session = ChatSession(cfg)
+    session.setup_voice()
+    if session.tts is None or session.speech is None:
+        print("[ERREUR] voix indisponible (--no-tts ?)")
+        return 2
+
+    # Le découpeur attend un flux : pour un texte complet, le dernier fragment doit être
+    # lu aussi, sinon le fichier s'arrête à la dernière ponctuation forte.
+    phrases, reste = txt.split_sentences(texte)
+    if reste.strip():
+        phrases.append(reste)
+    if not phrases:
+        print("[ERREUR] rien à lire")
+        return 2
+
+    print(f"Lecture de {len(phrases)} phrase(s)…")
+    try:
+        for phrase in phrases:
+            session.speech.say(phrase)
+        session.speech.wait()
+    except KeyboardInterrupt:
+        print("\nlecture interrompue")
+    finally:
+        session.speech.close()
+        if session.speaker:
+            session.speaker.close()
+    return 0
+
+
+def do_question(cfg: Config, question: str) -> int:
+    """Pose une seule question, affiche la réponse, puis sort.
+
+    C'est le mode scriptable : un cron peut faire annoncer un rappel à voix haute, et un
+    autre programme peut appeler voicechat sans lui offrir de terminal. Le clavier en mode
+    brut de `ask()` sait déjà se taire quand l'entrée n'est pas un terminal — vérifié,
+    sinon ce mode aurait planté sous cron.
+    """
+    session = ChatSession(cfg)
+    if not session.resolve_model():
+        return 2
+    session.cfg, _ = session.cfg.pour_modele(session.cfg.model)
+    session.setup_voice()
+    try:
+        session.ask(question)
+    except KeyboardInterrupt:
+        print("\ninterrompu")
+        return 130
+    finally:
+        if session.speech:
+            session.speech.wait()  # ne pas couper la voix au milieu d'une phrase
+            session.speech.close()
+        if session.speaker:
+            session.speaker.close()
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     cfg = config_from_args(args)
@@ -1206,6 +1417,17 @@ def main(argv: list[str] | None = None) -> int:
         return do_list_voices()
     if args.transcrire:
         return do_transcrire(cfg, args.transcrire)
+    if args.dire is not None:
+        return do_dire(cfg, args.dire)
+    if args.dire_fichier:
+        try:
+            texte = Path(args.dire_fichier).expanduser().read_text(encoding="utf-8")
+        except OSError as exc:
+            print(f"[ERREUR] {args.dire_fichier} : {exc}")
+            return 2
+        return do_dire(cfg, texte)
+    if args.question is not None:
+        return do_question(cfg, args.question)
     if args.diag_micro:
         return do_diag_micro(cfg)
     if args.serveur_tts:

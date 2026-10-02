@@ -1,5 +1,7 @@
 # voicechat ★
 
+[![tests](https://github.com/nikodindon/voicechat/actions/workflows/tests.yml/badge.svg)](https://github.com/nikodindon/voicechat/actions/workflows/tests.yml)
+
 Chat en console avec un **LLM local** (API OpenAI-compatible) qui **répond aussi à voix haute** grâce à **Kokoro TTS**, exécuté **en local sur la machine du client** (GPU utilisé si disponible).
 
 ```
@@ -42,13 +44,18 @@ sur la machine avec laquelle on parle. On ne dépend donc jamais d'un service TT
 | **Réessais avec délai croissant** (connexion refusée, 5xx, 429) | ✅ implémenté et vérifié (v0.6) — 3 essais, 0,5 s → 1 s → 2 s |
 | **Serveurs de secours** (`--secours`, `VOICECHAT_SECOURS`) | ✅ implémenté et vérifié (v0.6) — bascule annoncée à l'écran, jamais silencieuse |
 | **Mode dégradé** : phrases non synthétisées gardées et rejouables (`/rejoue`) | ✅ implémenté et vérifié (v0.6) |
+| **`--dire` / `--dire-fichier`** : lire un texte sans le LLM | ✅ implémenté et vérifié (v1.1) — par son WAV dans la réserve, cf. §14.1 |
+| **`/cherche <mot>`** dans les conversations sauvées (accents compris) | ✅ implémenté et vérifié (v1.1) — 17 tests, cf. §14.2 |
+| **`/resume`** : compacter les vieux échanges au lieu de les perdre | ✅ implémenté et vérifié (v1.1) — 1,1× à 1,6× selon la densité du texte, cf. §14.3 |
+| **`-q`** : mode non-interactif, scriptable (cron, autre programme) | ✅ implémenté et vérifié (v1.1) — testé **sans terminal**, cf. §14.4 |
+| **Intégration continue** (pytest + contrôle « sans paquets lourds ») | ✅ en place (v1.1) — la suite tourne sans torch, Kokoro ni GPU, cf. §14.5 |
 | **Réserve d'audio** : une phrase déjà dite n'est pas resynthétisée | ✅ implémenté et mesuré (v1.0) — 282 ms → ~0 ms par phrase répétée, cf. §13.1 |
 | **Paquet installable** (`pip install ./voicechat`, commande `voicechat`) | ✅ vérifié (v1.0) — installation et point d'entrée réellement exécutés, cf. §13.2 |
 | **Fichier de configuration TOML** + réglages par modèle et par voix | ✅ implémenté et vérifié (v1.0) — précédence testée, cf. §13.3 |
 | **Serveur TTS partagé** (`--serveur-tts` / `--tts-distant`) | ⚠️ fonctionnel et vérifié (v1.0), audio retranscrit à 100 % — mais testé en boucle locale seulement, pas entre deux machines, cf. §13.4 |
 | Sélection GPU `auto/cuda/cpu` | ✅ **GPU opérationnel** — RTF 0,09 (cf. §8 pour l'obligation de build cu126 sur Pascal) |
 | Serveur LLM `100.91.114.49:8080` (niko-1650-super) | ✅ **joignable** — Ornith-1.5-35B-A3B Q4_K_M |
-| Suite de tests hors ligne | ✅ 258 tests passent |
+| Suite de tests hors ligne | ✅ 275 tests — et 271 passent même **sans torch, Kokoro ni faster-whisper** |
 
 > **Cible réelle du serveur LLM** — `100.91.114.49` = `niko-1650-super` dans le tailnet,
 > llama.cpp exposant une API OpenAI-compatible :
@@ -239,6 +246,7 @@ de commande (l'option gagne). Aucune clé n'est obligatoire : llama.cpp ignore `
 | `/save [nom]` | enregistre la conversation (défaut : `derniere`) |
 | `/load <nom>` | recharge une conversation sauvegardée |
 | `/conversations` | liste les conversations sauvegardées |
+| `/cherche <mot>` | cherche un passage dans les conversations sauvegardées (accents ignorés) |
 | `/forget <nom>` | supprime une conversation sauvegardée |
 | `/export [fichier]` | écrit la conversation en markdown |
 | `/voices` | liste les voix Kokoro |
@@ -246,6 +254,8 @@ de commande (l'option gagne). Aucune clé n'est obligatoire : llama.cpp ignore `
 | `/ecoute` | écoute le micro et envoie ce qui est dit (puis retour clavier) |
 | `/micro on\|off` | bascule le mode mains libres |
 | `/rejoue` | réentend les phrases que la synthèse n'avait pas pu produire |
+| `/resume` | compacte les vieux échanges en un résumé (au lieu de les perdre) |
+| `/cache` | état de la réserve d'audio déjà synthétisé (`/cache vider`) |
 | `/stats` | latences (TTFT, débit en tokens, RTF TTS) |
 | `/debug` | bascule l'affichage des stats à chaque tour |
 
@@ -486,6 +496,9 @@ Trois scripts de vérification bout en bout pilotent le vrai CLI dans un pseudo-
 .venv/bin/python tests/bench_voix.py          # mélanges de voix : intelligibilité + timbre
 .venv/bin/python tests/verif_profil_voix.py   # un profil porte bien sa voix
 .venv/bin/python tests/verif_reprise.py       # bascule réseau, dans le vrai CLI
+.venv/bin/python tests/verif_sans_lourds.py   # toute la suite, sans torch/Kokoro/whisper
+.venv/bin/python tests/verif_confort.py       # -q, --dire, /cherche, /resume
+.venv/bin/python tests/verif_config.py        # précédence TOML/env/arguments
 ```
 
 ---
@@ -544,6 +557,95 @@ Trois scripts de vérification bout en bout pilotent le vrai CLI dans un pseudo-
 
 **Reste ouvert, d'avant la v1.0** : la capture micro hachée (§10). C'est le seul point
 du projet qui ne soit pas résolu.
+
+### v1.1 — confort d'usage ✅
+
+Une soirée de travail, effet immédiat, aucun risque : ces quatre-là ne touchent ni au
+réseau, ni au GPU, ni au découpage du texte.
+
+- [x] **`--dire "texte"` / `--dire-fichier part.txt`** — parler sans passer par le LLM.
+      C'est l'outil qui manque pour comparer deux voix côte à côte ou se faire lire un
+      document. Réutilise le nettoyage markdown et la file de synthèse déjà là.
+- [x] **`/cherche <mot>`** dans les conversations sauvegardées — les fichiers sont déjà
+      sur disque, il ne manquait que la recherche. Insensible à la casse **et aux accents**.
+- [x] **`/resume`** — compacter l'historique quand le contexte se remplit. Vrai besoin, pas
+      du confort : la fenêtre est de 32 768 tokens et la seule issue était `/reset`,
+      donc tout perdre. L'historique qui débordait le dit maintenant, au lieu de laisser
+      tomber des messages en silence.
+- [x] **`-q "question"`** — mode non-interactif : répond et sort. C'est ce qui rend le
+      projet scriptable (cron qui annonce un rappel, appel depuis un autre projet).
+- [x] **Intégration continue** — pytest sur chaque push + badge dans le README. La suite
+      tourne **sans torch, sans Kokoro, sans faster-whisper et sans GPU** : un contrôle
+      dédié le prouve et échoue si quelqu'un ajoute un import lourd en haut d'un module.
+
+### v1.2 — deux voix
+
+Le « waouh » pour le moins d'effort : la plomberie existe déjà (mélange de voix pondéré,
+voix portée par le profil, réserve d'audio, serveur TTS). Il ne reste que le prompt et
+l'ordonnancement.
+
+- [ ] **Mode dialogue** : deux voix alternées — question/réponse, ou deux personas qui
+      se relancent. Chaque voix garde son profil (voix, vitesse, prompt, modèle).
+- [ ] **`/enregistre`** : la session entière en un seul fichier audio. La réserve contient
+      déjà chaque phrase en WAV, il suffit de les recoller dans l'ordre.
+- [ ] **Voix automatique selon la langue** : Kokoro couvre 8 langues, mais `lang` est figé
+      à `f` ; quand le modèle répond en anglais, c'est la voix française qui le lit.
+
+### v1.3 — l'assistant dans le navigateur, et dans la poche
+
+Le serveur TTS de la v1.0 parle déjà HTTP : cette version rend le reste du service
+accessible, et fait entrer le téléphone dans la boucle.
+
+- [ ] **Interface web** (chat + lecture audio) servie par `voicechat --web` : on ouvre une
+      page, on tape, on entend. Rayon d'action immédiat depuis n'importe quelle machine
+      du tailnet.
+- [ ] **Service STT distant** (`--serveur-stt`), symétrique du serveur TTS : le téléphone
+      envoie l'**audio**, le poste GPU renvoie le **texte**. Sans ça, un client léger doit
+      embarquer Whisper — ce qui est justement ce qu'on veut éviter.
+- [ ] **Installable depuis le navigateur** (PWA) : utilisable sur le téléphone sans store,
+      et sans rien compiler.
+
+### v2.0 — l'assistant qui agit
+
+Le saut de nature : passer de « il répond » à « il fait ». llama.cpp expose déjà l'API
+d'outils OpenAI, et ARIA utilise déjà ce motif (`[DELEGATE]` → sous-processus).
+
+- [ ] **Outils / function calling** : lire un fichier, chercher sur le web, lancer une
+      commande.
+- [ ] **Garde-fous** : ce qui peut s'exécuter sans demander, et ce qui exige une
+      confirmation explicite. Le point délicat n'est pas technique.
+- [ ] **RAG local** sur les documents : indexer notes et projets pour répondre à
+      « qu'est-ce que je disais sur X ? ». Le morceau le plus profond — découpage, index,
+      seuil de pertinence — à ne lancer que si le besoin est réel.
+
+### v3.0 — application Android
+
+L'aboutissement logique du mode distribué : le téléphone est déjà dans le tailnet, donc
+il n'a besoin ni de GPU, ni de modèle local — juste d'être sur le réseau.
+
+- [ ] **Application Android** qui parle aux postes du tailnet : LLM sur un poste, Kokoro sur
+      l'autre (ou le même), Whisper ailleurs. Tous les services existent déjà après la
+      v1.3 : API OpenAI-compatible, `--serveur-tts`, `--serveur-stt`.
+- [ ] **Découverte des postes** : dire une fois où sont LLM / TTS / STT, garder ça en
+      configuration. Le tailnet donne des adresses `100.x.y.z` stables mais il y a
+      plusieurs machines (niko-1650-super, niko-tv, niko-nitro-an515-52) : ne pas confondre.
+- [ ] **Mode voiture / casque** : dialogue mains libres de bout en bout, ce qui suppose
+      que la capture micro soit enfin réglée (voir ci-dessous).
+
+### Chantier ouvert depuis la v0.4 : la capture micro
+
+Ce n'est pas une fonctionnalité, c'est le blocage qui décide de la suite. PortAudio hache
+la parole sur cette machine alors que `parec` est propre sur la même source : cause racine
+non identifiée (§10).
+
+Tant qu'il tient, trois idées restent **bloquées**, même si elles sont séduisantes :
+
+- la **dictée continue** (parler pour écrire, sans le LLM) ;
+- le **barge-in** (interrompre l'assistant en parlant, plutôt qu'avec `Ctrl+C`) ;
+- le **mot de réveil** (« hey … ») qui rendrait le mode mains libres vraiment utilisable.
+
+`tests/bench_capture.py` est prêt pour s'y attaquer : il compare notre capture à `parec`
+par corrélation. La première étape n'est pas de corriger, c'est de comprendre.
 
 ---
 
@@ -1975,6 +2077,186 @@ verif_distant, auxquels s'ajoutent les 9 contrôles de la v0.5 rejoués
 
 ---
 
-## 14. Licence
+## 14. Confort d'usage (v1.1)
+
+Quatre ajouts qui ne touchent ni au réseau, ni au GPU, ni au découpage du texte — donc
+finissables et vérifiables en une soirée.
+
+### 14.1 `--dire` : parler sans le modèle
+
+```bash
+voicechat --dire "Bonjour tout le monde."
+voicechat --dire-fichier notes.md
+voicechat --voice ff_siwis:3+ef_dora:1 --dire "Test de mélange."
+```
+
+Tout ce qui existe déjà est réutilisé : le nettoyage markdown, le découpage en phrases,
+la file de synthèse, la réserve, le serveur TTS distant si `--tts-distant` est donné. Ce
+qu'on entend par `--dire` est donc **exactement** ce qu'on entendrait d'une réponse.
+
+Le texte passe d'abord par `split_sentences`, qui est fait pour un flux : le dernier
+fragment, sans ponctuation finale, doit être réuni à la main, sinon un fichier s'arrête
+à sa dernière phrase ponctuée.
+
+La vérification ne se fie pas à l'oreille : elle construit la **clé de réserve** de la
+phrase demandée et la cherche dans le dossier.
+
+```
+--- B. --dire : lecture directe, vérifiée par la réserve ---
+  | Voix   : chargement de Kokoro « ff_siwis »…
+  | Lecture de 1 phrase(s)…
+  fichiers dans la réserve : 1
+  durée du WAV déposé : 4.12 s
+  clé attendue présente : True
+```
+
+### 14.2 `/cherche` : retrouver un passage
+
+```
+vous › /cherche tailscale
+2 passage(s) pour « tailscale » :
+  [reseau] 14/03 18:22 · vous · msg 1
+      … on avait dit quoi sur le tailscale du portable ? …
+  [reseau] 14/03 18:22 · ia · msg 2
+      … le tailscale donne des adresses 100.x.y.z stables …
+```
+
+Deux points de conception :
+
+**Insensible aux accents, dans les deux sens.** Chercher « resume » sans trouver
+« résumé » serait un échec silencieux particulièrement pénible en français. Le texte est
+normalisé en NFKD puis dépouillé de ses diacritiques — des deux côtés de la comparaison.
+La longueur est préservée pour les lettres accentuées, ce qui permet de réutiliser la
+position trouvée pour découper l'extrait ; les ligatures (`œ` → `oe`) allongent la
+chaîne, d'où une borne pour ne jamais sortir du texte.
+
+**Pas d'index, on relit les fichiers.** Ils sont petits, et un index qu'on oublie de
+mettre à jour est pire que pas d'index du tout : il donnerait des résultats faux sans
+prévenir. Une conversation abîmée est ignorée sans interrompre la recherche.
+
+17 tests dans `tests/test_recherche.py`, dont « l'index de message est correct » (le
+numéro doit désigner le message, pas la position dans le texte) et « conversation
+abîmée n'empêche pas la recherche ».
+
+### 14.3 `/resume` : ne plus perdre le début
+
+Avant cette version, `_trim_history()` gardait les 24 derniers messages et **laissait
+tomber les autres en silence**. Le modèle semblait devenir bête au fil d'une
+conversation, alors qu'il avait simplement cessé de recevoir le début. Désormais :
+
+* le débordement est **annoncé** une fois (« 4 message(s) ancien(s) ne sont plus
+  envoyés ») avec la commande à lancer ;
+* `/resume` demande au modèle de résumer les échanges anciens et les remplace par ce
+  résumé, en gardant le prompt système et le dernier échange intacts.
+
+```
+--- D. /resume : compactage du contexte ---
+  | [contexte] compactage de 4 message(s)…
+  | [contexte] 233 caractères résumés en 158 ; 4 message(s) en contexte.
+```
+
+Côté sûreté : si l'appel échoue ou est interrompu, **l'historique n'est pas touché** —
+mieux vaut un contexte long qu'un contexte perdu.
+
+Ce que la mesure dit, honnêtement : ce modèle **n'est pas compressif**.
+
+| Entrée | Résumé | Rapport | Tronqué ? |
+|---|---|---|---|
+| 855 caractères (échange dense, une info par phrase) | 785 | 1,1× | non (215 tokens produits) |
+| 1572 caractères (réponses verbeuses) | 1001 | 1,6× | oui, au plafond |
+
+D'où deux garde-fous ajoutés après mesure : un **plafond généreux** (512 à 2000 tokens,
+proportionnel à l'entrée) et deux avertissements explicites — l'un quand le résumé n'est
+pas plus court que l'original, l'autre quand il a atteint le plafond, car un résumé
+tronqué a l'air complet tout en s'arrêtant au milieu d'une phrase. Le premier essai
+coupait à 96 tokens, en plein « Concernant l'épingle d'av==18.1.0, » : c'est exactement
+ce qu'on ne veut pas d'un mécanisme destiné à ne rien perdre.
+
+### 14.4 `-q` : rendre le projet scriptable
+
+```bash
+voicechat -q "Résume les trois points de la réunion." --no-tts
+voicechat -q "Il est l'heure de la pause."        # et il le dit à voix haute
+```
+
+C'est ce qui permet de brancher le projet ailleurs : un cron qui annonce un rappel, un
+autre programme qui l'appelle. Le cas qui compte est donc l'absence de terminal — c'est
+ainsi qu'il est testé, avec `stdin` sur `/dev/null` :
+
+```
+--- A. mode non-interactif, sans terminal (cas du cron) ---
+  code de sortie : 0
+  | Modèle : Ornith-1.5-35B-A3B-APEX-i-mini
+  | Voix   : désactivée (--no-tts)
+  | ia › bonjour.
+```
+
+Vérifié avant de s'appuyer dessus : `ClavierGeneration`, qui met le terminal en mode
+brut pendant la génération, sort proprement quand l'entrée n'est pas un terminal. Sans
+ça, ce mode aurait planté au premier lancement depuis un cron.
+
+### 14.5 Intégration continue
+
+La suite tourne sur chaque `push`, avec pour seul bagage `numpy`, `soundfile` et
+`pytest` — pas de torch, pas de Kokoro, pas de GPU. Un job dédié le **prouve** :
+
+```
+$ python tests/verif_sans_lourds.py
+blocage actif : torch, kokoro, faster_whisper, ctranslate2, av
+271 passed, 4 skipped in 29.04s
+```
+
+Ce script n'est pas décoratif : il installe un bloqueur d'import et échoue si un module
+se met à importer torch en haut de fichier. Sans lui, quelqu'un ajouterait un `import
+torch` un jour, la CI deviendrait lente puis serait désactivée, et plus rien ne serait
+vérifié. Le badge est en haut de ce README.
+
+### 14.6 Quatre erreurs, toutes dans mes vérifications
+
+Aucune n'est dans le code livré, mais elles expliquent pourquoi la mise au point a pris
+plus de temps que prévu — et trois d'entre elles m'ont appris quelque chose sur le
+programme lui-même.
+
+1. **Attendre le prompt ne marche pas.** Mon pilote de pseudo-terminal attendait
+   « vous › » pour savoir qu'un tour était fini. Or l'éditeur de ligne **réaffiche le
+   prompt à chaque frappe** : il réapparaissait donc dès que la question était tapée,
+   bien avant la réponse. Symptôme : `/resume` semblait ne rien faire. Corrigé par une
+   détection de silence, avec un motif explicite quand la commande appelle le modèle sans
+   rien afficher pendant plusieurs secondes.
+2. **Texte et Entrée dans une seule écriture = collage.** L'éditeur attend alors une
+   Entrée distincte avant d'envoyer — c'est exactement le comportement voulu depuis la
+   v0.1 pour qu'un texte collé ne parte pas tout seul. Il faut deux écritures séparées,
+   comme un vrai clavier (`tests/test_editor.py` le fait déjà).
+3. **Mon bloqueur d'import levait la mauvaise exception.** Il levait `ImportError` ; un
+   paquet réellement absent lève `ModuleNotFoundError`, et depuis pytest 8.2
+   `importorskip` ne saute **que** sur celle-là. Le harnais échouait donc là où la vraie
+   CI aurait ignoré le test — il mentait sur ce qu'il prétendait mesurer.
+4. **Un test supposait faster-whisper installé.** `test_chargement_impossible_...`
+   attend un message précis (« aucune configuration ») qui n'arrive que si la
+   bibliothèque est présente. Sans elle, `charger()` s'arrête avant, sur un autre message
+   tout aussi lisible. Le test est maintenant explicitement conditionné.
+
+### 14.7 Vérification
+
+```
+$ .venv/bin/python tests/verif_confort.py
+=== contrôles ===
+  OK  `-q` répond sans terminal et sort en 0
+  OK  `--dire` synthétise bien la phrase demandée
+  OK  `/cherche` retrouve le passage
+  OK  `/resume` compacte l'historique
+
+>>> OK : les quatre apports de la v1.1 fonctionnent sur le vrai programme
+```
+
+| Fichier | Tests | Ce qu'il couvre |
+|---|---|---|
+| `tests/test_recherche.py` | 17 | accents, casse, extraits, limites, index, fichier abîmé |
+| `tests/verif_sans_lourds.py` | — | la suite entière, paquets lourds interdits |
+| `tests/verif_confort.py` | — | `-q`, `--dire`, `/cherche`, `/resume` sur le vrai CLI |
+
+---
+
+## 15. Licence
 
 MIT — voir le fichier `LICENSE`. Faire ce qu'on veut, sans garantie.

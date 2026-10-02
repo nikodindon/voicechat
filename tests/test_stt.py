@@ -124,7 +124,13 @@ def test_transcrire_sans_modele_leve_une_erreur_claire():
 
 
 def test_chargement_impossible_donne_un_message_lisible(monkeypatch):
-    """Un modèle inexistant ne doit pas lever : on veut un message, pas une trace."""
+    """Un modèle inexistant ne doit pas lever : on veut un message, pas une trace.
+
+    Ce test porte sur le cas « la bibliothèque est là, le modèle ne l'est pas ». Si
+    faster-whisper n'est pas installé (CI légère), `charger()` s'arrête avant, sur un
+    autre message — tout aussi lisible — et le test n'a plus d'objet.
+    """
+    pytest.importorskip("faster_whisper", reason="message de modèle : needs faster-whisper")
     transcriber = Transcriber(modele="modele-qui-nexiste-pas-0000", device="cpu")
     assert transcriber.charger() is False
     assert transcriber.erreur

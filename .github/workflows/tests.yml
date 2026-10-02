@@ -1,0 +1,37 @@
+name: tests
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  hors-ligne:
+    name: tests hors ligne (Python ${{ matrix.python }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      # Volontairement minimal : la suite doit tourner sans torch, sans Kokoro, sans
+      # faster-whisper et sans GPU. Ce n'est pas une supposition — le contrôle suivant
+      # le vérifie explicitement, et échoue si quelqu'un ajoute un import lourd en haut
+      # d'un module.
+      - name: Installer le strict nécessaire
+        run: |
+          python -m pip install --upgrade pip
+          pip install numpy soundfile pytest
+
+      - name: Tests
+        run: python -m pytest tests -q
+
+      - name: La suite ne doit pas dépendre des paquets lourds
+        run: python tests/verif_sans_lourds.py

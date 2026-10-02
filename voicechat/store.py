@@ -10,6 +10,7 @@ import json
 import os
 import re
 import time
+import unicodedata
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -183,6 +184,79 @@ def supprimer(nom: str) -> bool:
         return True
     except FileNotFoundError:
         return False
+
+
+# ------------------------------------------------------------------- recherche
+@dataclass
+class Trouvaille:
+    """Un passage retrouvé dans une conversation sauvegardée."""
+
+    conversation: str
+    role: str
+    message: int
+    date: float
+    extrait: str
+
+    def role_lisible(self) -> str:
+        """Le rôle tel qu'on l'affiche dans la console."""
+        return {"user": "vous", "assistant": "ia", "system": "système"}.get(self.role, self.role)
+
+
+def sans_accents(texte: str) -> str:
+    """Minuscules sans accents : « Résumé » et « resume » doivent se retrouver.
+
+    Chercher « resume » sans trouver « résumé » serait une source d'échecs silencieux
+    particulièrement pénible en français. NFKD sépare la lettre de son accent, puis on
+    retire les diacritiques. La longueur est préservée pour les lettres accentuées
+    («é» → «e»), mais pas pour les ligatures («œ» → «oe») : d'où la borne dans
+    ``chercher()``.
+    """
+    decompose = unicodedata.normalize("NFKD", texte.lower())
+    return "".join(c for c in decompose if not unicodedata.combining(c))
+
+
+def _extrait(contenu: str, position: int, largeur: int = 45) -> str:
+    """Le passage autour de la correspondance, encadré de points de suspension."""
+    debut = max(0, position - largeur)
+    fin = min(len(contenu), position + largeur)
+    morceau = " ".join(contenu[debut:fin].split())  # sauts de ligne et doubles espaces
+    return ("… " if debut else "") + morceau + (" …" if fin < len(contenu) else "")
+
+
+def chercher(motif: str, limite: int = 40) -> list[Trouvaille]:
+    """Cherche un motif dans toutes les conversations sauvegardées.
+
+    Les fichiers sont relus depuis le disque (ils sont petits) : pas d'index à tenir à
+    jour, donc rien qui puisse devenir faux en silence. Résultat : les conversations les
+    plus récentes d'abord, au plus ``limite`` passages.
+    """
+    aiguille = sans_accents(motif.strip())
+    if not aiguille:
+        return []
+
+    trouvailles: list[Trouvaille] = []
+    for resume in lister():  # déjà trié, la plus récente d'abord
+        try:
+            conversation = charger(resume["nom"])
+        except (FileNotFoundError, ValueError, OSError):
+            continue  # conversation abîmée : on l'ignore au lieu d'abandonner la recherche
+        for index, message in enumerate(conversation.messages):
+            contenu = message.get("content") or ""
+            position = sans_accents(contenu).find(aiguille)
+            if position < 0:
+                continue
+            trouvailles.append(
+                Trouvaille(
+                    conversation=conversation.nom,
+                    role=message.get("role", "?"),
+                    message=index,
+                    date=conversation.maj,
+                    extrait=_extrait(contenu, min(position, max(0, len(contenu) - 1))),
+                )
+            )
+            if len(trouvailles) >= limite:
+                return trouvailles
+    return trouvailles
 
 
 # --------------------------------------------------------------------- profils
