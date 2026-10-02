@@ -28,6 +28,7 @@ import pytest
 
 import voicechat.web as web
 from test_distant import FauxTTS
+from test_stt_distant import FauxTranscriber
 from voicechat.cli import ChatSession
 from voicechat.config import Config
 from voicechat.llm import LLMError, Usage
@@ -111,6 +112,31 @@ def _poster(url: str, charge: dict | None = None, delai: float = 10) -> tuple[in
             return reponse.status, reponse.read()
     except urllib.error.HTTPError as exc:
         return exc.code, exc.read()
+
+
+def _poster_octets(url: str, octets: bytes, ctype: str = "audio/webm") -> tuple[int, bytes]:
+    """Le geste exact du navigateur : des octets audio bruts, sans enveloppe JSON."""
+    requete = urllib.request.Request(
+        url, data=octets, headers={"Content-Type": ctype}, method="POST"
+    )
+    try:
+        with urllib.request.urlopen(requete, timeout=20) as reponse:
+            return reponse.status, reponse.read()
+    except urllib.error.HTTPError as exc:
+        return exc.code, exc.read()
+
+
+def _wav_16k(secondes: float = 0.4) -> bytes:
+    """Un vrai WAV, pour que le décodage du service ait quelque chose à manger."""
+    import io as _io
+
+    import numpy as np
+    import soundfile as sf
+
+    signal = (0.1 * np.sin(2 * np.pi * 220 * np.arange(int(16000 * secondes)) / 16000))
+    memoire = _io.BytesIO()
+    sf.write(memoire, signal.astype("float32"), 16000, format="WAV", subtype="PCM_16")
+    return memoire.getvalue()
 
 
 # ------------------------------------------------------------------ la page
@@ -361,3 +387,210 @@ def test_le_port_zero_prend_un_port_libre():
     finally:
         a._httpd.server_close()
         b._httpd.server_close()
+
+
+# ---------------------------------------------------------------- le micro (v1.2)
+# Le serveur web doit pouvoir transcrire : c'est ce qui permet au micro d'un téléphone de
+# servir alors que le téléphone n'a ni GPU ni Whisper. Ces tests passent par les **vraies**
+# routes HTTP, avec des octets audio réels — pas par les méthodes internes.
+
+
+def _serveur_micro(chargeur, monkeypatch, appels: list | None = None):
+    """Un serveur web avec un chargeur de transcription, sans jamais charger Whisper."""
+    monkeypatch.setattr(web, "stream_with_usage", faux_stream)
+    session = ChatSession(Config(model="m.gguf", tts=False))
+
+    def compter():
+        if appels is not None:
+            appels.append(1)
+        return FauxTranscriber(texte="bonjour le monde")
+
+    srv = web.ServeurWeb(
+        FauxTTS(), session, port=0,
+        charger_transcription=compter if chargeur else None,
+    )
+    srv.demarrer()
+    return srv
+
+
+def test_le_serveur_web_transcrit(monkeypatch):
+    """Le geste du navigateur, de bout en bout : des octets entrent, du texte sort."""
+    srv = _serveur_micro(chargeur=True, monkeypatch=monkeypatch)
+    try:
+        code, corps = _poster_octets(f"{srv.url_local}/transcris", _wav_16k())
+        assert code == 200
+        infos = json.loads(corps)
+        assert infos["texte"] == "bonjour le monde"
+        assert infos["langue"] == "fr"
+        assert infos["rtf"] == pytest.approx(0.4 / 0.4, abs=0.01)
+    finally:
+        srv.arreter()
+
+
+def test_whisper_arrive_a_la_premiere_demande_et_une_seule_fois(monkeypatch):
+    """Charger Whisper coûte de la VRAM : une fois, au premier besoin, pas au démarrage."""
+    appels: list = []
+    srv = _serveur_micro(chargeur=True, monkeypatch=monkeypatch, appels=appels)
+    try:
+        assert appels == []  # rien n'a été chargé au démarrage
+
+        code, _ = _poster_octets(f"{srv.url_local}/transcris", _wav_16k())
+        assert code == 200
+        assert len(appels) == 1
+
+        code, _ = _poster_octets(f"{srv.url_local}/transcris", _wav_16k())
+        assert code == 200
+        assert len(appels) == 1, "le second envoi ne doit pas recharger Whisper"
+    finally:
+        srv.arreter()
+
+
+def test_transcription_indisponible_sans_chargeur(monkeypatch):
+    """Sans chargeur, la route existe mais le dit clairement au lieu de planter."""
+    srv = _serveur_micro(chargeur=False, monkeypatch=monkeypatch)
+    try:
+        code, corps = _poster_octets(f"{srv.url_local}/transcris", _wav_16k())
+        assert code == 503
+        assert b"transcription" in corps
+    finally:
+        srv.arreter()
+
+
+def test_transcris_corps_vide(monkeypatch):
+    srv = _serveur_micro(chargeur=True, monkeypatch=monkeypatch)
+    try:
+        code, corps = _poster_octets(f"{srv.url_local}/transcris", b"")
+        assert code == 400
+        assert b"vide" in corps
+    finally:
+        srv.arreter()
+
+
+def test_transcris_contenu_illisible(monkeypatch):
+    srv = _serveur_micro(chargeur=True, monkeypatch=monkeypatch)
+    try:
+        code, corps = _poster_octets(
+            f"{srv.url_local}/transcris", b"ceci n'est pas de l'audio"
+        )
+        assert code == 400
+        assert b"illisible" in corps
+    finally:
+        srv.arreter()
+
+
+def test_l_etat_annonce_si_le_micro_est_possible(monkeypatch):
+    """La page a besoin de le savoir **avant** d'enregistrer, pour montrer le bouton."""
+    srv = _serveur_micro(chargeur=True, monkeypatch=monkeypatch)
+    try:
+        with urllib.request.urlopen(f"{srv.url_local}/etat", timeout=10) as reponse:
+            infos = json.loads(reponse.read())
+        assert infos["transcription"]["disponible"] is True
+        assert infos["transcription"]["pret"] is False  # pas encore chargé
+        assert infos["transcription"]["modele"] == "?"
+    finally:
+        srv.arreter()
+
+    srv = _serveur_micro(chargeur=False, monkeypatch=monkeypatch)
+    try:
+        with urllib.request.urlopen(f"{srv.url_local}/etat", timeout=10) as reponse:
+            infos = json.loads(reponse.read())
+        assert infos["transcription"]["disponible"] is False
+    finally:
+        srv.arreter()
+
+
+def test_deux_serveurs_ne_partagent_pas_le_transcripteur(monkeypatch):
+    """Le Whisper d'un serveur ne doit pas apparaître dans l'autre.
+
+    C'est le piège de la classe fabriquée : un attribut hérité de `_HandlerWeb` serait
+    commun à tous les serveurs du processus.
+    """
+    monkeypatch.setattr(web, "stream_with_usage", faux_stream)
+    a = web.ServeurWeb(
+        FauxTTS(), ChatSession(Config(model="m", tts=False)), port=0,
+        charger_transcription=lambda: FauxTranscriber(texte="serveur A"),
+    )
+    b = web.ServeurWeb(
+        FauxTTS(), ChatSession(Config(model="m", tts=False)), port=0,
+        charger_transcription=lambda: FauxTranscriber(texte="serveur B"),
+    )
+    a.demarrer()
+    b.demarrer()
+    try:
+        assert json.loads(_poster_octets(f"{a.url_local}/transcris", _wav_16k())[1])[
+            "texte"
+        ] == "serveur A"
+        assert json.loads(_poster_octets(f"{b.url_local}/transcris", _wav_16k())[1])[
+            "texte"
+        ] == "serveur B"
+    finally:
+        a.arreter()
+        b.arreter()
+
+
+def test_port_zero_du_serveur_web_va_jusqu_a_l_os(monkeypatch):
+    """`--port 0` doit demander un port libre, pas retomber sur celui par défaut.
+
+    `port or PORT_WEB` avalait le zéro — 0 est faux en Python — et le serveur tombait
+    silencieusement sur 8091 : le lancement échouait alors avec « Address already in use »
+    si ce port était déjà pris, sans que rien n'explique pourquoi. C'est arrivé pour de
+    vrai pendant une vérification.
+    """
+    from voicechat import cli
+
+    ports: list[int] = []
+
+    class FauxServeur:
+        def __init__(self, tts, session, port, charger_transcription=None):
+            ports.append(port)
+
+        def demarrer(self) -> str:
+            return "http://127.0.0.1:0"
+
+        @property
+        def url_local(self) -> str:
+            return "http://127.0.0.1:0"
+
+        @property
+        def port(self) -> int:
+            return 0
+
+        def arreter(self) -> None:
+            pass
+
+    class FausseSession:
+        def __init__(self, cfg):
+            self.cfg = cfg
+            self.tts = object()
+
+        def resolve_model(self) -> bool:
+            return True
+
+        def setup_voice(self, avec_pipeline: bool = True) -> None:
+            pass
+
+    def interrompre(_secondes):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(web, "ServeurWeb", FauxServeur)
+    monkeypatch.setattr(cli, "ChatSession", FausseSession)
+    monkeypatch.setattr(cli.time, "sleep", interrompre)
+
+    assert cli.do_web(Config(model="m.gguf", tts=False), port=0) == 0
+    assert ports == [0], "le zéro doit arriver tel quel : c'est l'OS qui choisit le port"
+
+
+def test_la_page_offre_le_micro_et_parle_aux_bonnes_routes():
+    """La page et le serveur doivent s'entendre sur les noms de routes.
+
+    Un renommage de route oublié côté page ne se voit qu'en cliquant sur le bouton, à la
+    main, dans un navigateur — ce test le voit tout de suite.
+    """
+    page = (web.PAGE).read_text(encoding="utf-8")
+    assert 'id="micro"' in page
+    assert 'fetch("transcris"' in page
+    assert 'fetch("etat")' in page
+    assert "getUserMedia" in page
+    # Le cas HTTPS doit être expliqué, pas silencieux : sans contexte sécurisé,
+    # `getUserMedia` n'existe même pas et il n'y a aucun message d'erreur à lire.
+    assert "HTTPS" in page

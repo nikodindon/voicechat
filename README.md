@@ -46,7 +46,8 @@ sur la machine avec laquelle on parle. On ne dépend donc jamais d'un service TT
 | **Mode dégradé** : phrases non synthétisées gardées et rejouables (`/rejoue`) | ✅ implémenté et vérifié (v0.6) |
 | **`/contexte`** : tokens utilisés d'après les chiffres du serveur, alerte à 80 % | ✅ implémenté et vérifié (v1.2) — contexte lu via `/props`, cf. §15 |
 | **Interface web** (`--web`) : la conversation dans un navigateur, texte + audio | ✅ implémenté et vérifié (v1.2) — 10 contrôles, audio retranscrit à 100 %, cf. §16 |
-| **Service STT distant** (`--serveur-stt`, `--stt-distant`) : audio → texte | ✅ implémenté et vérifié (v1.2) — boucle texte→audio→texte bouclée, webm/opus accepté, cf. §17 |
+| **Service STT distant** (`--serveur-stt`, `--stt-distant`) : audio → texte | ✅ implémenté et vérifié (v1.3) — boucle texte→audio→texte bouclée, webm/opus accepté, cf. §17 |
+| **Micro dans la page** (parler au lieu de taper) | ✅ implémenté et vérifié (v1.4) — 13 contrôles, webm/opus d'un navigateur, transcription pendant la réponse, cf. §16.6 |
 | **`--dire` / `--dire-fichier`** : lire un texte sans le LLM | ✅ implémenté et vérifié (v1.1) — par son WAV dans la réserve, cf. §14.1 |
 | **`/cherche <mot>`** dans les conversations sauvées (accents compris) | ✅ implémenté et vérifié (v1.1) — 17 tests, cf. §14.2 |
 | **`/resume`** : compacter les vieux échanges au lieu de les perdre | ✅ implémenté et vérifié (v1.1) — 1,1× à 1,6× selon la densité du texte, cf. §14.3 |
@@ -507,6 +508,7 @@ Trois scripts de vérification bout en bout pilotent le vrai CLI dans un pseudo-
 .venv/bin/python tests/verif_contexte.py      # contexte lu du serveur, élagage en tokens
 .venv/bin/python tests/verif_web.py           # page, flux SSE et audio, de bout en bout
 .venv/bin/python tests/verif_stt.py           # service STT : texte → audio → texte
+.venv/bin/python tests/verif_micro.py         # le micro de la page : webm → texte
 .venv/bin/python tests/verif_config.py        # précédence TOML/env/arguments
 ```
 
@@ -587,7 +589,7 @@ réseau, ni au GPU, ni au découpage du texte.
       tourne **sans torch, sans Kokoro, sans faster-whisper et sans GPU** : un contrôle
       dédié le prouve et échoue si quelqu'un ajoute un import lourd en haut d'un module.
 
-### v1.2–1.3 — contexte juste, client web, service STT ✅ (livré)
+### v1.2–1.4 — contexte juste, client web, service STT, micro ✅ (livré)
 
 **Ordre choisi volontairement** : le client web d'abord, Android ensuite. C'est ce qui
 change *où* on peut se servir du projet, et l'appli Android viendra s'y raccrocher
@@ -603,14 +605,18 @@ meilleur endroit pour les montrer.
 - [x] **Interface web** (`voicechat --web`) : une page, du SSE pour le texte, l'audio
       synthétisé par le serveur, sans framework ni étape de build. Vérifié de bout en
       bout, audio compris (cf. §16).
-- [ ] **`tailscale serve`** : HTTPS sur le tailnet. C'est ce qui rendra le micro du
-      navigateur utilisable et la page installable sur le téléphone — les trois
-      problèmes (TLS, PWA, accès restreint) réglés d'un coup.
+- [ ] **`tailscale serve`** : HTTPS sur le tailnet. Le micro de la page est **écrit et
+      vérifié** (§16.6) mais un navigateur ne le donne qu'en contexte sécurisé : c'est
+      donc la seule chose qui manque pour l'essayer depuis le téléphone. Ça rendra aussi
+      la page installable sur l'écran d'accueil.
 - [x] **Service STT distant** (`--serveur-stt`), symétrique du serveur TTS : le client
       envoie l'**audio**, le service rend le **texte**. Vérifié de bout en bout, webm/opus
       d'un navigateur compris (cf. §17).
+- [x] **Micro dans la page** : enregistrer, envoyer le webm/opus, recevoir le texte. Le
+      téléphone n'a ni GPU ni Whisper — c'est le poste GPU qui transcrit. Vérifié, y
+      compris une transcription **pendant** que le modèle répond (cf. §16.6).
 
-### v1.3 — deux voix (déplacé, assumé)
+### Deux voix (reporté, assumé)
 
 Le « waouh » pour le moins d'effort : la plomberie existe déjà (mélange de voix pondéré,
 voix portée par le profil, réserve d'audio, serveur TTS). Reporté après le web, où ça
@@ -2422,7 +2428,7 @@ fois la même leçon : un contrôle qui ne peut pas échouer ne prouve rien.
 
 ---
 
-## 16. Interface web (v1.2)
+## 16. Interface web (v1.2 – v1.4)
 
 La même conversation, dans un navigateur — et donc sur le téléphone, puisque tout est
 sur le tailnet.
@@ -2452,12 +2458,15 @@ GET  /flux?q=…   le texte au fil de l'eau, en SSE, puis les phrases à dire
 GET  /etat       quel modèle, quelle taille de contexte
 POST /reset      nouvelle conversation
 POST /parle      l'audio — hérité du serveur TTS
+POST /transcris  l'audio entre, le texte sort — hérité du service de transcription (§17)
 GET  /sante      l'état du synthétiseur — hérité aussi
 ```
 
 **Pourquoi SSE et pas WebSocket** : le texte va dans un seul sens, et un `EventSource`
-est un simple GET que le navigateur relit tout seul après une coupure. Le WebSocket
-deviendra utile le jour où le micro entrera dans la boucle, et il s'ajoutera alors sans
+est un simple GET que le navigateur relit tout seul après une coupure. Le micro est entré
+dans la boucle en v1.4 **sans** avoir besoin du WebSocket : il envoie un fichier d'un bloc
+et attend une réponse — c'est du HTTP ordinaire. Le WebSocket ne deviendra utile que pour
+une écoute **continue** (dictée permanente, mot de réveil), et il s'ajoutera alors sans
 rien réécrire de ce qui est là.
 
 **Pourquoi les erreurs passent par le flux** : un `EventSource` ne lit le corps de la
@@ -2576,9 +2585,126 @@ Et `tests/test_web.py` verrouille le cas : la génération est retenue en plein 
 demande l'audio, et il doit revenir tout de suite. **Ce test a été validé en remettant le
 bug** — il échoue alors au bout de 5 s, exactement comme le navigateur attendait.
 
+### 16.6 Le micro dans la page (v1.4)
+
+Parler au lieu de taper. Le service de transcription (§17) existait, mais rien ne s'en
+servait : voilà la pièce qui le rend utile.
+
+Le partage des rôles est celui qui était déjà en place : **le navigateur enregistre, le
+serveur transcrit**. Le téléphone n'a ni GPU ni Whisper, et c'est bien Whisper qui coûte
+cher, pas le fait de parler.
+
+```
+MediaRecorder  →  blob webm/opus  →  POST /transcris  →  texte dans le champ
+```
+
+Quatre décisions, chacune pour une raison précise :
+
+**1. Whisper arrive à la première demande, pas au démarrage.** Il coûte de la VRAM et une
+quinzaine de secondes, et beaucoup de visiteurs se servent de la page sans jamais parler.
+Le chargeur est posé par `ServeurWeb` (`charger_transcription`), l'attente est celle de la
+première requête, et un verrou de chargement évite que deux envois simultanés chargent
+deux Whisper. `/etat` annonce les deux choses séparément : `disponible` (le serveur sait
+transcrire) et `pret` (Whisper est déjà en mémoire) — sans quoi le premier essai
+paraîtrait planté pendant quinze secondes.
+
+**2. Le texte arrive dans le champ, il n'est pas envoyé.** À 5 mots sur 6 bien reconnus
+(§17.3), un mot mal entendu envoyé tout seul coûte plus cher qu'une touche Entrée. La
+transcription **s'ajoute** à ce qui est déjà tapé : le cas le plus courant est de dicter
+une précision après avoir commencé à écrire.
+
+**3. Sans HTTPS, la page explique au lieu de se taire.** Les navigateurs ne donnent le
+micro que dans un contexte sécurisé (`https`, ou `localhost`). En `http` sur une adresse
+IP, `navigator.mediaDevices.getUserMedia` **n'existe même pas** : aucun message d'erreur,
+juste un bouton qui ne fait rien. C'est le cas le plus fréquent puisqu'on ouvre la page
+depuis un téléphone sur son IP de tailnet. Le clic affiche donc directement l'explication
+et renvoie vers `tailscale serve`.
+
+**4. Le bouton est affiché même quand ça ne peut pas marcher**, et c'est volontaire : un
+bouton absent n'explique rien, un bouton qui répond pourquoi si.
+
+### 16.7 Vérification du micro
+
+`tests/verif_micro.py` refait **exactement** le geste du navigateur, sur un vrai
+`voicechat --web` : l'audio vient de Kokoro, il est converti en webm/opus par ffmpeg —
+le format que produit `MediaRecorder` — puis envoyé à `/transcris`.
+
+```
+$ .venv/bin/python tests/verif_micro.py
+  GET /etat → transcription {'pret': False, 'modele': '?', 'disponible': True}
+
+  Kokoro a produit 324080 octets (3.38 s)
+
+  POST /transcris (webm/opus, 13555 octets) → HTTP 200
+  attendu : « La réserve d'audio garde les phrases déjà dites. »
+  entendu : « La réserve d'audience garde les phrases déjà dites. »
+  mots retrouvés : 5/6 · RTF 0.218
+
+  GET /etat → {'pret': True, 'modele': 'small', 'device': 'cuda', 'transcriptions': 1}
+
+  POST /transcris (texte au lieu de son) → HTTP 400 : audio illisible ([Errno 1094995529]…)
+
+  POST /transcris **pendant** le tour → HTTP 200 en 0.68 s
+```
+
+```
+=== contrôles ===
+  OK  le serveur annonce qu'il peut transcrire
+  OK  Whisper n'est pas chargé au démarrage
+  OK  le service a produit l'audio
+  OK  le webm/opus d'un navigateur est accepté
+  OK  le webm/opus est correctement transcrit
+  OK  Whisper est chargé après la première demande
+  OK  le modèle annoncé est celui de la configuration
+  OK  le compteur de transcriptions a suivi
+  OK  un contenu illisible donne un 400 lisible
+  OK  on peut parler pendant que le modèle répond
+  OK  la page a le bouton micro
+  OK  la page envoie vers la bonne route
+  OK  la page gère le cas sans HTTPS
+```
+
+Le contrôle qui compte le plus est l'avant-dernier : **transcrire pendant que le modèle
+répond**, en 0,68 s. Whisper et Kokoro partagent le même GPU et n'ont chacun que leur
+propre verrou : c'est exactement l'endroit où l'on découvre une famine, et le cas d'usage
+réel sur un téléphone (la réponse est en cours de lecture, on veut enchaîner).
+
+### 16.8 Le bug que cette vérification a trouvé : `--port 0` avalé
+
+Premier lancement du script : `[ERREUR] port indisponible : [Errno 98] Address already in
+use` — alors qu'il demandait `--port 0`.
+
+```python
+serveur = ServeurWeb(session.tts, session, port or PORT_WEB)
+```
+
+`port or PORT_WEB` : en Python, **0 est faux**. Le `--port 0` — l'idiome « l'OS m'en
+choisit un libre », dont se servent les scripts de vérification — était donc
+silencieusement remplacé par le port par défaut. Le serveur tombait sur 8091, déjà pris
+par un `voicechat --web` resté ouvert, et refusait de démarrer sans dire pourquoi.
+
+Trois sites étaient touchés : `do_web`, `do_serveur_tts`, `do_serveur_stt`. Tous
+corrigés en `PORT_X if port is None else port`. Et un test verrouille le cas — validé en
+**remettant le bug**, où il échoue comme il faut.
+
+C'est le même genre d'erreur que `temperature` ou `n_ctx` jamais lus (§13.5) : une valeur
+qui n'arrive pas à destination, et un défaut qui prend sa place sans rien dire.
+
+### 16.9 Une conséquence inattendue : le micro du navigateur n'est pas celui de la console
+
+Le micro de la console reste cassé par PortAudio (§10, cause racine non identifiée), et
+c'est le seul vrai trou du projet. Mais le micro d'un navigateur **n'a rien à voir** : il
+passe par les API du navigateur, pas par PortAudio. Si le micro du téléphone fonctionne
+dans la page, alors la dictée et le mot de réveil deviennent possibles *sans* résoudre le
+bug de la v0.4.
+
+Reste à essayer pour de vrai, avec `tailscale serve` pour l'HTTPS. C'est maintenant le pas
+suivant le plus court — et il pourrait remplacer une enquête difficile par un contournement
+propre.
+
 ---
 
-## 17. Service de transcription (v1.2)
+## 17. Service de transcription (v1.3)
 
 Le pendant du serveur TTS, **dans l'autre sens** : ici le client envoie de l'audio et
 reçoit du texte. C'est la pièce qui permet à un client léger — un téléphone, un

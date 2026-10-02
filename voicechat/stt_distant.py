@@ -53,41 +53,40 @@ def decoder_audio(octets: bytes) -> np.ndarray:
         )
 
 
-class _HandlerSTT(HandlerService):
-    """Routes du service STT. Le transcripteur est posé par ``ServeurSTT``."""
+class RoutesTranscription(HandlerService):
+    """Le service de transcription, réutilisable dans n'importe quel serveur.
+
+    Même raison que pour la plomberie HTTP (`service.py`) : le serveur web doit pouvoir
+    offrir `/transcris` sans en recopier la logique. Un client léger — un téléphone — n'a
+    ainsi qu'une seule adresse à connaître pour parler **et** pour écouter, et il n'existe
+    qu'un seul décodage audio à corriger le jour où quelque chose cloche.
+
+    S'utilise comme mixin : ``class MonServeur(AutreChose, RoutesTranscription)``.
+    """
 
     transcriber = None
     # Nommé précisément, et surtout **différent** de tout verrou hérité : la v1.2.1 a
     # montré ce que coûte un nom réutilisé (le verrou GPU écrasé mettait la synthèse de
-    # la première phrase derrière la fin du tour). Ici, un seul GPU ne transcrit qu'une
-    # piste à la fois.
+    # la première phrase derrière la fin du tour).
     verrou_transcription = threading.Lock()
     transcriptions = 0
 
-    def do_GET(self) -> None:  # noqa: N802 (nom imposé par http.server)
-        if self.path.rstrip("/") not in ("/sante", ""):
-            self._erreur(404, "routes : GET /sante, POST /transcris")
-            return
+    # ----------------------------------------------------------------------- état
+    def etat_transcription(self) -> dict:
+        """Ce que le service peut dire de lui-même, sans rien transcrire."""
         transcriber = type(self).transcriber
-        if transcriber is None or not transcriber.pret:
-            self._erreur(503, "transcripteur non chargé")
-            return
-        self._json(
-            200,
-            {
-                "service": TITRE_STT,
-                "pret": True,
-                "modele": getattr(transcriber, "modele", "?"),
-                "device": getattr(transcriber, "device", "?"),
-                "langue": getattr(transcriber, "langue", "") or "auto",
-                "transcriptions": type(self).transcriptions,
-            },
-        )
+        return {
+            "service": TITRE_STT,
+            "pret": bool(transcriber is not None and transcriber.pret),
+            "modele": getattr(transcriber, "modele", "?"),
+            "device": getattr(transcriber, "device", "?"),
+            "langue": getattr(transcriber, "langue", "") or "auto",
+            "transcriptions": type(self).transcriptions,
+        }
 
-    def do_POST(self) -> None:  # noqa: N802
-        if self.path.rstrip("/") != "/transcris":
-            self._erreur(404, "routes : GET /sante, POST /transcris")
-            return
+    # ---------------------------------------------------------------------- route
+    def servir_transcris(self) -> None:
+        """``POST /transcris`` : des octets audio entrent, du texte sort."""
         transcriber = type(self).transcriber
         if transcriber is None or not transcriber.pret:
             self._erreur(503, "transcripteur non chargé")
@@ -116,6 +115,26 @@ class _HandlerSTT(HandlerService):
             return
 
         self._json(200, _resultat_en_json(resultat))
+
+
+class _HandlerSTT(RoutesTranscription):
+    """Le service STT seul, quand on le lance pour d'autres postes (``--serveur-stt``)."""
+
+    def do_GET(self) -> None:  # noqa: N802 (nom imposé par http.server)
+        if self.path.rstrip("/") not in ("/sante", ""):
+            self._erreur(404, "routes : GET /sante, POST /transcris")
+            return
+        etat = self.etat_transcription()
+        if not etat["pret"]:
+            self._erreur(503, "transcripteur non chargé")
+            return
+        self._json(200, etat)
+
+    def do_POST(self) -> None:  # noqa: N802
+        if self.path.rstrip("/") != "/transcris":
+            self._erreur(404, "routes : GET /sante, POST /transcris")
+            return
+        self.servir_transcris()
 
 
 def _resultat_en_json(resultat: Resultat) -> dict:

@@ -1535,7 +1535,13 @@ def do_web(cfg: Config, port: int | None = None) -> int:
         return 2
 
     try:
-        serveur = ServeurWeb(session.tts, session, port or PORT_WEB)
+        # Whisper n'est **pas** chargé ici : il arrive à la première demande de
+        # transcription. Beaucoup de visiteurs se servent de la page sans jamais parler, et
+        # Whisper coûte de la VRAM comme du temps de démarrage.
+        serveur = ServeurWeb(
+            session.tts, session, PORT_WEB if port is None else port,
+            charger_transcription=lambda: charger_transcripteur(cfg),
+        )
         url = serveur.demarrer()
     except OSError as exc:
         print(f"[ERREUR] port indisponible : {exc}")
@@ -1546,6 +1552,7 @@ def do_web(cfg: Config, port: int | None = None) -> int:
     print(f"Modèle  : {nom_court(session.cfg.model)}")
     if session.cfg.n_ctx:
         print(f"Contexte: {session.cfg.n_ctx} tokens")
+    print("Micro   : bouton dans la page — le texte arrive dans le champ")
     print()
     print("Ouvrir l'adresse depuis n'importe quelle machine du tailnet.")
     print("Pour HTTPS (micro du navigateur, installation sur téléphone) :")
@@ -1581,7 +1588,10 @@ def do_serveur_stt(cfg: Config, port: int | None = None) -> int:
         return 2
     print(f"Transcription : {transcriber.device} ({transcriber.compute_reel})")
 
-    port_stt = port or PORT_STT
+    # `if port is None` et non `port or PORT_STT` : avec `or`, un `--port 0` (l'idiome
+    # « l'OS m'en choisit un libre », dont se servent les scripts de vérification) serait
+    # **silencieusement remplacé** par le port par défaut, puisque 0 est faux en Python.
+    port_stt = PORT_STT if port is None else port
     try:
         serveur = ServeurSTT(transcriber, port_stt)
         url = serveur.demarrer()
@@ -1629,7 +1639,8 @@ def do_serveur_tts(cfg: Config, port: int | None = None) -> int:
     print(f"GPU         : {tts.device_reason} → device={tts.device}")
     print(f"Réserve     : {cache.dossier}")
 
-    port_tts = port or PORT_DEFAUT
+    # Même piège que pour le service STT : `port or …` avale un `--port 0`.
+    port_tts = PORT_DEFAUT if port is None else port
     try:
         serveur = ServeurTTS(tts, port_tts)
         url = serveur.demarrer()

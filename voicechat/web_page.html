@@ -55,6 +55,12 @@
     font: inherit; max-height: 8rem; min-height: 2.6rem;
   }
   textarea:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
+  #micro { padding: .6rem .7rem; font-size: 1.1rem; line-height: 1; }
+  #micro.enregistre {
+    background: #7a3b42; border-color: #b3575f; color: #ffd9dc;
+    animation: respire 1.4s ease-in-out infinite;
+  }
+  @keyframes respire { 50% { opacity: .5; } }
   .aide { color: var(--faible); font-size: .72rem; text-align: center; margin-top: .4rem; }
 </style>
 </head>
@@ -70,6 +76,7 @@
 
 <footer>
   <div class="saisie">
+    <button id="micro" title="Parler — le texte entendu arrive dans le champ" hidden>🎤</button>
     <textarea id="q" rows="1" placeholder="Écrivez, puis Entrée — Maj+Entrée pour un saut de ligne"></textarea>
     <button id="envoi">Envoyer</button>
   </div>
@@ -86,6 +93,7 @@ const boutonStop = document.getElementById("stop");
 const boutonNeuf = document.getElementById("neuf");
 const zoneModel = document.getElementById("modele");
 const aide = document.getElementById("aide");
+const boutonMicro = document.getElementById("micro");
 
 let source = null;        // le flux SSE en cours
 let fileAudio = [];       // phrases à dire, dans l'ordre
@@ -219,6 +227,99 @@ function terminer() {
   zone.focus();
 }
 
+// -------------------------------------------------------------------- micro
+// Parler plutôt que taper. Trois pièces : le navigateur enregistre, le serveur transcrit
+// (Whisper tourne sur le poste GPU, pas ici), et le texte arrive dans le champ —
+// **sans être envoyé**. C'est délibéré : une transcription peut se tromper, et mieux vaut
+// la relire avant qu'elle devienne une question ; un mot mal entendu envoyé tout seul
+// coûte plus cher qu'une touche Entrée.
+let enregistreur = null;
+let morceaux = [];
+let fluxMicro = null;
+
+async function commencer() {
+  if (enregistreur) return;
+  if (!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia)) {
+    // Le cas le plus courant, et le plus déroutant : la page est ouverte en http
+    // (non chiffré) sur une adresse IP. Les navigateurs ne donnent le micro que dans un
+    // contexte sécurisé (https, ou localhost) — et dans ce cas `getUserMedia` n'existe
+    // même pas : il n'y a aucun message d'erreur à lire, juste un silence. D'où cette
+    // explication.
+    panne("Le micro du navigateur exige HTTPS. Sur le téléphone il faut passer par " +
+          "l'adresse https (voir « tailscale serve »), pas par l'adresse non chiffrée " +
+          "(" + location.host + ").");
+    return;
+  }
+  try {
+    fluxMicro = await navigator.mediaDevices.getUserMedia({ audio: true });
+  } catch (err) {
+    panne("Micro refusé : " + (err && err.message ? err.message : err));
+    return;
+  }
+  morceaux = [];
+  // webm/opus est ce que produisent Chrome, Edge et Firefox ; Safari ne le sait pas et
+  // enregistre en mp4/aac. Le serveur accepte les deux — c'est le repli PyAV qui s'en
+  // charge — donc on prend ce que le navigateur sait faire, sans l'imposer.
+  const voulu = "audio/webm;codecs=opus";
+  enregistreur = new MediaRecorder(
+    fluxMicro,
+    MediaRecorder.isTypeSupported(voulu) ? { mimeType: voulu } : undefined
+  );
+  enregistreur.addEventListener("dataavailable", (e) => {
+    if (e.data && e.data.size) morceaux.push(e.data);
+  });
+  enregistreur.addEventListener("stop", () => {
+    const format = enregistreur.mimeType || "audio/webm";
+    if (fluxMicro) fluxMicro.getTracks().forEach((p) => p.stop());
+    fluxMicro = null;
+    enregistreur = null;
+    boutonMicro.classList.remove("enregistre");
+    boutonMicro.textContent = "🎤";
+    transcrire(new Blob(morceaux, { type: format }));
+  });
+  enregistreur.start();
+  boutonMicro.classList.add("enregistre");
+  boutonMicro.textContent = "■";
+  aide.style.color = "";
+  aide.textContent = "enregistre… cliquer pour arrêter";
+}
+
+async function transcrire(blob) {
+  aide.style.color = "";
+  aide.textContent = "transcription…";
+  try {
+    const reponse = await fetch("transcris", {
+      method: "POST",
+      headers: { "Content-Type": blob.type || "application/octet-stream" },
+      body: blob,
+    });
+    if (!reponse.ok) {
+      panne("Transcription impossible : " + (await reponse.text()));
+      return;
+    }
+    const infos = await reponse.json();
+    const texte = (infos.texte || "").trim();
+    if (!texte) {
+      panne("Rien entendu — réessayer en parlant plus près du micro.");
+      return;
+    }
+    // On **ajoute** au champ au lieu de le remplacer : dicter une précision après avoir
+    // commencé à taper est le cas le plus courant.
+    zone.value = zone.value.trim() ? zone.value.replace(/\s+$/, "") + " " + texte : texte;
+    zone.dispatchEvent(new Event("input"));  // la zone grandit comme à la frappe
+    zone.focus();
+    aide.style.color = "";
+    aide.textContent = "entendu (« " + infos.rtf + " » RTF) — Entrée pour envoyer";
+  } catch (err) {
+    panne("Transcription impossible : " + err.message);
+  }
+}
+
+boutonMicro.onclick = () => {
+  if (enregistreur) enregistreur.stop();
+  else commencer();
+};
+
 // ------------------------------------------------------------------- départ
 boutonEnvoi.onclick = envoyer;
 boutonStop.onclick = () => { taire(); terminer(); aide.textContent = "arrêté"; };
@@ -239,10 +340,14 @@ zone.addEventListener("input", () => {
   zone.style.height = Math.min(zone.scrollHeight, 128) + "px";
 });
 
-// État initial : quel modèle, quel contexte.
+// État initial : quel modèle, quel contexte — et le micro est-il possible.
 fetch("etat").then((r) => r.json()).then((e) => {
   zoneModel.textContent = e.modele + (e.contexte
     ? " · contexte " + e.contexte.total : "");
+  // Le bouton n'apparaît que si le serveur est capable de transcrire. Le cas « pas de
+  // HTTPS » n'est **pas** filtré ici, exprès : cliquer dessus doit expliquer pourquoi,
+  // ce qu'un bouton absent n'expliquerait pas.
+  if (e.transcription && e.transcription.disponible) boutonMicro.hidden = false;
 }).catch(() => {});
 zone.focus();
 </script>

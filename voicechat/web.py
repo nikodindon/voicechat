@@ -36,12 +36,13 @@ import threading
 import time
 from http.server import ThreadingHTTPServer
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 from urllib.parse import parse_qs, urlsplit
 
 from . import distant
 from .config import nom_court
 from .llm import LLMError, stream_with_usage
+from .stt_distant import RoutesTranscription
 from .tour import derouler
 
 if TYPE_CHECKING:  # évite un cycle à l'exécution : cli.py importe ce module
@@ -51,8 +52,14 @@ PORT_WEB = 8091
 PAGE = Path(__file__).with_name("web_page.html")
 
 
-class _HandlerWeb(distant._Handler):
-    """Routes du serveur web. La session et le synthétiseur sont posés par ``ServirWeb``."""
+class _HandlerWeb(distant._Handler, RoutesTranscription):
+    """Routes du serveur web. La session et le synthétiseur sont posés par ``ServirWeb``.
+
+    Il tient trois rôles : servir la page, porter la conversation (`/flux`, `/reset`), et
+    — depuis la v1.2 — **transcrire** (`/transcris`, hérité de ``RoutesTranscription``).
+    C'est la même adresse pour parler et pour écouter : un client léger n'en connaît
+    qu'une.
+    """
 
     session: "ChatSession | None" = None
     # Un seul tour à la fois : deux tours simultanés se marcheraient dessus dans le même
@@ -62,6 +69,39 @@ class _HandlerWeb(distant._Handler):
     # première phrase. Le son n'arrivait donc qu'une fois la réponse entière affichée —
     # exactement l'inverse du but.
     verrou_tour = threading.Lock()
+
+    # Le transcripteur n'est **pas** chargé au démarrage : Whisper coûte de la VRAM et une
+    # quinzaine de secondes, et beaucoup de visiteurs se servent de la page sans jamais
+    # parler. Il arrive à la première demande de transcription. `charger_transcription`
+    # est posé par ``ServirWeb``, qui seul connaît la configuration.
+    # Volontairement `Any` et non `Callable` : annoté `Callable`, Pyright le prend pour
+    # une **méthode** et refuse de le lire sur la classe (il attend un `self`). Or c'est
+    # bien une fonction posée de l'extérieur, par ``ServirWeb``.
+    charger_transcription: Any = None  # () -> Transcription | None
+    verrou_chargement = threading.Lock()
+
+    @classmethod
+    def _assurer_transcription(cls) -> object | None:
+        """Charge Whisper à la première demande, une seule fois même à plusieurs.
+
+        Deux requêtes simultanées ne doivent pas charger deux Whisper : le second
+        attendrait pour rien, et le GPU n'en voudrait pas deux de toute façon.
+        """
+        if cls.transcriber is not None:
+            return cls.transcriber
+        if cls.charger_transcription is None:
+            return None
+        with cls.verrou_chargement:
+            if cls.transcriber is None:  # re-test : un autre fil a pu charger entre-temps
+                cls.transcriber = cls.charger_transcription()
+            return cls.transcriber
+
+    def transcrire(self) -> None:
+        """``POST /transcris`` : charge Whisper au besoin, puis transcrit."""
+        if type(self)._assurer_transcription() is None:
+            self._erreur(503, "transcription indisponible : Whisper n'a pas pu être chargé")
+            return
+        self.servir_transcris()
 
     # ------------------------------------------------------------------ utilitaires
     def _evenement(self, nom: str, donnees: dict) -> None:
@@ -99,8 +139,12 @@ class _HandlerWeb(distant._Handler):
         super().do_GET()  # /sante, hérité du serveur TTS
 
     def do_POST(self) -> None:  # noqa: N802
-        if urlsplit(self.path).path.rstrip("/") == "/reset":
+        chemin = urlsplit(self.path).path.rstrip("/")
+        if chemin == "/reset":
             self._reset()
+            return
+        if chemin == "/transcris":
+            self.transcrire()
             return
         super().do_POST()  # /parle, hérité du serveur TTS
 
@@ -124,6 +168,14 @@ class _HandlerWeb(distant._Handler):
             "archives": len(session.messages),
             "voix": getattr(tts, "voice", ""),
             "contexte": None,
+            # Ce que la page peut savoir du micro **avant** d'enregistrer : le service est
+            # capable de transcrire (le chargeur existe), et Whisper est-il déjà en
+            # mémoire. Sans ça, le premier « tenir pour parler » échouerait sans explication
+            # pendant la quinzaine de secondes que met Whisper à se charger.
+            "transcription": {
+                **self.etat_transcription(),
+                "disponible": type(self).charger_transcription is not None,
+            },
         }
         if session.cfg.n_ctx:
             donnees["contexte"] = {
@@ -247,12 +299,34 @@ class _HandlerWeb(distant._Handler):
 class ServeurWeb:
     """Le service web lui-même : une page, un flux, et le TTS hérité."""
 
-    def __init__(self, tts, session: "ChatSession", port: int = PORT_WEB) -> None:
+    def __init__(
+        self,
+        tts,
+        session: "ChatSession",
+        port: int = PORT_WEB,
+        charger_transcription: Any = None,
+    ) -> None:
+        # `staticmethod` : sans lui, la fonction posée dans la classe serait prise pour une
+        # méthode et recevrait `self` en premier argument au moment de l'appel.
+        #
+        # `transcriber`, `verrou_chargement` et `transcriptions` sont reposés ici, et pas
+        # hérités : hérités, ils seraient **communs à tous les serveurs du même
+        # processus** — un second serveur verrait le Whisper du premier, et son compteur.
         handler = type(
-            "_HandlerWebLie", (_HandlerWeb,), {"tts": tts, "session": session}
+            "_HandlerWebLie",
+            (_HandlerWeb,),
+            {
+                "tts": tts,
+                "session": session,
+                "charger_transcription": staticmethod(charger_transcription),
+                "transcriber": None,
+                "verrou_chargement": threading.Lock(),
+                "transcriptions": 0,
+            },
         )
         self.tts = tts
         self.session = session
+        self.charger_transcription = charger_transcription
         self._httpd = ThreadingHTTPServer(("0.0.0.0", port), handler)
         # Port réellement pris : avec 0, l'OS en choisit un libre.
         self.port = int(self._httpd.server_address[1])
