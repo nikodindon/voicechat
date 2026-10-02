@@ -5,7 +5,7 @@ Chat en console avec un **LLM local** (API OpenAI-compatible) qui **répond auss
 ```
    ┌──────────────────────────┐         HTTP / SSE          ┌───────────────────────┐
    │  voicechat (ce projet)   │  ─────────────────────────► │  serveur LLM          │
-   │  console + TTS + audio   │  ◄───────────────────────── │  100.108.224.60:8080  │
+   │  console + TTS + audio   │  ◄───────────────────────── │  100.91.114.49:8080   │
    └──────────────────────────┘      tokens en streaming    └───────────────────────┘
               │
               │ Kokoro (torch) + sounddevice
@@ -25,26 +25,45 @@ sur la machine avec laquelle on parle. On ne dépend donc jamais d'un service TT
 | Client console + streaming SSE | ✅ implémenté et vérifié (v0.1) |
 | Kokoro TTS local + lecture audio | ✅ implémenté et vérifié (v0.1) |
 | Sélection GPU `auto/cuda/cpu` | ✅ **GPU opérationnel** — RTF 0,09 (cf. §8 pour l'obligation de build cu126 sur Pascal) |
-| Serveur LLM `100.108.224.60:8080` | ⚠️ **injoignable au moment de l'écriture** |
+| Serveur LLM `100.91.114.49:8080` (niko-1650-super) | ✅ **joignable** — Ornith-1.5-35B-A3B Q4_K_M |
 | Suite de tests hors ligne | ✅ 20 tests passent |
 
-> **Constat réseau (mesuré, pas supposé)** — l'hôte `100.108.224.60` est `niko-tv` dans le tailnet :
+> **Cible réelle du serveur LLM** — `100.91.114.49` = `niko-1650-super` dans le tailnet,
+> llama.cpp exposant une API OpenAI-compatible :
 >
 > ```
-> $ tailscale status | grep 100.108.224.60
-> 100.108.224.60  niko-tv   nikodindon@  linux  active; relay "par"; offline, last seen 2d ago
+> $ tailscale status | grep 100.91.114.49
+> 100.91.114.49   niko-1650-super   nikodindon@   linux   active; direct 192.168.1.32:41641
 >
-> $ ping -c 2 100.108.224.60
-> 2 packets transmitted, 0 received, 100% packet loss
->
-> $ curl -sv -m 8 http://100.108.224.60:8080/v1/models
-> *   Trying 100.108.224.60:8080...
-> * Connection timed out after 8002 milliseconds
+> $ curl -s -m 10 http://100.91.114.49:8080/v1/models | python3 -m json.tool | head -18
+> {
+>     "models": [
+>         {
+>             "name": "/mnt/data/sdc2/models/Ornith-1.5-35B-A3B-APEX-i-mini.gguf",
+>             "model": "/mnt/data/sdc2/models/Ornith-1.5-35B-A3B-APEX-i-mini.gguf",
+>             "modified_at": "",
+>             "size": "",
+>             "digest": "",
+>             "type": "model",
+>             "description": "",
+>             "tags": [
+>                 ""
+>             ],
+>             "capabilities": [
+>                 "completion"
+>             ],
+>             "parameters": "",
+>             "details": {
 > ```
 >
-> Le code de la v0.1 est donc validé **contre un faux serveur OpenAI-compatible local**
-> (voir §6 « Tests »). Aucune sortie de ce README n'est inventée : ce qui est marqué ✅ a été
-> exécuté, ce qui est marqué ⚠️ a échoué et est reporté tel quel.
+> Le nom du modèle renvoyé par llama.cpp est un **chemin de fichier complet**. Le client le
+> reprend tel quel depuis `/v1/models` — c'est exactement pourquoi il ne faut pas le coder en
+> dur dans une constante.
+
+> **Note historique** : la v0.1 a d'abord été développée en pointant sur `100.108.224.60`
+> (`niko-tv`), qui était en fait **éteint depuis 2 jours** — et surtout n'était pas la bonne
+> machine. Le §9 conserve la trace de ce diagnostic raté et de la validation intermédiaire
+> contre `tests/fake_llm_server.py`, car le chemin de code exercé était le même.
 
 ---
 
@@ -113,7 +132,7 @@ de commande (l'option gagne). Aucune clé n'est obligatoire : llama.cpp ignore `
 
 | Variable | Défaut | Rôle |
 |---|---|---|
-| `VOICECHAT_BASE_URL` | `http://100.108.224.60:8080/v1` | racine de l'API OpenAI-compatible |
+| `VOICECHAT_BASE_URL` | `http://100.91.114.49:8080/v1` | racine de l'API OpenAI-compatible |
 | `VOICECHAT_MODEL` | *(auto)* | nom du modèle ; si vide → détecté via `/v1/models` |
 | `VOICECHAT_API_KEY` | *(vide)* | jeton éventuel |
 | `VOICECHAT_VOICE` | `ff_siwis` | voix Kokoro (français) |
@@ -140,9 +159,14 @@ de commande (l'option gagne). Aucune clé n'est obligatoire : llama.cpp ignore `
 # Lister les voix Kokoro disponibles
 .venv/bin/python -m voicechat --list-voices
 
-# Changer de cible / de voix / forcer le CPU
-.venv/bin/python -m voicechat --base-url http://100.91.114.49:8080/v1 \
-                              --voice ff_siwis --device cpu
+# Changer de cible (utile pour tester contre un autre llama-server)
+.venv/bin/python -m voicechat --base-url http://192.168.1.32:8080/v1
+
+# Forcer le CPU (pas le GPU) pour ne pas chauffer pendant une longue session
+.venv/bin/python -m voicechat --device cpu
+
+# Voix anglaise, débit ralenti
+.venv/bin/python -m voicechat --voice af_heart --lang a --speed 0.9
 ```
 
 ### Commandes en session
@@ -214,6 +238,7 @@ python3 tests/fake_llm_server.py 8099          # terminal 1
 
 ### v0.2 — confort d'usage
 - [ ] Interruption à chaud : `Ctrl+C` coupe la lecture **et** la génération en cours
+- [ ] Afficher un **nom de modèle court** au lieu du chemin complet renvoyé par llama.cpp
 - [ ] `/save` et `/load` : persistance des conversations en JSON
 - [ ] Historique de saisie (readline) + complétion des `/commandes`
 - [ ] Streaming audio par morceaux (moins de trou entre deux phrases)
@@ -232,7 +257,7 @@ python3 tests/fake_llm_server.py 8099          # terminal 1
 
 ### v0.5 — robustesse réseau
 - [ ] Reconnexion automatique + retry exponentiel si `niko-tv` redémarre
-- [ ] Bascule automatique vers un serveur de secours (ex. `100.91.114.49`)
+- [ ] Bascule automatique vers un serveur de secours (ex. `niko-tv`, aujourd'hui éteint)
 - [ ] Mode dégradé : réponses texte, voix mise en file puis rejouée au retour du GPU
 
 ### v1.0 — distribué
@@ -245,18 +270,23 @@ python3 tests/fake_llm_server.py 8099          # terminal 1
 
 ## 8. Dépannage
 
-**`[ERREUR] Connexion impossible à http://100.108.224.60:8080/v1`**
-La machine distante est éteinte ou Tailscale est down.
+**`[ERREUR] Connexion impossible à http://100.91.114.49:8080/v1`**
+La machine distante est éteinte, ou Tailscale est down, ou l'IP a changé (les adresses
+`100.x.y.z` du tailnet sont **stables** mais il y a plusieurs machines : ne pas confondre
+`niko-tv`, `niko-1650-super` et `niko-nitro-an515-52`).
 ```bash
-tailscale status | grep 100.108.224.60    # « offline, last seen … » ?
-tailscale ping 100.108.224.60
+tailscale status | grep 100.91.114.49    # « offline, last seen … » ?
+tailscale ping 100.91.114.49
 ```
 Un serveur LLM doit écouter en `0.0.0.0` sur le port 8080, sinon Tailscale ne le voit pas :
 
 ```bash
-# exemple llama.cpp côté niko-tv
+# exemple llama.cpp côté niko-1650-super
 llama-server -m modele.gguf --host 0.0.0.0 --port 8080
 ```
+
+Astuce diagnostic : `--probe` teste la cible **sans** charger Kokoro. Séparer les deux moitiés
+du problème (réseau vs GPU/TTS) fait gagner beaucoup de temps.
 
 **`Torch not compiled with CUDA enabled` / repli CPU silencieux**
 Vérifier ce que voit PyTorch :
@@ -407,8 +437,9 @@ $ .venv/bin/python -m voicechat
 [matériel] auto → CPU. torch 2.14.1+cu130 — GPU visible (sm_61) mais aucun noyau compilé
 pour lui — ce wheel ne contient que sm_75, sm_80, sm_86, sm_90, sm_100, sm_120.
 Détail : CUDA error: no kernel image is available for execution on the device
-voicechat 0.1.0  ·  serveur http://100.108.224.60:8080/v1
 ```
+
+(capture faite **avant** le remplacement du wheel ; seule la ligne utile est reproduite)
 
 ### Le build cu126 change tout — mesure CPU vs GPU
 
@@ -446,20 +477,70 @@ vous › ia › Bonjour ! Voici une réponse de test, découpée en plusieurs ph
    · 1er token 0.00 s | 220 car. en 1.18 s (186.9 car/s) | TTS RTF 0.13
 ```
 
-### Attente du serveur réel
+### Le serveur réel : premier échange complet
+
+`--probe`, sans aucun argument — donc sur la cible par défaut :
 
 ```
-$ .venv/bin/python -m voicechat --probe --base-url http://100.108.224.60:8080/v1
-Serveur   : http://100.108.224.60:8080/v1
-Test      : GET http://100.108.224.60:8080/v1/models
-ÉCHEC après 10.1 s
-  Connexion impossible à 100.108.224.60:8080 (<urlopen error timed out>).
-  → la machine distante est probablement éteinte, ou le serveur LLM n'écoute pas sur 0.0.0.0.
-  → vérifier : tailscale status ; ou lancer le serveur avec --host 0.0.0.0
+$ .venv/bin/python -m voicechat --probe
+Serveur   : http://100.91.114.49:8080/v1
+Test      : GET http://100.91.114.49:8080/v1/models
+OK en 0.05 s — 1 modèle(s)
+  • /mnt/data/sdc2/models/Ornith-1.5-35B-A3B-APEX-i-mini.gguf
 ```
 
-Dès que `niko-tv` est rallumé, la même commande doit afficher `OK … — N modèle(s)` et le
-client prend le modèle tout seul, sans `--model`.
+Puis le vrai chat, avec la voix sur GPU (modèle détecté tout seul, aucun `--model`) :
+
+```
+$ .venv/bin/python -m voicechat --debug
+[matériel] auto → GPU. torch 2.14.1+cu126 — NVIDIA GeForce GTX 1050 (4031 Mo)
+voicechat 0.1.0  ·  serveur http://100.91.114.49:8080/v1
+Modèle : /mnt/data/sdc2/models/Ornith-1.5-35B-A3B-APEX-i-mini.gguf (détecté, 1 disponible(s))
+Voix   : chargement de Kokoro « ff_siwis »…
+GPU    : auto → GPU. torch 2.14.1+cu126 — NVIDIA GeForce GTX 1050 (4031 Mo) → device=cuda
+
+vous › Reponds en une seule phrase courte : quelle est la capitale de la France ?
+ia › La capitale de la France est Paris.
+   · 1er token 1.81 s | 35 car. en 2.20 s (15.9 car/s) | TTS RTF 0.28
+```
+
+**Ce qui est prouvé ici** : la chaîne complète tourne — question tapée → streaming depuis
+`niko-1650-super` (35B MoE, 3B actifs, Q4_K_M) → découpage en phrases → Kokoro sur la GTX 1050
+→ audio dans les haut-parleurs. Le débit texte (15,9 car/s) est bien plus lent que la synthèse
+(RTF 0,28) : la voix n'attend jamais le texte, c'est le texte qui attend la voix.
+
+Réponse plus longue, avec **aucun argument de ligne de commande** (donc cible par défaut) :
+
+```
+$ .venv/bin/python -m voicechat --debug
+vous › Explique en trois phrases courtes pourquoi le ciel est bleu.
+ia › Le ciel est bleu à cause de la diffusion de la lumière du soleil par l'atmosphère.
+
+Les rayons lumineux bleus ont une longueur d'onde plus courte, donc ils se dispersent
+davantage que les autres couleurs.
+
+C'est ce phénomène, appelé diffusion de Rayleigh, qui donne au ciel sa couleur bleue.
+   · 1er token 0.97 s | 291 car. en 3.89 s (74.8 car/s) | TTS RTF 0.12
+```
+
+Le modèle sépare ses phrases par des lignes vides : le découpage les traite comme trois
+phrases distinctes, donc **la première est déjà en train d'être prononcée** pendant que la
+troisième n'est pas encore écrite. C'est tout l'intérêt de découper le flux au vol.
+
+### Réglage : le nom du modèle
+
+llama.cpp renvoie un **chemin de fichier** comme identifiant :
+
+```
+Modèle : /mnt/data/sdc2/models/Ornith-1.5-35B-A3B-APEX-i-mini.gguf
+```
+
+C'est laid dans la console mais fonctionnel — et c'est exactement pourquoi la détection
+automatique via `/v1/models` vaut mieux qu'un nom codé en dur. Pour un affichage propre :
+
+```bash
+.venv/bin/python -m voicechat --model Ornith-1.5-35B-A3B-APEX-i-mini.gguf
+```
 
 ### Voix disponibles
 

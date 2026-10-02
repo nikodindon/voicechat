@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, replace
 
-DEFAULT_BASE_URL = "http://100.108.224.60:8080/v1"
+DEFAULT_BASE_URL = "http://100.91.114.49:8080/v1"
 DEFAULT_VOICE = "ff_siwis"  # français féminin
 DEFAULT_LANG = "f"
 DEFAULT_SYSTEM = (
