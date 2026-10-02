@@ -2198,18 +2198,27 @@ brut pendant la génération, sort proprement quand l'entrée n'est pas un termi
 ### 14.5 Intégration continue
 
 La suite tourne sur chaque `push`, avec pour seul bagage `numpy`, `soundfile` et
-`pytest` — pas de torch, pas de Kokoro, pas de GPU. Un job dédié le **prouve** :
+`pytest` — pas de torch, pas de Kokoro, pas de GPU. Deux jobs, un par version de Python,
+chacun en environ une minute :
 
 ```
-$ python tests/verif_sans_lourds.py
-blocage actif : torch, kokoro, faster_whisper, ctranslate2, av
-271 passed, 4 skipped in 29.04s
+✓ tests hors ligne (Python 3.11) in 1m10s
+✓ tests hors ligne (Python 3.12) in 1m10s
 ```
 
-Ce script n'est pas décoratif : il installe un bloqueur d'import et échoue si un module
-se met à importer torch en haut de fichier. Sans lui, quelqu'un ajouterait un `import
-torch` un jour, la CI deviendrait lente puis serait désactivée, et plus rien ne serait
-vérifié. Le badge est en haut de ce README.
+Et ce que la CI a réellement exécuté, tel quel dans ses journaux :
+
+```
+Tests                                  271 passed, 4 skipped in 29.26s
+La suite ne doit pas dépendre des paquets lourds
+   blocage actif : torch, kokoro, faster_whisper, ctranslate2, av
+                                       271 passed, 4 skipped in 28.82s
+```
+
+Ce second contrôle n'est pas décoratif : `tests/verif_sans_lourds.py` installe un
+bloqueur d'import et échoue si un module se met à importer torch en haut de fichier.
+Sans lui, quelqu'un ajouterait un `import torch` un jour, la CI deviendrait lente puis
+serait désactivée, et plus rien ne serait vérifié. Le badge est en haut de ce README.
 
 ### 14.6 Quatre erreurs, toutes dans mes vérifications
 
