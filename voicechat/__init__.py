@@ -3,7 +3,7 @@
 import os
 import warnings
 
-__version__ = "1.2.1"
+__version__ = "1.3.0"
 
 # Bruit de bibliothèques tierces : rien d'actionnable pour l'utilisateur, mais ça
 # remplit la console de dizaines de lignes à chaque lancement. On le coupe ici,

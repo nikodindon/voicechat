@@ -31,7 +31,8 @@ from .llm import (
     stream_with_usage,
 )
 from .micro import DetecteurParole, Ecouteur, Microphone
-from .stt import Transcriber
+from .stt import Transcriber, Transcription
+from .stt_distant import PORT_STT, STTDistant
 from .tour import derouler
 from .tts import (
     KokoroTTS,
@@ -166,11 +167,15 @@ def build_parser() -> argparse.ArgumentParser:
                    help="synthétiser sur un autre poste (ex. http://niko-tv:8090)")
     p.add_argument("--serveur-tts", action="store_true",
                    help="tenir le service TTS pour d'autres postes, puis sortir")
+    p.add_argument("--serveur-stt", action="store_true",
+                   help="tenir le service de transcription pour d'autres postes, puis sortir")
+    p.add_argument("--stt-distant", metavar="URL",
+                   help="transcrire sur un autre poste (ex. http://niko-tv:8092)")
     p.add_argument("--web", action="store_true",
                    help="servir l'interface web (page + texte au fil de l'eau + audio)")
     p.add_argument("--port", type=int, default=None,
                    help=f"port d'écoute (défaut : {PORT_DEFAUT} pour --serveur-tts, "
-                        f"{PORT_WEB} pour --web)")
+                        f"{PORT_STT} pour --serveur-stt, {PORT_WEB} pour --web)")
     p.add_argument("--temperature", type=float, help="température d'échantillonnage")
     p.add_argument("--timeout", type=float, help="délai max en secondes par requête")
     p.add_argument("--probe", action="store_true", help="tester la joignabilité du serveur et sortir")
@@ -230,6 +235,7 @@ def config_from_args(args: argparse.Namespace) -> Config:
         tts=False if args.no_tts else None,
         cache=False if args.no_cache else None,
         tts_url=args.tts_distant.rstrip("/") if args.tts_distant else None,
+        stt_url=args.stt_distant.rstrip("/") if args.stt_distant else None,
         temperature=args.temperature,
         timeout=args.timeout,
         profil=args.profil,
@@ -278,6 +284,41 @@ def do_probe(cfg: Config) -> int:
     return 0
 
 
+def charger_transcripteur(cfg: Config):
+    """Prépare la transcription : locale, ou déportée si ``stt_url`` est renseigné.
+
+    Retourne le transcripteur prêt, ou ``None`` après avoir affiché pourquoi. Les deux
+    sites d'appel — le mode `--transcrire` et le micro de la session — veulent exactement
+    le même comportement ; les laisser écrire chacun leur tour de création garantissait
+    qu'ils finissent par diverger.
+
+    Les deux implémentations se présentent pareil (``pret``, ``charger()``,
+    ``transcrire()``, ``transcrire_fichier()``) : le reste du programme n'a pas à savoir
+    laquelle il tient.
+    """
+    if cfg.stt_url:
+        print(f"Micro  : connexion au service STT {cfg.stt_url}…")
+        transcriber = STTDistant(url=cfg.stt_url, langue=cfg.stt_langue)
+    else:
+        print(f"Micro  : chargement de whisper « {cfg.stt_modele} »…")
+        transcriber = Transcriber(
+            modele=cfg.stt_modele, device=cfg.stt_device, langue=cfg.stt_langue
+        )
+
+    if not transcriber.charger():
+        print(f"Micro  : INDISPONIBLE — {transcriber.erreur}")
+        return None
+    print(f"Micro  : {decrire_transcripteur(cfg, transcriber)}")
+    return transcriber
+
+
+def decrire_transcripteur(cfg: Config, transcriber) -> str:
+    """La ligne de console qui dit ce qui transcrit, et où."""
+    if cfg.stt_url:
+        return f"transcription déportée vers {cfg.stt_url} (modèle {transcriber.modele})"
+    return f"whisper « {cfg.stt_modele} » sur {transcriber.device} ({transcriber.compute_reel})"
+
+
 def do_transcrire(cfg: Config, chemin: str) -> int:
     """Mode one-shot : transcrire un fichier audio, sans conversation ni voix."""
     import os
@@ -286,14 +327,9 @@ def do_transcrire(cfg: Config, chemin: str) -> int:
         print(f"fichier introuvable : {chemin}")
         return 2
 
-    print(f"Micro  : chargement de whisper « {cfg.stt_modele} »…")
-    transcriber = Transcriber(
-        modele=cfg.stt_modele, device=cfg.stt_device, langue=cfg.stt_langue
-    )
-    if not transcriber.charger():
-        print(f"[ERREUR] {transcriber.erreur}")
+    transcriber = charger_transcripteur(cfg)
+    if transcriber is None:
         return 2
-    print(f"Micro  : whisper « {cfg.stt_modele} » sur {transcriber.device} ({transcriber.compute_reel})")
 
     try:
         resultat = transcriber.transcrire_fichier(chemin)
@@ -426,7 +462,7 @@ class ChatSession:
         self.frappes = ""  # frappes faites pendant la réponse, rendues au prochain prompt
         self.modeles: list[str] = []  # noms connus du serveur, pour Tab
         self._voix: list[str] | None = None  # voix Kokoro, récupérées une seule fois
-        self.transcripteur: Transcriber | None = None  # chargé au premier besoin
+        self.transcripteur: Transcription | None = None  # chargé au premier besoin
         self.ecouteur: Ecouteur | None = None
         self._stt_indisponible = False
         self.mains_libres = cfg.micro
@@ -570,20 +606,10 @@ class ChatSession:
         if self._stt_indisponible:
             return False
 
-        print(f"Micro  : chargement de whisper « {self.cfg.stt_modele} »…")
-        transcriber = Transcriber(
-            modele=self.cfg.stt_modele,
-            device=self.cfg.stt_device,
-            langue=self.cfg.stt_langue,
-        )
-        if not transcriber.charger():
-            print(f"Micro  : INDISPONIBLE — {transcriber.erreur}")
+        transcriber = charger_transcripteur(self.cfg)
+        if transcriber is None:
             self._stt_indisponible = True
             return False
-        print(
-            f"Micro  : whisper « {self.cfg.stt_modele} » sur "
-            f"{transcriber.device} ({transcriber.compute_reel})"
-        )
         self.transcripteur = transcriber
         return True
 
@@ -821,7 +847,12 @@ class ChatSession:
                 self.messages.pop()  # on retire la question pour garder un contexte propre
             finally:
                 reponse = "".join(recus) or reponse
-                flux.close()  # ferme la connexion HTTP, même si on a interrompu
+                # On ne présume pas du type : `stream_with_usage` annonce un itérateur,
+                # mais en pratique c'est un générateur — donc fermable, ce qui libère la
+                # connexion HTTP du modèle.
+                fermer = getattr(flux, "close", None)
+                if fermer is not None:
+                    fermer()
 
             print()  # fin de la ligne de réponse
 
@@ -1531,6 +1562,52 @@ def do_web(cfg: Config, port: int | None = None) -> int:
     return 0
 
 
+def do_serveur_stt(cfg: Config, port: int | None = None) -> int:
+    """Tient le service de transcription pour d'autres postes, jusqu'à Ctrl+C.
+
+    Le pendant du serveur TTS, dans l'autre sens : le client envoie de l'**audio**, le
+    service rend du **texte**. Un client léger — téléphone, navigateur — peut donc parler
+    sans embarquer Whisper, ce qui est tout l'intérêt : c'est Whisper qui coûte cher, pas
+    le fait de parler.
+    """
+    from .stt_distant import ServeurSTT
+
+    print(f"Serveur STT : chargement de whisper « {cfg.stt_modele} »…")
+    transcriber = Transcriber(
+        modele=cfg.stt_modele, device=cfg.stt_device, langue=cfg.stt_langue
+    )
+    if not transcriber.charger():
+        print(f"[ERREUR] {transcriber.erreur}")
+        return 2
+    print(f"Transcription : {transcriber.device} ({transcriber.compute_reel})")
+
+    port_stt = port or PORT_STT
+    try:
+        serveur = ServeurSTT(transcriber, port_stt)
+        url = serveur.demarrer()
+    except OSError as exc:
+        print(f"[ERREUR] port {port_stt} indisponible : {exc}")
+        return 2
+
+    print(f"Écoute      : {url}")
+    print(f"                GET  {url}/sante      (état)")
+    print(f"                POST {url}/transcris  (audio → texte)")
+    print()
+    print("Depuis un autre poste :")
+    print(f"  voicechat --transcrire enregistrement.wav --stt-distant {url}")
+    print(f"  voicechat --micro --stt-distant {url}")
+    print()
+    print("Ctrl+C pour arrêter le service.")
+    try:
+        while True:
+            time.sleep(0.5)
+    except KeyboardInterrupt:
+        print("\nservice arrêté.")
+    finally:
+        serveur.arreter()
+    return 0
+
+
 def do_serveur_tts(cfg: Config, port: int | None = None) -> int:
     """Tient le service TTS pour d'autres postes, jusqu'à Ctrl+C.
 
@@ -1669,6 +1746,8 @@ def main(argv: list[str] | None = None) -> int:
         return do_diag_micro(cfg)
     if args.serveur_tts:
         return do_serveur_tts(cfg, args.port)
+    if args.serveur_stt:
+        return do_serveur_stt(cfg, args.port)
     if args.web:
         return do_web(cfg, args.port)
     if args.probe:

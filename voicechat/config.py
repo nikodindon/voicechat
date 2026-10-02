@@ -153,6 +153,9 @@ class Config:
     stt_device: str = "auto"  # auto | cuda | cpu
     stt_langue: str = "fr"  # "" = détection automatique
     micro_device: int | str | None = None
+    # Transcription déportée : envoyer l'AUDIO à un service et recevoir le TEXTE (v1.2).
+    # Vide = Whisper local (cf. `charger_transcripteur`).
+    stt_url: str = ""
 
     show_stats: bool = False
     history_limit: int = 24  # nb de messages gardés si le serveur n'annonce pas son contexte
@@ -204,6 +207,7 @@ class Config:
             stt_device=env("VOICECHAT_STT_DEVICE", "stt_device", "auto").lower(),
             stt_langue=env("VOICECHAT_STT_LANGUE", "stt_langue", "fr"),
             micro_device=env("VOICECHAT_MICRO_DEVICE", "micro_device", "") or None,
+            stt_url=env("VOICECHAT_STT_URL", "stt_url", "").rstrip("/"),
             # 0 (défaut) = demander au serveur. Une valeur force le budget de contexte.
             n_ctx=int(_env_float("VOICECHAT_N_CTX", float(base.get("n_ctx", defauts.n_ctx)))),
             # Ces trois-là n'étaient réglables ni par l'environnement ni par le fichier :

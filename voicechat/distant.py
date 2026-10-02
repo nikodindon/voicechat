@@ -22,9 +22,11 @@ from __future__ import annotations
 import io
 import json
 import threading
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from http.server import ThreadingHTTPServer
 
 import numpy as np
+
+from .service import HandlerService
 
 SAMPLE_RATE = 24000
 PORT_DEFAUT = 8090
@@ -32,36 +34,12 @@ TITRE = "voicechat-tts/1"
 
 
 # ============================================================ côté serveur
-class _Handler(BaseHTTPRequestHandler):
-    """Routes du service. Le synthétiseur est posé sur le serveur (attribut de classe)."""
+class _Handler(HandlerService):
+    """Routes du service TTS. Le synthétiseur est posé par ``ServeurTTS`` (attribut de classe)."""
 
-    protocol_version = "HTTP/1.1"
-    tts = None  # rempli par `servir()`
+    tts = None
     verrou = threading.Lock()  # un seul appel au GPU à la fois
     appels = 0
-
-    def log_message(self, format: str, *args) -> None:  # noqa: A002 (nom imposé)
-        """Silence : le serveur ne pollue pas le terminal de ses clients."""
-        return
-
-    # ------------------------------------------------------------- utilitaires
-    def _envoyer(self, code: int, corps: bytes, ctype: str) -> None:
-        self.send_response(code)
-        # Le charset vaut pour le texte (JSON, HTML, flux d'évènements) : sans lui,
-        # « synthétiseur non chargé » devient illisible au curl et dans un navigateur.
-        # L'annoncer sur audio/wav serait faux : d'où le test sur le type.
-        if ctype.startswith(("application/json", "text/")):
-            ctype = f"{ctype}; charset=utf-8"
-        self.send_header("Content-Type", ctype)
-        self.send_header("Content-Length", str(len(corps)))
-        self.end_headers()
-        self.wfile.write(corps)
-
-    def _erreur(self, code: int, message: str) -> None:
-        # ensure_ascii=False : sans ça, « synthétiseur non chargé » devient
-        # « synth\u00e9tiseur » dans le corps, illisible au curl et dans un navigateur.
-        corps = json.dumps({"erreur": message}, ensure_ascii=False).encode("utf-8")
-        self._envoyer(code, corps, "application/json")
 
     # ------------------------------------------------------------------ routes
     def do_GET(self) -> None:  # noqa: N802 (nom imposé par http.server)
@@ -72,7 +50,8 @@ class _Handler(BaseHTTPRequestHandler):
         if tts is None or not tts.ready:
             self._erreur(503, "synthétiseur non chargé")
             return
-        corps = json.dumps(
+        self._json(
+            200,
             {
                 "service": TITRE,
                 "pret": True,
@@ -82,9 +61,7 @@ class _Handler(BaseHTTPRequestHandler):
                 "reprises": _reprises(tts),
                 "appels": type(self).appels,
             },
-            ensure_ascii=False,
-        ).encode("utf-8")
-        self._envoyer(200, corps, "application/json")
+        )
 
     def do_POST(self) -> None:  # noqa: N802
         if self.path.rstrip("/") != "/parle":

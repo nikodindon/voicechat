@@ -46,6 +46,7 @@ sur la machine avec laquelle on parle. On ne dépend donc jamais d'un service TT
 | **Mode dégradé** : phrases non synthétisées gardées et rejouables (`/rejoue`) | ✅ implémenté et vérifié (v0.6) |
 | **`/contexte`** : tokens utilisés d'après les chiffres du serveur, alerte à 80 % | ✅ implémenté et vérifié (v1.2) — contexte lu via `/props`, cf. §15 |
 | **Interface web** (`--web`) : la conversation dans un navigateur, texte + audio | ✅ implémenté et vérifié (v1.2) — 10 contrôles, audio retranscrit à 100 %, cf. §16 |
+| **Service STT distant** (`--serveur-stt`, `--stt-distant`) : audio → texte | ✅ implémenté et vérifié (v1.2) — boucle texte→audio→texte bouclée, webm/opus accepté, cf. §17 |
 | **`--dire` / `--dire-fichier`** : lire un texte sans le LLM | ✅ implémenté et vérifié (v1.1) — par son WAV dans la réserve, cf. §14.1 |
 | **`/cherche <mot>`** dans les conversations sauvées (accents compris) | ✅ implémenté et vérifié (v1.1) — 17 tests, cf. §14.2 |
 | **`/resume`** : compacter les vieux échanges au lieu de les perdre | ✅ implémenté et vérifié (v1.1) — 1,1× à 1,6× selon la densité du texte, cf. §14.3 |
@@ -196,7 +197,8 @@ de commande (l'option gagne). Aucune clé n'est obligatoire : llama.cpp ignore `
 | `VOICECHAT_STT_MODELE` | `small` | modèle faster-whisper (`base`, `small`, `medium`, `large-v3`) |
 | `VOICECHAT_STT_DEVICE` | `auto` | appareil de transcription : `auto` / `cuda` / `cpu` |
 | `VOICECHAT_STT_LANGUE` | `fr` | langue forcée ; vide = détection automatique |
-| `VOICECHAT_MICRO_DEVICE` | *(défaut)* | périphérique d'entrée (nom ou index) |
+| `VOICECHAT_MICRO_DEVICE` | *(défaut)* | périphérique d'entrée audio |
+| `VOICECHAT_STT_URL` | *(vide)* | transcription déportée : le service qui reçoit l'audio (cf. §17) |
 
 ---
 
@@ -504,6 +506,7 @@ Trois scripts de vérification bout en bout pilotent le vrai CLI dans un pseudo-
 .venv/bin/python tests/verif_confort.py       # -q, --dire, /cherche, /resume
 .venv/bin/python tests/verif_contexte.py      # contexte lu du serveur, élagage en tokens
 .venv/bin/python tests/verif_web.py           # page, flux SSE et audio, de bout en bout
+.venv/bin/python tests/verif_stt.py           # service STT : texte → audio → texte
 .venv/bin/python tests/verif_config.py        # précédence TOML/env/arguments
 ```
 
@@ -584,7 +587,7 @@ réseau, ni au GPU, ni au découpage du texte.
       tourne **sans torch, sans Kokoro, sans faster-whisper et sans GPU** : un contrôle
       dédié le prouve et échoue si quelqu'un ajoute un import lourd en haut d'un module.
 
-### v1.2 — contexte juste, et cap sur le navigateur (en cours)
+### v1.2–1.3 — contexte juste, client web, service STT ✅ (livré)
 
 **Ordre choisi volontairement** : le client web d'abord, Android ensuite. C'est ce qui
 change *où* on peut se servir du projet, et l'appli Android viendra s'y raccrocher
@@ -603,9 +606,9 @@ meilleur endroit pour les montrer.
 - [ ] **`tailscale serve`** : HTTPS sur le tailnet. C'est ce qui rendra le micro du
       navigateur utilisable et la page installable sur le téléphone — les trois
       problèmes (TLS, PWA, accès restreint) réglés d'un coup.
-- [ ] **Service STT distant** (`--serveur-stt`), symétrique du serveur TTS : le téléphone
-      envoie l'**audio**, le poste GPU renvoie le **texte**. Sans ça, un client léger
-      doit embarquer Whisper.
+- [x] **Service STT distant** (`--serveur-stt`), symétrique du serveur TTS : le client
+      envoie l'**audio**, le service rend le **texte**. Vérifié de bout en bout, webm/opus
+      d'un navigateur compris (cf. §17).
 
 ### v1.3 — deux voix (déplacé, assumé)
 
@@ -2575,6 +2578,120 @@ bug** — il échoue alors au bout de 5 s, exactement comme le navigateur attend
 
 ---
 
-## 17. Licence
+## 17. Service de transcription (v1.2)
+
+Le pendant du serveur TTS, **dans l'autre sens** : ici le client envoie de l'audio et
+reçoit du texte. C'est la pièce qui permet à un client léger — un téléphone, un
+navigateur — de parler sans embarquer Whisper. Et c'est bien Whisper qui coûte cher, pas
+le fait de parler.
+
+```bash
+voicechat --serveur-stt                    # port 8092
+voicechat --transcrire note.wav --stt-distant http://100.66.131.33:8092
+voicechat --micro --stt-distant http://100.66.131.33:8092
+```
+
+```
+GET  /sante       →  {"service": "voicechat-stt/1", "pret": true, "modele": "small",
+                      "device": "cuda", "langue": "fr", "transcriptions": 0}
+POST /transcris   →  corps : octets audio bruts (wav, flac, ogg, webm, m4a…)
+                     réponse {"texte": "…", "langue": "fr", "probabilite": 0.98,
+                              "duree_audio_s": 3.38, "duree_s": 0.55, "rtf": 0.16}
+```
+
+### 17.1 Deux façons de décoder l'audio, et pourquoi les deux
+
+Le point délicat n'est pas la transcription, c'est l'entrée. Un navigateur ne produit pas
+du WAV : `MediaRecorder` donne du **webm/opus**, que libsndfile ne sait pas lire. D'où
+deux chemins, dans cet ordre :
+
+1. **libsndfile** (`stt.lire_audio`) : exact et rapide pour WAV, FLAC, OGG ;
+2. **PyAV** (`faster_whisper.audio.decode_audio`) en repli : c'est ce qui permet d'avaler
+   du webm/opus ou du m4a. Sans lui, la page devrait fabriquer du WAV elle-même,
+   c'est-à-dire refaire à la main ce que le navigateur fait très bien.
+
+Les deux passent ensuite par le même `Transcriber` : la conversion (stéréo → mono,
+44,1 kHz → 16 kHz) est celle qui était déjà testée pour `--transcrire`.
+
+### 17.2 Un seul endroit qui décide qui transcrit
+
+`charger_transcripteur(cfg)` est la fabrique : locale, ou déportée si `stt_url` est
+renseigné. Les deux sites d'appel — le mode `--transcrire` et le micro de la session —
+passaient chacun leur propre création du transcripteur ; les laisser ainsi garantissait
+qu'ils finissent par diverger. C'est le même raisonnement que pour la voix en v0.6.
+
+Et comme pour la voix, les deux implémentations respectent un contrat commun
+(`stt.Transcription`, un `Protocol`) :
+
+```python
+assert isinstance(Transcriber(modele="small"), Transcription)   # Whisper local
+assert isinstance(STTDistant(url=…), Transcription)             # service distant
+```
+
+Le programme ne sait donc jamais laquelle il tient — et le vérificateur de types ne
+réclame pas de `type: ignore` à chaque affectation.
+
+### 17.3 Vérification : la boucle complète
+
+Rien n'est simulé : **deux vrais services** tournent dans des processus à part (Kokoro et
+Whisper, tous deux sur le GPU), et le script fait passer de la parole par les deux.
+
+```
+$ .venv/bin/python tests/verif_stt.py
+  | Transcription : cuda (int8_float32)
+  GET /sante  → {'service': 'voicechat-stt/1', 'pret': True, 'modele': 'small',
+                 'device': 'cuda', 'langue': 'fr'}
+
+  Kokoro a produit 324080 octets de WAV (3.38 s à 24000 Hz)
+
+  POST /transcris (WAV 24 kHz mono) → HTTP 200
+  attendu : « La réserve d'audio garde les phrases déjà dites. »
+  entendu : « La réserve d'AudioGuard les phrases déjà dites. »
+  mots retrouvés : 5/6
+
+  POST /transcris (webm/opus, 13555 octets) → HTTP 200
+  entendu : « La réserve d'audience garde les phrases déjà dites. »
+  mots retrouvés : 5/6
+
+  POST /transcris (WAV 44,1 kHz stéréo) → HTTP 200
+  entendu : « La réserve d'AudioGuard les phrases déjà dites. »
+
+  POST /transcris (texte au lieu de son) → HTTP 400 : audio illisible
+  voicechat --transcrire … --stt-distant → code 0
+  | Résumé : 3.38 s d'audio transcrites en 0.55 s (RTF 0.16) — langue fr (100%)
+```
+
+```
+=== contrôles ===
+  OK  le service annonce le modèle et son état
+  OK  le service TTS a produit l'audio
+  OK  la phrase dite est reconnue
+  OK  le service annonce la langue et le RTF
+  OK  le webm/opus d'un navigateur est accepté
+  OK  le webm/opus est bien transcrit
+  OK  le stéréo 44,1 kHz est converti et transcrit
+  OK  un contenu illisible donne un 400 lisible
+  OK  le CLI transcrit via le service distant
+  OK  le CLI a bien transcrit la phrase
+```
+
+**Ce que ces chiffres disent, et ne disent pas.** 5/6 mots retrouvés, avec
+« d'audio garde » entendu « d'AudioGuard » : les mots sont bons, c'est le découpage qui
+glisse. C'est un comportement connu de Whisper sur de la parole synthétique courte, et
+ça se retrouve sur n'importe quel service de transcription — ce n'est pas un défaut du
+transport. Le RTF de 0,16, lui, mesure bien ce qu'on voulait : 3,38 s d'audio transcrites
+en 0,55 s, soit six fois plus vite que le temps réel.
+
+**Une correction de méthode** : la première version de ce script écrivait les
+échantillons 24 kHz en les déclarant « 44,1 kHz ». Ce n'est pas un rééchantillonnage,
+c'est une accélération de 1,8× — le son testé n'était plus celui qu'on croyait, et le
+stéréo rendait une transcription nettement plus mauvaise (ce qui aurait pu passer pour
+un défaut du service). Le script rééchantillonne maintenant pour de vrai, et le stéréo
+donne **exactement** le même texte que le mono. Un test qui ne teste pas le bon signal ne
+dit rien.
+
+---
+
+## 18. Licence
 
 MIT — voir le fichier `LICENSE`. Faire ce qu'on veut, sans garantie.

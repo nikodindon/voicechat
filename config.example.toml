@@ -33,6 +33,10 @@ cache = true
 # `voicechat --serveur-tts`). Laisser vide = synthèse locale.
 tts_url = ""
 
+# Transcription sur un autre poste : "http://niko-tv:8092" (le poste GPU lance
+# `voicechat --serveur-stt`). Laisser vide = Whisper local.
+stt_url = ""
+
 # Génération
 temperature = 0.7
 # 0 = laisser le serveur décider
