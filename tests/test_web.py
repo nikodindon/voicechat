@@ -101,13 +101,13 @@ def lire_sse(url: str) -> list[tuple[str, dict]]:
     return evenements
 
 
-def _poster(url: str, charge: dict | None = None) -> tuple[int, bytes]:
+def _poster(url: str, charge: dict | None = None, delai: float = 10) -> tuple[int, bytes]:
     corps = json.dumps(charge or {}).encode("utf-8")
     requete = urllib.request.Request(
         url, data=corps, headers={"Content-Type": "application/json"}, method="POST"
     )
     try:
-        with urllib.request.urlopen(requete, timeout=10) as reponse:
+        with urllib.request.urlopen(requete, timeout=delai) as reponse:
             return reponse.status, reponse.read()
     except urllib.error.HTTPError as exc:
         return exc.code, exc.read()
@@ -227,13 +227,13 @@ def test_une_erreur_du_modele_arrive_dans_le_flux(serveur, monkeypatch):
 
 def test_un_second_tour_simultané_est_refusé(serveur):
     srv, _ = serveur
-    assert web._HandlerWeb.verrou.acquire(blocking=True, timeout=1)
+    assert web._HandlerWeb.verrou_tour.acquire(blocking=True, timeout=1)
     try:
         evenements = lire_sse(f"{srv.url_local}/flux?q=Bonjour")
         assert evenements[-1][0] == "erreur"
         assert "déjà en cours" in evenements[-1][1]["message"]
     finally:
-        web._HandlerWeb.verrou.release()
+        web._HandlerWeb.verrou_tour.release()
 
 
 def test_le_verrou_est_relaché_après_une_erreur(serveur, monkeypatch):
@@ -241,10 +241,61 @@ def test_le_verrou_est_relaché_après_une_erreur(serveur, monkeypatch):
     monkeypatch.setattr(web, "stream_with_usage", faux_stream_erreur)
     srv, _ = serveur
     lire_sse(f"{srv.url_local}/flux?q=Bonjour")
-    assert not web._HandlerWeb.verrou.locked()
+    assert not web._HandlerWeb.verrou_tour.locked()
     # Et un tour normal passe derrière.
     monkeypatch.setattr(web, "stream_with_usage", faux_stream)
     assert [n for n, _ in lire_sse(f"{srv.url_local}/flux?q=Encore")][-1] == "fin"
+
+
+def test_l_audio_ne_doit_pas_attendre_la_fin_du_tour(serveur, monkeypatch):
+    """Régression : l'audio démarrait après la réponse complète, au lieu de la suivre.
+
+    Cause : la route `/parle` prenait `verrou`, nom qui est aussi celui du verrou GPU
+    hérité du serveur TTS — et que `/flux` garde pendant **tout** le tour. La synthèse de
+    la première phrase attendait donc la dernière.
+
+    Le test reproduit le geste du navigateur : il retient la génération en plein milieu,
+    puis demande l'audio. La réponse doit venir tout de suite, pas à la fin du tour.
+    """
+    phrase_prete = threading.Event()
+    suite = threading.Event()
+
+    def flux_retenu(base_url=None, model=None, messages=None, **kwargs):
+        def gen():
+            yield "Bonjour. "  # phrase complète : le navigateur va demander son audio
+            phrase_prete.set()
+            suite.wait(timeout=20)  # la génération reste en cours, volontairement
+            yield "Et voilà la suite."
+        usage = Usage()
+        usage.prompt_tokens = 12
+        return gen(), usage
+
+    monkeypatch.setattr(web, "stream_with_usage", flux_retenu)
+    srv, _ = serveur
+
+    def lire() -> None:
+        with urllib.request.urlopen(flux(srv, "Bonjour"), timeout=30) as reponse:
+            for _ in reponse:
+                pass
+
+    fil = threading.Thread(target=lire, daemon=True)
+    fil.start()
+    assert phrase_prete.wait(timeout=15), "la première phrase n'est jamais arrivée"
+
+    # Le tour est toujours en cours. C'est ici que le bug se voyait.
+    debut = time.monotonic()
+    try:
+        code, corps = _poster(f"{srv.url_local}/parle", {"texte": "Bonjour."}, delai=5)
+    finally:
+        suite.set()
+    attente = time.monotonic() - debut
+
+    assert code == 200
+    assert corps[:4] == b"RIFF"
+    assert attente < 3.0, (
+        f"l'audio a attendu {attente:.1f} s : il est resté derrière le tour en cours"
+    )
+    fil.join(timeout=20)
 
 
 # ------------------------------------------------------------------ autres routes

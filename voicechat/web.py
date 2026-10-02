@@ -55,10 +55,13 @@ class _HandlerWeb(distant._Handler):
     """Routes du serveur web. La session et le synthétiseur sont posés par ``ServirWeb``."""
 
     session: "ChatSession | None" = None
-    # Une seule conversation à la fois : deux tours simultanés se marcheraient dessus
-    # dans le même historique, et le GPU ne sait de toute façon pas faire deux synthèses
-    # en parallèle.
-    verrou = threading.Lock()
+    # Un seul tour à la fois : deux tours simultanés se marcheraient dessus dans le même
+    # historique. Nom **distinct** de `verrou`, qui est hérité de `distant._Handler` et
+    # sert à sérialiser les appels au GPU : les confondre faisait que `/parle`, appelé par
+    # la page pendant la génération, attendait la **fin du tour** avant de synthétiser la
+    # première phrase. Le son n'arrivait donc qu'une fois la réponse entière affichée —
+    # exactement l'inverse du but.
+    verrou_tour = threading.Lock()
 
     # ------------------------------------------------------------------ utilitaires
     def _evenement(self, nom: str, donnees: dict) -> None:
@@ -137,7 +140,7 @@ class _HandlerWeb(distant._Handler):
         if session is None:
             self._erreur(503, "session indisponible")
             return
-        with type(self).verrou:
+        with type(self).verrou_tour:
             session.messages = [{"role": "system", "content": session.cfg.system}]
             session._oubli_signale = False
             session._contexte_signale = False
@@ -164,7 +167,7 @@ class _HandlerWeb(distant._Handler):
         if not question:
             self._evenement("erreur", {"message": "question vide"})
             return
-        if not cls.verrou.acquire(blocking=False):
+        if not cls.verrou_tour.acquire(blocking=False):
             self._evenement("erreur", {"message": "une réponse est déjà en cours"})
             return
 
@@ -238,7 +241,7 @@ class _HandlerWeb(distant._Handler):
             # HTTP du modèle.
             if flux is not None and hasattr(flux, "close"):
                 flux.close()
-            cls.verrou.release()
+            cls.verrou_tour.release()
 
 
 class ServeurWeb:

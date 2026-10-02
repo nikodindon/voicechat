@@ -2536,6 +2536,43 @@ console en remaniant `ask()` était plus grand que le gain pour cette première 
 mais ça reste à réunir : la prochaine occasion doit faire descendre cette logique dans
 `ChatSession`, pour qu'il n'en existe qu'une version.
 
+### 16.5 Le bug que seul l'usage a révélé
+
+Premier essai réel depuis un navigateur : **le son ne démarrait qu'à la fin de la
+réponse**, alors qu'il suit la génération phrase par phrase dans la console.
+
+La cause tenait à un nom. `distant._Handler` porte un verrou de classe `verrou`, qui
+sérialise les appels au GPU. Ma classe web en a défini un autre, pour empêcher deux tours
+simultanés — et je lui ai donné **le même nom** :
+
+```python
+class _HandlerWeb(distant._Handler):
+    verrou = threading.Lock()   # écrasait le verrou GPU hérité
+```
+
+Résultat : `/flux` prend `verrou` pour toute la durée du tour, et la route `/parle` —
+héritée du serveur TTS, qui fait `with type(self).verrou` — attendait donc **la fin du
+tour** pour synthétiser la première phrase. Les deux verrous protègent des choses
+différentes : l'un dit « un seul tour à la fois », l'autre « une seule synthèse à la
+fois ». Les confondre les mettait en série.
+
+Correction : le verrou de conversation s'appelle maintenant `verrou_tour`. Il vit à côté
+du verrou GPU hérité, qui reprend son rôle.
+
+**Pourquoi la vérification ne l'avait pas vu**, et c'est le plus instructif : le script
+lisait tout le flux, puis demandait l'audio. Autrement dit il ne reproduisait pas le geste
+du navigateur, qui demande l'audio **pendant** que le modèle écrit. Un contrôle qui ne
+reproduit pas le geste réel ne teste pas le chemin réel. Le script demande maintenant
+l'audio dès la première phrase :
+
+```
+POST /parle pendant le tour → HTTP 200, 520880 octets, en 1.04 s (à t=2.07 s du flux)
+```
+
+Et `tests/test_web.py` verrouille le cas : la génération est retenue en plein milieu, on
+demande l'audio, et il doit revenir tout de suite. **Ce test a été validé en remettant le
+bug** — il échoue alors au bout de 5 s, exactement comme le navigateur attendait.
+
 ---
 
 ## 17. Licence

@@ -3,14 +3,12 @@
 Rien n'est simulé : un vrai `voicechat --web` démarre dans un processus à part (vrai
 serveur LLM, vrai Kokoro), et un client urllib joue le rôle du navigateur.
 
-Ce qui est éprouvé, dans l'ordre :
-
-* la page est servie, et elle ne dépend d'aucune ressource externe ;
-* l'état annonce le bon modèle et la bonne taille de contexte ;
-* le flux SSE rend le texte **et** les phrases à dire, et les deux se recollent ;
-* l'audio récupéré par HTTP sur la première phrase est **retranscrit par Whisper** —
-  c'est le seul contrôle qui prouve que le navigateur jouerait bien la phrase affichée ;
-* `/reset` vide l'historique côté serveur.
+**Le point délicat, et ce qui a changé après un vrai bug** : ce script lisait tout le
+flux, puis demandait l'audio — ce qui ne ressemble pas à ce que fait le navigateur, et a
+laissé passer le défaut que l'utilisateur a vu (le son ne démarrait qu'à la fin de la
+réponse). Il demande maintenant l'audio **dès que la première phrase arrive**, pendant que
+le modèle écrit encore. C'est la seule façon de vérifier que le son suit la génération au
+lieu de l'attendre.
 
     .venv/bin/python tests/verif_web.py
 """
@@ -18,19 +16,18 @@ Ce qui est éprouvé, dans l'ordre :
 from __future__ import annotations
 
 import json
+import os
 import re
 import subprocess
-import sys
 import tempfile
 import time
-import urllib.error
 import urllib.request
 from pathlib import Path
 from urllib.parse import quote
 
 PROJ = Path(__file__).resolve().parent.parent
 PY = str(PROJ / ".venv" / "bin" / "python")
-QUESTION = "Réponds en une phrase simple : que fais-tu quand le GPU est occupé ?"
+QUESTION = "Explique en trois phrases courtes ce que fait la réserve d'audio du projet."
 
 
 def attendre_serveur(processus: subprocess.Popen, delai: float) -> tuple[str, str]:
@@ -50,31 +47,38 @@ def attendre_serveur(processus: subprocess.Popen, delai: float) -> tuple[str, st
     return "", "".join(lignes)
 
 
-def lire_flux(url: str) -> tuple[list[tuple[str, dict]], float]:
-    """Lit le flux SSE, horodate le premier évènement, rend les évènements."""
+def poster(url: str, charge: dict | None = None, delai: float = 120):
+    corps = json.dumps(charge or {}).encode("utf-8")
+    requete = urllib.request.Request(
+        url, data=corps, headers={"Content-Type": "application/json"}, method="POST"
+    )
+    with urllib.request.urlopen(requete, timeout=delai) as reponse:
+        return reponse.status, reponse.read()
+
+
+def suivre_flux(url: str, sur_phrase=None) -> tuple[list[tuple[str, dict]], float]:
+    """Lit le flux SSE, et appelle `sur_phrase` **pendant** la lecture.
+
+    C'est `sur_phrase` qui reproduit le geste du navigateur : demander l'audio dès la
+    première phrase, sans attendre la fin du tour.
+    """
     evenements: list[tuple[str, dict]] = []
     debut = time.monotonic()
     premier = 0.0
-    with urllib.request.urlopen(url, timeout=180) as reponse:
+    with urllib.request.urlopen(url, timeout=300) as reponse:
         nom = ""
         for ligne_brute in reponse:
             ligne = ligne_brute.decode("utf-8").rstrip("\n")
             if ligne.startswith("event: "):
                 nom = ligne[len("event: ") :]
             elif ligne.startswith("data: "):
+                donnees = json.loads(ligne[len("data: ") :])
                 if not premier:
                     premier = time.monotonic() - debut
-                evenements.append((nom, json.loads(ligne[len("data: ") :])))
+                evenements.append((nom, donnees))
+                if nom == "phrase" and sur_phrase is not None:
+                    sur_phrase(donnees["t"], time.monotonic() - debut, nom)
     return evenements, premier
-
-
-def poster(url: str, charge: dict | None = None):
-    corps = json.dumps(charge or {}).encode("utf-8")
-    requete = urllib.request.Request(
-        url, data=corps, headers={"Content-Type": "application/json"}, method="POST"
-    )
-    with urllib.request.urlopen(requete, timeout=180) as reponse:
-        return reponse.status, reponse.read()
 
 
 def main() -> int:
@@ -86,7 +90,7 @@ def main() -> int:
     processus = subprocess.Popen(
         [PY, "-m", "voicechat", "--web", "--port", "0"],
         cwd=PROJ, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
-        env={**_environ(), "VOICECHAT_DATA": str(dossier / "donnees")},
+        env={**os.environ, "VOICECHAT_DATA": str(dossier / "donnees")},
     )
     try:
         port, sortie = attendre_serveur(processus, 240.0)
@@ -117,38 +121,67 @@ def main() -> int:
         controles.append(("l'état annonce le modèle et le contexte",
                           bool(etat.get("modele")) and (etat.get("contexte") or {}).get("total", 0) > 0))
 
-        # --- 3. le flux -------------------------------------------------------
-        evenements, premier = lire_flux(f"{base}/flux?q={quote(QUESTION)}")
+        # --- 3. le flux, avec l'audio demandé en plein tour -------------------
+        audio = {"recu": False, "avant_fin": False, "attente": 0.0, "wav": b"", "phrase": ""}
+        fin_vue = {"vu": False, "t": 0.0}
+
+        def sur_phrase(phrase: str, instant: float, _nom: str) -> None:
+            if audio["recu"]:
+                return
+            debut = time.monotonic()
+            try:
+                code, wav = poster(f"{base}/parle", {"texte": phrase})
+            except Exception as exc:  # noqa: BLE001 — on veut voir l'échec dans le rapport
+                print(f"  !! audio : {exc}")
+                return
+            audio.update(
+                recu=code == 200,
+                avant_fin=not fin_vue["vu"],
+                attente=time.monotonic() - debut,
+                wav=wav,
+                phrase=phrase,
+            )
+            print(f"  POST /parle pendant le tour → HTTP {code}, {len(wav)} octets, "
+                  f"en {audio['attente']:.2f} s (à t={instant:.2f} s du flux)")
+
+        evenements, premier = suivre_flux(
+            f"{base}/flux?q={quote(QUESTION)}", sur_phrase=sur_phrase
+        )
         noms = [nom for nom, _ in evenements]
         texte = "".join(d["t"] for nom, d in evenements if nom == "texte")
         phrases = [d["t"] for nom, d in evenements if nom == "phrase"]
-        fin = dict(evenements).get("fin", {})
+        fin_vue["vu"] = "fin" in noms
+
         print(f"\n  GET /flux   → {len(evenements)} évènements : "
               f"{', '.join(sorted(set(noms)))}")
         print(f"  premier évènement reçu après {premier * 1000:.0f} ms")
-        print(f"  texte  : « {texte.strip()[:110]} »")
+        print(f"  texte  : « {texte.strip()[:100]} »")
         print(f"  phrases : {len(phrases)}")
-        for phrase in phrases:
-            print(f"     · {phrase[:90]}")
+        for phrase in phrases[:3]:
+            print(f"     · {phrase[:88]}")
+        if len(phrases) > 3:
+            print(f"     · … et {len(phrases) - 3} autre(s)")
 
         controles.append(("le flux commence par debut et finit par fin",
                           noms[0] == "debut" and noms[-1] == "fin"))
         controles.append(("l'écran et la voix disent la même chose",
                           " ".join(phrases).split() == texte.split()))
         controles.append(("le premier évènement arrive vite (< 10 s)", 0 < premier < 10))
-        controles.append(("le texte est arrivé avant la fin du tour",
-                          noms.count("texte") > 1 and "fin" in noms))
+        controles.append((
+            "l'audio de la 1re phrase arrive PENDANT la génération, pas après",
+            audio["recu"] and audio["avant_fin"],
+        ))
+        controles.append(("la synthèse ne bloque pas le flux (< 5 s)", audio["attente"] < 5))
 
-        # --- 4. l'audio par HTTP, retranscrit ---------------------------------
-        if phrases:
+        # --- 4. l'audio retranscrit -------------------------------------------
+        if audio["recu"]:
             import soundfile as sf
 
-            code, wav = poster(f"{base}/parle", {"texte": phrases[0]})
             chemin = dossier / "phrase.wav"
-            chemin.write_bytes(wav)
-            audio, taux = sf.read(str(chemin))
-            duree = len(audio) / taux
-            print(f"\n  POST /parle → HTTP {code}, {len(wav)} octets, {duree:.2f} s d'audio")
+            chemin.write_bytes(audio["wav"])
+            echantillons, taux = sf.read(str(chemin))
+            print(f"\n  phrase envoyée à Whisper : « {audio['phrase'][:80]} »")
+            print(f"  durée : {len(echantillons) / taux:.2f} s d'audio")
 
             from faster_whisper import WhisperModel
 
@@ -160,7 +193,7 @@ def main() -> int:
             def mots(t: str) -> list[str]:
                 return [m for m in re.sub(r"[^a-zà-ÿ0-9 ]", " ", t.lower()).split() if len(m) > 3]
 
-            attendus = mots(phrases[0])
+            attendus = mots(audio["phrase"])
             trouves = sum(1 for mot in attendus if mot in entendu.lower())
             proportion = trouves / len(attendus) if attendus else 0.0
             print(f"  mots significatifs retrouvés : {trouves}/{len(attendus)} ({proportion:.0%})")
@@ -176,7 +209,7 @@ def main() -> int:
         controles.append(("reset vide l'historique", apres["archives"] == 1))
 
         # --- 6. le suivi de contexte ------------------------------------------
-        lire_flux(f"{base}/flux?q={quote('Dis simplement bonjour.')}")
+        suivre_flux(f"{base}/flux?q={quote('Dis simplement bonjour.')}")
         with urllib.request.urlopen(f"{base}/etat", timeout=30) as reponse:
             suivi = json.loads(reponse.read())
         utilise = (suivi.get("contexte") or {}).get("utilise", 0)
@@ -200,12 +233,6 @@ def main() -> int:
             processus.wait(timeout=20)
         except subprocess.TimeoutExpired:
             processus.kill()
-
-
-def _environ() -> dict[str, str]:
-    import os
-
-    return dict(os.environ)
 
 
 if __name__ == "__main__":
