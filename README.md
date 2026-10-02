@@ -45,6 +45,7 @@ sur la machine avec laquelle on parle. On ne dépend donc jamais d'un service TT
 | **Serveurs de secours** (`--secours`, `VOICECHAT_SECOURS`) | ✅ implémenté et vérifié (v0.6) — bascule annoncée à l'écran, jamais silencieuse |
 | **Mode dégradé** : phrases non synthétisées gardées et rejouables (`/rejoue`) | ✅ implémenté et vérifié (v0.6) |
 | **`/contexte`** : tokens utilisés d'après les chiffres du serveur, alerte à 80 % | ✅ implémenté et vérifié (v1.2) — contexte lu via `/props`, cf. §15 |
+| **Interface web** (`--web`) : la conversation dans un navigateur, texte + audio | ✅ implémenté et vérifié (v1.2) — 10 contrôles, audio retranscrit à 100 %, cf. §16 |
 | **`--dire` / `--dire-fichier`** : lire un texte sans le LLM | ✅ implémenté et vérifié (v1.1) — par son WAV dans la réserve, cf. §14.1 |
 | **`/cherche <mot>`** dans les conversations sauvées (accents compris) | ✅ implémenté et vérifié (v1.1) — 17 tests, cf. §14.2 |
 | **`/resume`** : compacter les vieux échanges au lieu de les perdre | ✅ implémenté et vérifié (v1.1) — 1,1× à 1,6× selon la densité du texte, cf. §14.3 |
@@ -502,6 +503,7 @@ Trois scripts de vérification bout en bout pilotent le vrai CLI dans un pseudo-
 .venv/bin/python tests/verif_sans_lourds.py   # toute la suite, sans torch/Kokoro/whisper
 .venv/bin/python tests/verif_confort.py       # -q, --dire, /cherche, /resume
 .venv/bin/python tests/verif_contexte.py      # contexte lu du serveur, élagage en tokens
+.venv/bin/python tests/verif_web.py           # page, flux SSE et audio, de bout en bout
 .venv/bin/python tests/verif_config.py        # précédence TOML/env/arguments
 ```
 
@@ -595,8 +597,9 @@ meilleur endroit pour les montrer.
       vingt fois trop tôt.
 - [x] **Alerte à 80 %** et commande **`/contexte`** : combien de tokens utilisés, place
       restante, et le dernier compte exact rendu par le serveur.
-- [ ] **Interface web** (`voicechat --web`) : une page, du SSE pour le texte, l'audio
-      synthétisé par le serveur, sans framework ni étape de build.
+- [x] **Interface web** (`voicechat --web`) : une page, du SSE pour le texte, l'audio
+      synthétisé par le serveur, sans framework ni étape de build. Vérifié de bout en
+      bout, audio compris (cf. §16).
 - [ ] **`tailscale serve`** : HTTPS sur le tailnet. C'est ce qui rendra le micro du
       navigateur utilisable et la page installable sur le téléphone — les trois
       problèmes (TLS, PWA, accès restreint) réglés d'un coup.
@@ -2006,6 +2009,20 @@ Depuis un autre poste :
   voicechat --tts-distant http://192.168.1.22:36733
 ```
 
+Et pour la conversation complète cette fois (texte **et** audio), c'est `--web` (§16) :
+
+```
+$ voicechat --web
+Page    : http://192.168.1.22:8091
+          en local : http://127.0.0.1:8091
+Modèle  : Ornith-1.5-35B-A3B-APEX-i-mini
+Contexte: 32768 tokens
+
+Ouvrir l'adresse depuis n'importe quelle machine du tailnet.
+Pour HTTPS (micro du navigateur, installation sur téléphone) :
+  sudo tailscale serve --bg 8091
+```
+
 Sur le poste léger : `voicechat --tts-distant http://192.168.1.22:8090` (ou la variable
 `VOICECHAT_TTS_URL`).
 
@@ -2402,6 +2419,125 @@ fois la même leçon : un contrôle qui ne peut pas échouer ne prouve rien.
 
 ---
 
-## 16. Licence
+## 16. Interface web (v1.2)
+
+La même conversation, dans un navigateur — et donc sur le téléphone, puisque tout est
+sur le tailnet.
+
+```bash
+voicechat --web            # port 8091 par défaut
+voicechat --web --port 0   # port choisi par l'OS (utile pour essayer)
+```
+
+Ce que ça réutilise, sans rien réécrire :
+
+* `POST /parle` et `GET /sante` viennent du **serveur TTS de la v1.0** ;
+* l'historique, les profils, la **réserve d'audio** et la mesure du contexte sont ceux
+  de `ChatSession` ;
+* la découpe des phrases avant la voix est celle de la console (`tour.derouler`).
+
+C'est ce dernier point qui compte le plus : si les deux chemins découpaient les phrases
+chacun de leur côté, l'écran et le son finiraient par ne plus dire la même chose. Le
+cœur est donc partagé, et un test vérifie explicitement que les phrases annoncées se
+recollent **mot pour mot** avec le texte affiché.
+
+### 16.1 Les routes
+
+```
+GET  /           la page (un seul fichier : ni framework, ni étape de build)
+GET  /flux?q=…   le texte au fil de l'eau, en SSE, puis les phrases à dire
+GET  /etat       quel modèle, quelle taille de contexte
+POST /reset      nouvelle conversation
+POST /parle      l'audio — hérité du serveur TTS
+GET  /sante      l'état du synthétiseur — hérité aussi
+```
+
+**Pourquoi SSE et pas WebSocket** : le texte va dans un seul sens, et un `EventSource`
+est un simple GET que le navigateur relit tout seul après une coupure. Le WebSocket
+deviendra utile le jour où le micro entrera dans la boucle, et il s'ajoutera alors sans
+rien réécrire de ce qui est là.
+
+**Pourquoi les erreurs passent par le flux** : un `EventSource` ne lit le corps de la
+réponse que si le code est 200. Un 409 « une réponse est déjà en cours » n'afficherait
+donc qu'un « connexion perdue » sans explication. Les pannes arrivent donc comme
+évènements `erreur`, à l'intérieur du flux.
+
+### 16.2 La page
+
+Un seul fichier, du HTML et du JavaScript nus, aucune dépendance externe — ni CDN, ni
+police distante. Un test le vérifie : une page qui tirerait une ressource depuis
+Internet serait inutilisable sur un tailnet isolé.
+
+Le son suit le texte : les phrases sont mises en file et jouées dans l'ordre, exactement
+comme la console le fait avec sa file de synthèse. Sans cette file, les phrases se
+chevaucheraient.
+
+### 16.3 Vérification
+
+Rien n'est simulé : un vrai `voicechat --web` démarre dans un processus à part, et un
+client urllib joue le rôle du navigateur.
+
+```
+$ .venv/bin/python tests/verif_web.py
+  serveur | Contexte : 32768 tokens
+  serveur | Page    : http://192.168.1.22:8091
+
+  GET /       → text/html; charset=utf-8, 9053 octets
+  GET /etat   → {'modele': 'Ornith-1.5-35B-A3B-APEX-i-mini', 'archives': 1,
+                 'voix': 'ff_siwis',
+                 'contexte': {'utilise': 39, 'total': 32768, 'budget': 26214}}
+
+  GET /flux   → 29 évènements : debut, fin, phrase, texte
+  premier évènement reçu après 1 ms
+  texte  : « Je n'ai pas accès au GPU, donc je n'ai pas besoin d'attendre ni de gérer
+             les ressources matérielles. »
+  phrases : 1
+
+  POST /parle → HTTP 200, 580880 octets, 6.05 s d'audio
+  entendu : « Je n'ai pas accès au GP, donc je n'ai pas besoin d'attendre ni de gérer
+              les ressources matérielles. »
+  mots significatifs retrouvés : 7/7 (100%)
+```
+
+Le contrôle qui compte est celui de l'audio : le WAV est récupéré **par HTTP**, comme le
+ferait le navigateur, puis **retranscrit par Whisper**. Une page qui afficherait le bon
+texte en jouant autre chose passerait tous les autres contrôles.
+
+```
+=== contrôles ===
+  OK  la page est servie en HTML
+  OK  la page ne dépend d'aucune ressource externe
+  OK  l'état annonce le modèle et le contexte
+  OK  le flux commence par debut et finit par fin
+  OK  l'écran et la voix disent la même chose
+  OK  le premier évènement arrive vite (< 10 s)
+  OK  le texte est arrivé avant la fin du tour
+  OK  l'audio du navigateur est la phrase affichée
+  OK  reset vide l'historique
+  OK  le contexte est suivi après le tour
+```
+
+`tests/test_web.py` (19 tests) couvre hors ligne ce qui ne peut pas se vérifier à l'œil :
+le recollage exact des phrases, une erreur du modèle qui arrive bien dans le flux, un
+second tour simultané refusé, et le **verrou relâché après une erreur** — sans quoi la
+page resterait bloquée jusqu'au redémarrage du serveur.
+
+### 16.4 La limite, et le pas suivant
+
+La vérification tourne en **boucle locale** : le serveur écoute bien sur `0.0.0.0` et
+annonce l'adresse de l'interface par défaut, mais l'essai depuis le téléphone n'est pas
+encore fait. C'est l'étape suivante, avec `tailscale serve`, qui apporte HTTPS — donc le
+micro du navigateur et l'installation sur l'écran d'accueil.
+
+**Dette assumée** : l'orchestration d'un tour (empiler la question, appeler le modèle,
+empiler la réponse, mesurer) existe maintenant en deux exemplaires — dans
+`ChatSession.ask` pour la console, dans `web._flux` pour la page. Le risque de casser la
+console en remaniant `ask()` était plus grand que le gain pour cette première tranche,
+mais ça reste à réunir : la prochaine occasion doit faire descendre cette logique dans
+`ChatSession`, pour qu'il n'en existe qu'une version.
+
+---
+
+## 17. Licence
 
 MIT — voir le fichier `LICENSE`. Faire ce qu'on veut, sans garantie.

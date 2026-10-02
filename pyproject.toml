@@ -53,5 +53,10 @@ version = { attr = "voicechat.__version__" }
 # `tests/` n'est pas un paquet à installer : on ne prend que le code du produit.
 include = ["voicechat*"]
 
+[tool.setuptools.package-data]
+# La page web est un fichier, pas du code : sans cette ligne elle ne serait pas embarquée
+# dans le paquet, et `voicechat --web` n'aurait rien à servir après un `pip install`.
+voicechat = ["*.html"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]

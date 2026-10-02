@@ -47,8 +47,10 @@ class _Handler(BaseHTTPRequestHandler):
     # ------------------------------------------------------------- utilitaires
     def _envoyer(self, code: int, corps: bytes, ctype: str) -> None:
         self.send_response(code)
-        # Le charset ne vaut que pour le JSON : l'annoncer sur audio/wav serait faux.
-        if ctype.startswith("application/json"):
+        # Le charset vaut pour le texte (JSON, HTML, flux d'évènements) : sans lui,
+        # « synthétiseur non chargé » devient illisible au curl et dans un navigateur.
+        # L'annoncer sur audio/wav serait faux : d'où le test sur le type.
+        if ctype.startswith(("application/json", "text/")):
             ctype = f"{ctype}; charset=utf-8"
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(corps)))

@@ -32,6 +32,7 @@ from .llm import (
 )
 from .micro import DetecteurParole, Ecouteur, Microphone
 from .stt import Transcriber
+from .tour import derouler
 from .tts import (
     KokoroTTS,
     SpeechPipeline,
@@ -42,6 +43,7 @@ from .tts import (
     list_voices,
     resolve_device,
 )
+from .web import PORT_WEB
 
 BANNER = r"""
  __     __    _         _____ _           _
@@ -164,8 +166,11 @@ def build_parser() -> argparse.ArgumentParser:
                    help="synthétiser sur un autre poste (ex. http://niko-tv:8090)")
     p.add_argument("--serveur-tts", action="store_true",
                    help="tenir le service TTS pour d'autres postes, puis sortir")
-    p.add_argument("--port", type=int, default=PORT_DEFAUT,
-                   help=f"port du service TTS (défaut : {PORT_DEFAUT})")
+    p.add_argument("--web", action="store_true",
+                   help="servir l'interface web (page + texte au fil de l'eau + audio)")
+    p.add_argument("--port", type=int, default=None,
+                   help=f"port d'écoute (défaut : {PORT_DEFAUT} pour --serveur-tts, "
+                        f"{PORT_WEB} pour --web)")
     p.add_argument("--temperature", type=float, help="température d'échantillonnage")
     p.add_argument("--timeout", type=float, help="délai max en secondes par requête")
     p.add_argument("--probe", action="store_true", help="tester la joignabilité du serveur et sortir")
@@ -436,22 +441,31 @@ class ChatSession:
         self._ancrage_messages = 0
 
     # ------------------------------------------------------------------ démarrage
-    def setup_voice(self) -> None:
+    def setup_voice(self, avec_pipeline: bool = True) -> None:
+        """Charge la voix.
+
+        ``avec_pipeline=False`` sert au serveur web : la synthèse doit être disponible
+        (c'est elle qui fournit l'audio au navigateur) mais **la machine ne doit pas
+        parler** — le son sort du navigateur, pas de ses haut-parleurs.
+        """
         cfg = self.cfg
         if not cfg.tts:
             print("Voix   : désactivée (--no-tts)")
             return
 
-        self.speaker = Speaker(samplerate=24000, device=cfg.output_device)  # type: ignore[arg-type]
-        if not self.speaker.available:
-            print("Voix   : sounddevice indisponible → chat muet")
-            self.cfg.tts = False
-            return
-        self.speaker.start()
-        if not self.speaker.pret:
-            print(f"Voix   : {self.speaker.last_error} → chat muet")
-            self.cfg.tts = False
-            return
+        if avec_pipeline:
+            self.speaker = Speaker(samplerate=24000, device=cfg.output_device)  # type: ignore[arg-type]
+            if not self.speaker.available:
+                print("Voix   : sounddevice indisponible → chat muet")
+                self.cfg.tts = False
+                return
+            self.speaker.start()
+            if not self.speaker.pret:
+                print(f"Voix   : {self.speaker.last_error} → chat muet")
+                self.cfg.tts = False
+                return
+        else:
+            print("Voix   : synthèse seule — le son sortira du navigateur")
 
         if cfg.tts_url:
             # Poste léger : aucune synthèse locale, donc ni torch ni GPU ici.
@@ -770,18 +784,35 @@ class ChatSession:
         # Le clavier reste écouté pendant tout l'échange : Échap coupe la voix sans
         # perdre la réponse, et les frappes faites entre-temps ne sont pas jetées.
         with ClavierGeneration() as clavier:
+            # `recus` accumule au fil de l'eau plutôt que de compter sur la valeur de
+            # retour : si l'utilisateur interrompt en pleine génération, on veut garder ce
+            # qui a déjà été lu — c'est ce qu'il a vu à l'écran.
+            recus: list[str] = []
+
+            def sur_texte(morceau: str) -> None:
+                print(morceau, end="", flush=True)
+                recus.append(morceau)
+
+            def surveiller_clavier() -> None:
+                """Échap coupe la voix — la génération, elle, continue jusqu'au bout.
+
+                C'est un effet de bord, pas un arrêt : mettre fin au flux ici tronquerait
+                la réponse à l'écran, ce que la vérification d'interruption refuse.
+                """
+                nonlocal coupee
+                if clavier.sonder():
+                    coupee = True
+                    self._couper_voix()
+
             try:
                 morceaux = flux if premier is None else itertools.chain([premier], flux)
-                for morceau in morceaux:
-                    print(morceau, end="", flush=True)
-                    reponse += morceau
-                    tampon += morceau
-                    phrases, tampon = txt.split_sentences(tampon)
-                    for phrase in phrases:
-                        self._speak(phrase)
-                    if clavier.sonder():
-                        coupee = True
-                        self._couper_voix()
+                _, tampon, _ = derouler(
+                    morceaux,
+                    on_texte=sur_texte,
+                    on_phrase=self._speak,
+                    sur_morceau=surveiller_clavier,
+                )
+                reponse = "".join(recus)
             except KeyboardInterrupt:
                 interrompu = True
             except LLMError as exc:
@@ -789,6 +820,7 @@ class ChatSession:
                 print(f"\n[ERREUR] {exc}")
                 self.messages.pop()  # on retire la question pour garder un contexte propre
             finally:
+                reponse = "".join(recus) or reponse
                 flux.close()  # ferme la connexion HTTP, même si on a interrompu
 
             print()  # fin de la ligne de réponse
@@ -1451,7 +1483,55 @@ class ChatSession:
 
 
 # ------------------------------------------------------------------------ entrée
-def do_serveur_tts(cfg: Config, port: int) -> int:
+def do_web(cfg: Config, port: int | None = None) -> int:
+    """Sert l'interface web : la même conversation, dans un navigateur.
+
+    Le serveur tient **une** `ChatSession` : historique, profils, réserve d'audio et
+    mesure du contexte sont donc ceux de la console. La synthèse reste ici aussi, ce qui
+    permet d'ouvrir la page depuis un téléphone qui n'a ni GPU ni Kokoro.
+    """
+    from .web import ServeurWeb
+
+    session = ChatSession(cfg)
+    if not session.resolve_model():
+        return 2
+    session.cfg, _ = session.cfg.pour_modele(session.cfg.model)
+    # Pas de pipeline local : la machine ne doit pas se mettre à parler pendant que le
+    # navigateur joue déjà le son.
+    session.setup_voice(avec_pipeline=False)
+    if session.tts is None:
+        print("[ERREUR] la voix doit être disponible : c'est elle qui fournit l'audio")
+        return 2
+
+    try:
+        serveur = ServeurWeb(session.tts, session, port or PORT_WEB)
+        url = serveur.demarrer()
+    except OSError as exc:
+        print(f"[ERREUR] port indisponible : {exc}")
+        return 2
+
+    print(f"Page    : {url}")
+    print(f"          en local : {serveur.url_local}")
+    print(f"Modèle  : {nom_court(session.cfg.model)}")
+    if session.cfg.n_ctx:
+        print(f"Contexte: {session.cfg.n_ctx} tokens")
+    print()
+    print("Ouvrir l'adresse depuis n'importe quelle machine du tailnet.")
+    print("Pour HTTPS (micro du navigateur, installation sur téléphone) :")
+    print(f"  sudo tailscale serve --bg {serveur.port}")
+    print()
+    print("Ctrl+C pour arrêter.")
+    try:
+        while True:
+            time.sleep(0.5)
+    except KeyboardInterrupt:
+        print("\nservice arrêté.")
+    finally:
+        serveur.arreter()
+    return 0
+
+
+def do_serveur_tts(cfg: Config, port: int | None = None) -> int:
     """Tient le service TTS pour d'autres postes, jusqu'à Ctrl+C.
 
     Le poste léger n'a alors besoin que de ``--tts-distant`` : ni torch, ni Kokoro,
@@ -1472,11 +1552,12 @@ def do_serveur_tts(cfg: Config, port: int) -> int:
     print(f"GPU         : {tts.device_reason} → device={tts.device}")
     print(f"Réserve     : {cache.dossier}")
 
+    port_tts = port or PORT_DEFAUT
     try:
-        serveur = ServeurTTS(tts, port)
+        serveur = ServeurTTS(tts, port_tts)
         url = serveur.demarrer()
     except OSError as exc:
-        print(f"[ERREUR] port {port} indisponible : {exc}")
+        print(f"[ERREUR] port {port_tts} indisponible : {exc}")
         return 2
 
     print(f"Écoute      : {url}")
@@ -1588,6 +1669,8 @@ def main(argv: list[str] | None = None) -> int:
         return do_diag_micro(cfg)
     if args.serveur_tts:
         return do_serveur_tts(cfg, args.port)
+    if args.web:
+        return do_web(cfg, args.port)
     if args.probe:
         return do_probe(cfg)
 

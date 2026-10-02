@@ -1,0 +1,250 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<!-- Sans ce réglage, un téléphone affiche la page en tout petit et zoome sur les champs. -->
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="dark light">
+<meta name="theme-color" content="#12141a">
+<!-- Rendu « application » quand on l'ajoute à l'écran d'accueil du téléphone.
+     C'est ce qui fait le pont vers Android : la même page, installée. -->
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<title>voicechat</title>
+<style>
+  :root {
+    --fond: #12141a; --fond2: #1b1e27; --trait: #2c313d;
+    --texte: #e8eaf0; --faible: #99a0b0; --accent: #7cc4ff; --moi: #2a3a2e;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body {
+    background: var(--fond); color: var(--texte);
+    font: 16px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    display: flex; flex-direction: column;
+  }
+  header {
+    display: flex; align-items: center; gap: .6rem;
+    padding: .6rem .9rem; border-bottom: 1px solid var(--trait);
+    background: var(--fond2); position: sticky; top: 0; z-index: 2;
+  }
+  header b { font-weight: 600; }
+  header .etat { color: var(--faible); font-size: .8rem; margin-left: auto; text-align: right; }
+  button {
+    background: var(--fond); color: var(--texte); border: 1px solid var(--trait);
+    border-radius: .5rem; padding: .4rem .7rem; font: inherit; cursor: pointer;
+  }
+  button:active { background: var(--trait); }
+  button:disabled { opacity: .45; cursor: default; }
+  main { flex: 1; overflow-y: auto; padding: .9rem; display: flex; flex-direction: column; gap: .8rem; }
+  .tour { max-width: 46rem; width: 100%; margin: 0 auto; }
+  .qui { color: var(--faible); font-size: .75rem; text-transform: uppercase; letter-spacing: .05em; }
+  .bulle { white-space: pre-wrap; overflow-wrap: anywhere; padding: .55rem .75rem; border-radius: .6rem; }
+  .moi .bulle { background: var(--moi); }
+  .ia .bulle { background: var(--fond2); border: 1px solid var(--trait); }
+  .ia.parle .bulle::after { content: " ▌"; color: var(--accent); animation: clignote 1s steps(2) infinite; }
+  @keyframes clignote { 50% { opacity: 0; } }
+  .phrase-jouee { color: var(--faible); }
+  #panne { display: none; background: #3a2226; border-color: #7a3b42; color: #ffc9ce; }
+  footer { border-top: 1px solid var(--trait); background: var(--fond2); padding: .6rem .9rem; }
+  .saisie { max-width: 46rem; margin: 0 auto; display: flex; gap: .5rem; align-items: flex-end; }
+  textarea {
+    flex: 1; resize: none; background: var(--fond); color: var(--texte);
+    border: 1px solid var(--trait); border-radius: .6rem; padding: .6rem .7rem;
+    font: inherit; max-height: 8rem; min-height: 2.6rem;
+  }
+  textarea:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
+  .aide { color: var(--faible); font-size: .72rem; text-align: center; margin-top: .4rem; }
+</style>
+</head>
+<body>
+<header>
+  <b>voicechat</b>
+  <span id="modele" class="etat"></span>
+  <button id="stop" title="Couper la voix et arrêter la réponse" disabled>Stop</button>
+  <button id="neuf" title="Nouvelle conversation">Neuf</button>
+</header>
+
+<main id="fil"></main>
+
+<footer>
+  <div class="saisie">
+    <textarea id="q" rows="1" placeholder="Écrivez, puis Entrée — Maj+Entrée pour un saut de ligne"></textarea>
+    <button id="envoi">Envoyer</button>
+  </div>
+  <div class="aide" id="aide">Entrée envoie · le texte s'affiche pendant qu'il est lu</div>
+</footer>
+
+<script>
+"use strict";
+
+const fil = document.getElementById("fil");
+const zone = document.getElementById("q");
+const boutonEnvoi = document.getElementById("envoi");
+const boutonStop = document.getElementById("stop");
+const boutonNeuf = document.getElementById("neuf");
+const zoneModel = document.getElementById("modele");
+const aide = document.getElementById("aide");
+
+let source = null;        // le flux SSE en cours
+let fileAudio = [];       // phrases à dire, dans l'ordre
+let joue = false;         // une lecture est en cours
+let arretDemande = false;
+
+// ---------------------------------------------------------------- affichage
+function tour(qui) {
+  const bloc = document.createElement("div");
+  bloc.className = "tour " + qui;
+  const etiquette = document.createElement("div");
+  etiquette.className = "qui";
+  etiquette.textContent = qui === "moi" ? "vous" : "ia";
+  const bulle = document.createElement("div");
+  bulle.className = "bulle";
+  bloc.append(etiquette, bulle);
+  fil.append(bloc);
+  fil.scrollTop = fil.scrollHeight;
+  return { bloc, bulle };
+}
+
+function panne(message) {
+  aide.textContent = message;
+  aide.style.color = "#ff9aa4";
+}
+
+// ------------------------------------------------------------------- audio
+// Le son arrive après le texte : on fait la queue, comme la console le fait avec sa
+// file de synthèse. Sans cette file, les phrases se chevaucheraient.
+async function dire(texte) {
+  fileAudio.push(texte);
+  if (!joue) await viderFile();
+}
+
+async function viderFile() {
+  if (joue) return;
+  joue = true;
+  boutonStop.disabled = false;
+  while (fileAudio.length && !arretDemande) {
+    const phrase = fileAudio.shift();
+    try {
+      const reponse = await fetch("parle", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ texte: phrase }),
+      });
+      if (!reponse.ok) {
+        const detail = await reponse.text();
+        panne("voix : HTTP " + reponse.status + " " + detail.slice(0, 120));
+        continue;
+      }
+      const url = URL.createObjectURL(await reponse.blob());
+      await new Promise((fini) => {
+        const son = new Audio(url);
+        son.onended = fini;
+        son.onerror = fini;   // un format refusé ne doit pas bloquer la file
+        son.play().catch(fini);
+        window.__son = son;   // pour pouvoir l'arrêter depuis le bouton
+      });
+      URL.revokeObjectURL(url);
+    } catch (err) {
+      panne("voix injoignable : " + err);
+    }
+  }
+  joue = false;
+  boutonStop.disabled = true;
+}
+
+function taire() {
+  arretDemande = true;
+  fileAudio = [];
+  if (window.__son) { try { window.__son.pause(); } catch (e) {} window.__son = null; }
+  if (source) { source.close(); source = null; }
+  boutonStop.disabled = true;
+}
+
+// ------------------------------------------------------------------ envoi
+function envoyer() {
+  const question = zone.value.trim();
+  if (!question || source) return;
+
+  tour("moi").bulle.textContent = question;
+  zone.value = "";
+  zone.style.height = "auto";
+  const cible = tour("ia");
+  cible.bloc.classList.add("parle");
+  boutonEnvoi.disabled = true;
+  arretDemande = false;
+  aide.style.color = "";
+  aide.textContent = "réponse en cours…";
+
+  source = new EventSource("flux?q=" + encodeURIComponent(question));
+
+  source.addEventListener("texte", (e) => {
+    cible.bulle.textContent += JSON.parse(e.data).t;
+    fil.scrollTop = fil.scrollHeight;
+  });
+
+  source.addEventListener("phrase", (e) => {
+    dire(JSON.parse(e.data).t);
+  });
+
+  source.addEventListener("fin", (e) => {
+    const info = JSON.parse(e.data);
+    zoneModel.textContent = info.contexte
+      ? "contexte " + info.contexte.utilise + " / " + info.contexte.total +
+        " · " + info.tok_s.toFixed(0) + " tok/s"
+      : info.tok_s.toFixed(0) + " tok/s";
+    aide.textContent = "terminé — " + info.tokens + " tokens en " +
+      info.secondes.toFixed(1) + " s";
+    terminer();
+  });
+
+  source.addEventListener("erreur", (e) => {
+    cible.bulle.textContent += "\n[" + JSON.parse(e.data).message + "]";
+    terminer();
+  });
+
+  // Erreur réseau : EventSource retente tout seul, on prévient simplement.
+  source.onerror = () => {
+    if (!source) return;
+    panne("connexion au serveur interrompue");
+    terminer();
+  };
+}
+
+function terminer() {
+  if (source) { source.close(); source = null; }
+  document.querySelectorAll(".ia.parle").forEach((b) => b.classList.remove("parle"));
+  boutonEnvoi.disabled = false;
+  zone.focus();
+}
+
+// ------------------------------------------------------------------- départ
+boutonEnvoi.onclick = envoyer;
+boutonStop.onclick = () => { taire(); terminer(); aide.textContent = "arrêté"; };
+boutonNeuf.onclick = async () => {
+  taire();
+  await fetch("reset", { method: "POST" });
+  fil.innerHTML = "";
+  zoneModel.textContent = "";
+  aide.textContent = "nouvelle conversation";
+  terminer();
+};
+
+zone.addEventListener("keydown", (e) => {
+  if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); envoyer(); }
+});
+zone.addEventListener("input", () => {
+  zone.style.height = "auto";
+  zone.style.height = Math.min(zone.scrollHeight, 128) + "px";
+});
+
+// État initial : quel modèle, quel contexte.
+fetch("etat").then((r) => r.json()).then((e) => {
+  zoneModel.textContent = e.modele + (e.contexte
+    ? " · contexte " + e.contexte.total : "");
+}).catch(() => {});
+zone.focus();
+</script>
+</body>
+</html>
