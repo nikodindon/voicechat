@@ -528,6 +528,29 @@ def test_deux_serveurs_ne_partagent_pas_le_transcripteur(monkeypatch):
         b.arreter()
 
 
+def test_la_page_offre_les_mains_libres():
+    """Le mode mains libres : la page publie son état, et rien ne peut rester bloqué.
+
+    Ces quelques chaînes sont le contrat entre la page et la vérification qui la pilote dans
+    un vrai navigateur (`tests/verif_mains_libres.py`) : c'est `data-etat` qui lui permet de
+    suivre où en est la détection sans deviner.
+    """
+    page = web.PAGE.read_text(encoding="utf-8")
+    assert 'id="mains"' in page
+    assert 'id="jauge-niveau"' in page
+    assert 'id="jauge-seuil"' in page
+    # La page dit dans quel état elle est, dans le DOM — pas seulement à l'œil.
+    assert "document.body.dataset.etat" in page
+    for etat in ("repos", "calibration", "ecoute", "parle", "transcrit", "muet"):
+        assert f'"{etat}"' in page, f"état manquant : {etat}"
+    # Les garde-fous trouvés à l'usage : un enregistrement borné dans le temps, et un seuil
+    # plafonné pour qu'une calibration ratée ne rende jamais le micro sourd.
+    assert "dureeMaxi" in page
+    assert "seuilMaxi" in page
+    # Aucun chemin de transcription ne peut laisser la page coincée sur « transcrit ».
+    assert "finally" in page and 'if (etatVad === "transcrit") finDeTour();' in page
+
+
 def test_port_zero_du_serveur_web_va_jusqu_a_l_os(monkeypatch):
     """`--port 0` doit demander un port libre, pas retomber sur celui par défaut.
 

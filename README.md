@@ -49,6 +49,7 @@ sur la machine avec laquelle on parle. On ne dépend donc jamais d'un service TT
 | **Service STT distant** (`--serveur-stt`, `--stt-distant`) : audio → texte | ✅ implémenté et vérifié (v1.3) — boucle texte→audio→texte bouclée, webm/opus accepté, cf. §17 |
 | **Micro dans la page** (parler au lieu de taper) | ✅ implémenté et vérifié (v1.4) — 13 contrôles, webm/opus d'un navigateur, transcription pendant la réponse, cf. §16.6 |
 | **Mode dialogue à deux voix** (`/dialogue alice bob <sujet>`) | ✅ implémenté et vérifié (v1.5) — 7 contrôles, voix relevée à chaque synthèse, cf. §18 |
+| **Mains libres dans la page** (∞ : arrêt sur silence, envoi seul, barge-in) | ✅ implémenté et vérifié (v1.6) — 12 contrôles dans un vrai Chromium, cf. §19 |
 | **`--dire` / `--dire-fichier`** : lire un texte sans le LLM | ✅ implémenté et vérifié (v1.1) — par son WAV dans la réserve, cf. §14.1 |
 | **`/cherche <mot>`** dans les conversations sauvées (accents compris) | ✅ implémenté et vérifié (v1.1) — 17 tests, cf. §14.2 |
 | **`/resume`** : compacter les vieux échanges au lieu de les perdre | ✅ implémenté et vérifié (v1.1) — 1,1× à 1,6× selon la densité du texte, cf. §14.3 |
@@ -511,6 +512,7 @@ Trois scripts de vérification bout en bout pilotent le vrai CLI dans un pseudo-
 .venv/bin/python tests/verif_stt.py           # service STT : texte → audio → texte
 .venv/bin/python tests/verif_micro.py         # le micro de la page : webm → texte
 .venv/bin/python tests/verif_dialogue.py      # deux personas, deux voix (audio en temps réel)
+python3 tests/verif_mains_libres.py           # mains libres dans un vrai navigateur (playwright)
 .venv/bin/python tests/verif_config.py        # précédence TOML/env/arguments
 ```
 
@@ -656,8 +658,9 @@ il n'a besoin ni de GPU, ni de modèle local — juste d'être sur le réseau.
 - [ ] **Découverte des postes** : dire une fois où sont LLM / TTS / STT, garder ça en
       configuration. Le tailnet donne des adresses `100.x.y.z` stables mais il y a
       plusieurs machines (niko-1650-super, niko-tv, niko-nitro-an515-52) : ne pas confondre.
-- [ ] **Mode voiture / casque** : dialogue mains libres de bout en bout, ce qui suppose
-      que la capture micro soit enfin réglée (voir ci-dessous).
+- [ ] **Mode voiture / casque** : dialogue mains libres de bout en bout. La brique existe
+      depuis la v1.6 (mains libres + barge-in dans la page, §19) ; il reste à l'éprouver en
+      acoustique réelle, et à la console de comprendre le bruit de la v0.4.
 
 ### Chantier ouvert depuis la v0.4 : la capture micro
 
@@ -665,11 +668,12 @@ Ce n'est pas une fonctionnalité, c'est le blocage qui décide de la suite. Port
 la parole sur cette machine alors que `parec` est propre sur la même source : cause racine
 non identifiée (§10).
 
-Tant qu'il tient, trois idées restent **bloquées**, même si elles sont séduisantes :
+Tant qu'il tient, trois idées restent **bloquées dans la console** — mais elles ont été
+débloquées ailleurs, dans la page, où le micro n'est pas celui de PortAudio :
 
-- la **dictée continue** (parler pour écrire, sans le LLM) ;
-- le **barge-in** (interrompre l'assistant en parlant, plutôt qu'avec `Ctrl+C`) ;
-- le **mot de réveil** (« hey … ») qui rendrait le mode mains libres vraiment utilisable.
+- la **dictée continue** (parler pour écrire, sans le LLM) — ✅ **faite dans la page** en v1.6, où le micro n'est pas celui de PortAudio (§19) ;
+- le **barge-in** (interrompre l'assistant en parlant, plutôt qu'avec `Ctrl+C`) — ✅ **fait dans la page** en v1.6 ;
+- le **mot de réveil** (« hey … ») qui rendrait le mode mains libres vraiment utilisable — reste à faire, la détection est en place.
 
 `tests/bench_capture.py` est prêt pour s'y attaquer : il compare notre capture à `parec`
 par corrélation. La première étape n'est pas de corriger, c'est de comprendre.
@@ -3086,8 +3090,160 @@ peuvent donc tourner sur deux modèles différents.
 Enfin, la commande lance **6 répliques** (trois chacun). Le nombre n'est pas encore
 réglable depuis la commande.
 
+## 19. Mains libres dans la page (v1.6)
+
+Le chantier ouvert depuis la v0.4 est enfin traité — **par un autre chemin que celui
+prévu**. La roadmap disait : « PortAudio hache la parole sur cette machine (§10), donc la
+dictée continue, le barge-in et le mot de réveil sont bloqués tant que ce n'est pas
+résolu ». C'est vrai pour la console. Mais le micro d'un **navigateur** n'a rien à voir avec
+PortAudio : il passe par les API du navigateur. Ces trois idées sont donc possibles dans la
+page **sans jamais résoudre le bug de la v0.4**. C'est ce que fait cette version.
+
+Trois façons de s'en servir, deux boutons :
+
+| | comment ça marche |
+|---|---|
+| 🎤 (v1.4) | un appui commence, un appui arrête. Le texte arrive dans le champ, on le relit avant d'envoyer. |
+| 🎤 + ∞ | **mains libres** : un appui, on parle. Ça s'arrête tout seul après un silence, le texte part sans être relu, la réponse se joue, l'écoute reprend. Et on recommence. |
+| pendant la réponse | **barge-in** : on parle par-dessus, la réponse se tait et c'est nous qu'on écoute. |
+
+Le micro reste ouvert pendant toute la session mains libres — c'est ce qui permet le
+barge-in et la reprise immédiate. Le navigateur l'affiche (sa pastille d'enregistrement),
+et c'est normal.
+
+### 19.1 Un seuil calibré, pas un seuil réglé
+
+Un niveau fixe ne peut pas marcher : il couperait au milieu d'une phrase dans une pièce
+calme et ne couperait jamais dans une pièce bruyante. Le seuil est donc **appris**, puis
+suivi :
+
+* 600 ms de calibration à l'activation, dont on prend un **quantile bas** — pas la moyenne :
+  on appuie sur ∞ et on commence souvent à parler tout de suite, et la moyenne apprendrait
+  la voix comme bruit de fond (c'est arrivé au premier essai, le seuil est parti au plafond) ;
+* puis une moyenne glissante lente tant qu'on ne parle pas : si un ventilateur démarre, le
+  seuil monte avec lui ;
+* un **plafond** (`seuilMaxi`) : une calibration ratée ne doit jamais rendre le micro sourd,
+  sinon plus rien n'est détecté et plus rien n'est réappris ;
+* l'AGC du navigateur est **désactivé** : mesuré, il remonte un silence à 0,05 de RMS, ce qui
+  rend tout seuil fixe absurde. Il amplifierait le bruit de fond, donc le seuil, donc la
+  voix — une course en avant.
+
+Une **jauge** sous le champ de saisie montre le niveau et le seuil. Sans elle, régler ça sur
+un téléphone serait à l'aveugle : on voit tout de suite si le seuil est au-dessus de la
+voix, ou si le micro ne capte rien.
+
+### 19.2 Trois bancs d'essai faux avant d'en avoir un vrai
+
+La vérification (`tests/verif_mains_libres.py`) pilote un **vrai Chromium** sur un **vrai
+serveur**, et lui parle. Y arriver a coûté quatre tentatives, toutes instructives :
+
+**1. Le périphérique factice de Chromium ne se tait jamais.** Premier essai :
+`--use-file-for-fake-audio-capture=phrase.wav`. Résultat : un signal **continu**, 0,4 de RMS
+partout, jamais un silence — donc une détection de fin de phrase qui ne peut *jamais* se
+déclencher, et un enregistrement qui ne s'arrête jamais. Le journal de l'enregistreur l'a
+dit sans ambiguïté : `['créé', 'start ok']` — `stop` n'a jamais été appelé.
+
+**2. Le traitement audio du navigateur détruit ce même signal.** Mesuré sur le même
+enregistrement de 4 s :
+
+```
+brut (sans traitement)   : RMS 0,460 · pic 1,000   ← de la vraie parole
+anti-écho + réduction    : RMS 0,047 · pic 0,266   ← plat : du bruit résiduel
+```
+
+Whisper n'a alors rien à transcrire (`{"texte": "", …}`). C'est un artefact du périphérique
+factice, pas du code : l'anti-écho n'a pas de référence sonore à soustraire, et il soustrait
+tout. Sur un vrai téléphone, ce traitement est actif et le micro fonctionne.
+
+**3. Le serveur peut se bloquer sur un tube plein.** Un `Popen` dont on lit la sortie au
+démarrage puis qu'on abandonne : dès que le tube est plein, le serveur se suspend en
+écriture — au milieu d'une requête. On croit alors à un bug ailleurs. Le script draine
+désormais la sortie en continu **et** la garde pour le diagnostic.
+
+**4. La vérification se taisait sur la cause.** La première version affichait « KO » sans
+dire pourquoi : ni la réponse du serveur, ni ce que la page affichait, ni les niveaux vus
+par la détection. Elle imprime tout ça maintenant en cas d'échec — et c'est ce qui a permis
+de trouver les deux points ci-dessus.
+
+**Ce qui a fini par marcher** : la vérification **fabrique son propre micro**. Elle remplace
+`getUserMedia` par un flux qu'elle compose (`MediaStreamDestination`) à partir d'un WAV que
+Kokoro a prononcé, et c'est **elle qui décide quand ça parle** (`window.__parle()`), avec du
+vrai silence entre. Plus rien à espérer d'un fichier joué en boucle : le scénario est
+déterministe, y compris le barge-in (on parle pendant que la réponse se joue).
+
+### 19.3 Deux défauts trouvés dans le code, cette fois
+
+**La page se bloquait sur « transcrit ».** Une erreur de transcription sortait de la
+fonction par un `return` sans remettre l'état — et tout le mode mains libres restait figé
+jusqu'au rechargement de la page. Un `finally` garantit maintenant qu'aucun chemin ne
+laisse la page dans cet état. C'est le genre de bogue qu'on ne voit qu'en le vivant : à
+l'écran, rien ne distingue « ça réfléchit » de « c'est mort ».
+
+**Le début de la phrase était coupé.** La détection attendait 180 ms de son avant de lancer
+l'enregistrement — de quoi perdre la première syllabe. La vérification l'a montré sans
+discussion possible :
+
+```
+attendu :  Quel temps fera-t-il demain à Lyon ?
+entendu :           Et aura-t-il demain à Lyon ?
+```
+
+L'enregistrement démarre maintenant au **premier dépassement du seuil**. Ce sont les clics
+qu'il faut jeter, et ça se fait à l'autre bout : un clic dure moins de 350 ms, et un
+enregistrement plus court que ça n'est jamais envoyé. Après correction, la phrase revient
+**exacte**, deux fois de suite.
+
+### 19.4 Vérification
+
+```
+$ python3 tests/verif_mains_libres.py
+[4/6] activation des mains libres — le micro ne dit encore rien :
+      état : ecoute · seuil appris (position sur la jauge) : 3%
+
+[5/6] on parle (le micro synthétique joue la phrase), puis on se tait :
+      état pendant la phrase : parle
+      message parti seul après 5.0 s : « Quel temps fera-t-il demain à Lyon ? »
+
+[6/6] réponse, reprise d'écoute — puis on interrompt en parlant :
+      état pendant la réponse : muet
+      après avoir parlé par-dessus : parle (la réponse a été coupée, l'écoute a repris)
+      deuxième message, toujours sans rien toucher : « Quel temps fera-t-il demain à Lyon ? »
+      état final : ecoute
+
+      chronologie observée : ecoute → parle → transcrit → muet → parle → ecoute
+      journal du micro      : ['micro ouvert', 'parle', 'parle']
+      journal enregistreur  : ['créé', 'start ok', 'stop demandé', 'ÉVÉNEMENT stop', …]
+
+=== contrôles ===
+  OK  les deux boutons sont proposés
+  OK  la page a la jauge de niveau
+  OK  le seuil se calibre puis passe en écoute
+  OK  la jauge de niveau est affichée
+  OK  le seuil est mesuré, pas figé
+  OK  la parole déclenche l'enregistrement
+  OK  le silence arrête l'enregistrement et le message part seul
+  OK  le texte envoyé est celui de la phrase dite
+  OK  pendant la réponse, le micro passe en veille
+  OK  parler pendant la réponse la coupe et ouvre l'écoute
+  OK  la boucle tourne : un deuxième tour part tout seul
+  OK  aucune erreur JavaScript
+```
+
+**Ce que ce banc ne peut pas juger, et qu'il faut essayer à la main sur un téléphone** :
+l'acoustique. Ici le haut-parleur ne sort aucun son, donc l'anti-écho n'a rien à annuler.
+Le jour où la réponse sort par le vrai haut-parleur et rentre dans le vrai micro, c'est le
+navigateur qui doit la soustraire — et c'est là qu'on saura si le barge-in est utilisable ou
+s'il s'interrompt tout seul. Le facteur `margeBargeIn` (seuil × 3 pendant la réponse) est là
+pour ça, mais il ne remplace pas un essai réel.
+
+### 19.5 Ce qui reste
+
+Le **mot de réveil** (« hey … ») : la détection est en place, il faudrait comparer ce qui est
+entendu à un mot attendu et n'envoyer au modèle que dans ce cas. Et la même chose dans la
+console, qui attend toujours que le bruit de la v0.4 soit compris.
+
 ---
 
-## 19. Licence
+## 20. Licence
 
 MIT — voir le fichier `LICENSE`. Faire ce qu'on veut, sans garantie.

@@ -55,6 +55,21 @@
     font: inherit; max-height: 8rem; min-height: 2.6rem;
   }
   textarea:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
+  #mains { padding: .6rem .6rem; font-size: 1rem; line-height: 1; color: var(--faible); }
+  #mains.actif { background: #24384a; border-color: var(--accent); color: var(--accent); }
+  /* La jauge : le niveau du micro, et le seuil de détection en rouge. Sans elle, régler le
+     seuil sur un téléphone serait à l'aveugle — c'est l'outil de mise au point. */
+  .jauge {
+    display: none; position: relative; max-width: 46rem; margin: .45rem auto 0;
+    height: .35rem; background: var(--fond); border: 1px solid var(--trait);
+    border-radius: .2rem; overflow: hidden;
+  }
+  body[data-etat="calibration"] .jauge, body[data-etat="ecoute"] .jauge,
+  body[data-etat="parle"] .jauge, body[data-etat="muet"] .jauge { display: block; }
+  .jauge i { position: absolute; left: 0; top: 0; bottom: 0; width: 0; background: var(--accent); transition: width .06s linear; }
+  .jauge b { position: absolute; top: -.15rem; bottom: -.15rem; width: 2px; background: #ff9aa4; }
+  #micro.ecoute { border-color: var(--accent); color: var(--accent); }
+  #micro.muet { opacity: .55; }
   #micro { padding: .6rem .7rem; font-size: 1.1rem; line-height: 1; }
   #micro.enregistre {
     background: #7a3b42; border-color: #b3575f; color: #ffd9dc;
@@ -76,9 +91,13 @@
 
 <footer>
   <div class="saisie">
+    <button id="mains" title="Mains libres : parler sans toucher l'écran" aria-pressed="false">∞</button>
     <button id="micro" title="Parler — le texte entendu arrive dans le champ" hidden>🎤</button>
     <textarea id="q" rows="1" placeholder="Écrivez, puis Entrée — Maj+Entrée pour un saut de ligne"></textarea>
     <button id="envoi">Envoyer</button>
+  </div>
+  <div class="jauge" id="jauge">
+    <i id="jauge-niveau"></i><b id="jauge-seuil"></b>
   </div>
   <div class="aide" id="aide">Entrée envoie · le texte s'affiche pendant qu'il est lu</div>
 </footer>
@@ -175,6 +194,10 @@ function envoyer() {
   const question = zone.value.trim();
   if (!question || source) return;
 
+  // Mains libres : le micro reste ouvert pendant la réponse, pour pouvoir l'interrompre
+  // en parlant. On le met en veille (`muet`) avec un seuil plus haut.
+  if (mainsLibres && etatVad !== "repos") afficherEtat("muet");
+
   tour("moi").bulle.textContent = question;
   zone.value = "";
   zone.style.height = "auto";
@@ -225,20 +248,92 @@ function terminer() {
   document.querySelectorAll(".ia.parle").forEach((b) => b.classList.remove("parle"));
   boutonEnvoi.disabled = false;
   zone.focus();
+  // Mains libres : on se remet à écouter quand la voix a **fini de parler**, pas quand le
+  // texte a fini d'arriver — sinon le micro s'ouvrirait par-dessus la réponse et
+  // l'entendrait comme si c'était l'utilisateur.
+  if (mainsLibres) {
+    attendreFinAudio().then(armerEcoute);
+  }
 }
 
 // -------------------------------------------------------------------- micro
-// Parler plutôt que taper. Trois pièces : le navigateur enregistre, le serveur transcrit
-// (Whisper tourne sur le poste GPU, pas ici), et le texte arrive dans le champ —
-// **sans être envoyé**. C'est délibéré : une transcription peut se tromper, et mieux vaut
-// la relire avant qu'elle devienne une question ; un mot mal entendu envoyé tout seul
-// coûte plus cher qu'une touche Entrée.
-let enregistreur = null;
-let morceaux = [];
-let fluxMicro = null;
+// Parler plutôt que taper. Le navigateur enregistre, le serveur transcrit (Whisper tourne
+// sur le poste GPU, pas ici), et le texte revient.
+//
+// Deux façons de s'en servir, un seul bouton 🎤 :
+//
+//   * **sans mains libres** (v1.4) : un appui commence, un appui arrête. Le texte arrive
+//     dans le champ et on le relit avant d'envoyer — une transcription peut se tromper, et
+//     un mot mal entendu envoyé tout seul coûte plus cher qu'une touche Entrée.
+//
+//   * **avec mains libres** (v1.6) : un appui, et on parle. L'enregistrement s'arrête tout
+//     seul après un silence, le texte part sans être relu, la réponse se joue, puis
+//     l'écoute reprend. Et si on parle **pendant** la réponse, elle se tait et on reprend
+//     la parole (c'est le barge-in).
+//
+// Le seuil de détection est **calibré sur le bruit ambiant** au démarrage, puis suivi en
+// continu, et l'AGC du navigateur est désactivé. Mesuré au banc (voir README §19) : avec
+// l'AGC, un silence remonte à 0,05 de RMS — un seuil fixe couperait au milieu d'une phrase
+// dans une pièce calme et ne couperait jamais dans une pièce bruyante.
+const VAD = {
+  calibration: 600,   // ms d'écoute du bruit ambiant avant de fixer le seuil
+  marge: 3.0,         // seuil = bruit ambiant × marge
+  seuilMini: 0.006,   // plancher : dans un silence parfait, ne pas devenir fou
+  seuilMaxi: 0.05,    // plafond : voir plus bas — c'est la garantie de rester détectable
+  dureeSilence: 850,  // ms de calme pour décider que la phrase est finie
+  dureeMini: 350,     // ms de parole minimum, sinon on jette (toux, bruit de fond)
+  dureeMaxi: 20000,   // garde-fou : un enregistrement ne dure jamais plus que ça
+  margeBargeIn: 3.0,  // pendant la réponse : le micro entend le haut-parleur, on exige plus
+  echo: { echoCancellation: true, noiseSuppression: true, autoGainControl: false },
+};
 
-async function commencer() {
-  if (enregistreur) return;
+// Pourquoi un plafond au seuil, et un quantile bas plutôt qu'une moyenne : la première
+// vérification a montré les deux pièges.
+//
+// 1. Le fichier qui servait de micro parlait déjà pendant la calibration : la « moyenne du
+//    bruit ambiant » a donc appris la **voix** comme bruit de fond, et le seuil est parti
+//    au plafond de la jauge. Avec une voix réelle, c'est la même chose — on appuie sur ∞ et
+//    on commence à parler tout de suite. Le quantile bas corrige la mesure, le plafond
+//    garantit qu'une calibration ratée ne rend jamais le micro sourd.
+// 2. Sans plafond, un seuil appris trop haut ne se rattrape pas : plus rien n'est détecté,
+//    donc plus rien n'est réappris.
+function quantileBas(valeurs, part = 0.25) {
+  const tri = valeurs.slice().sort((a, b) => a - b);
+  return tri[Math.min(tri.length - 1, Math.floor(tri.length * part))] || 0;
+}
+
+let micro = null;          // { flux, ctx, analyseur, tampon } — ouvert tant qu'on écoute
+let vad = null;            // l'état de la détection, null quand elle est arrêtée
+let minuterieVad = null;
+let enregistreur = null;
+let morceauxMicro = [];
+let jeterCeBlob = false;
+let mainsLibres = false;
+let etatVad = "repos";     // repos | calibration | ecoute | parle | transcrit | muet
+
+const jauge = document.getElementById("jauge-niveau");
+const jaugeSeuil = document.getElementById("jauge-seuil");
+const boutonMains = document.getElementById("mains");
+
+function afficherEtat(nom) {
+  etatVad = nom;
+  document.body.dataset.etat = nom;
+  const libelles = { repos: "🎤", calibration: "…", ecoute: "🎤", parle: "■",
+                     transcrit: "…", muet: "🎤" };
+  boutonMicro.textContent = libelles[nom] || "🎤";
+  boutonMicro.classList.toggle("enregistre", nom === "parle");
+  boutonMicro.classList.toggle("ecoute", nom === "ecoute" || nom === "calibration");
+  boutonMicro.classList.toggle("muet", nom === "muet");
+  boutonMicro.title = {
+    repos: "Parler", calibration: "J'écoute le bruit ambiant…", ecoute: "Je t'écoute",
+    parle: "Enregistre — se coupera tout seul", transcrit: "Transcription…",
+    muet: "Réponse en cours — parle pour l'interrompre",
+  }[nom] || "Parler";
+}
+
+// ---------------------------------------------------------------- le micro brut
+async function ouvrirMicro() {
+  if (micro) return micro;
   if (!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia)) {
     // Le cas le plus courant, et le plus déroutant : la page est ouverte en http
     // (non chiffré) sur une adresse IP. Les navigateurs ne donnent le micro que dans un
@@ -248,43 +343,156 @@ async function commencer() {
     panne("Le micro du navigateur exige HTTPS. Sur le téléphone il faut passer par " +
           "l'adresse https (voir « tailscale serve »), pas par l'adresse non chiffrée " +
           "(" + location.host + ").");
-    return;
+    return null;
   }
   try {
-    fluxMicro = await navigator.mediaDevices.getUserMedia({ audio: true });
+    const flux = await navigator.mediaDevices.getUserMedia({ audio: VAD.echo });
+    const ctx = new AudioContext();
+    const analyseur = ctx.createAnalyser();
+    analyseur.fftSize = 2048;
+    ctx.createMediaStreamSource(flux).connect(analyseur);
+    micro = { flux, ctx, analyseur, tampon: new Float32Array(analyseur.fftSize) };
+    return micro;
   } catch (err) {
     panne("Micro refusé : " + (err && err.message ? err.message : err));
+    return null;
+  }
+}
+
+function libererMicro() {
+  if (!micro) return;
+  if (micro.flux) micro.flux.getTracks().forEach((p) => p.stop());
+  if (micro.ctx) micro.ctx.close().catch(() => {});
+  micro = null;
+}
+
+function niveau() {
+  micro.analyseur.getFloatTimeDomainData(micro.tampon);
+  let somme = 0;
+  for (const v of micro.tampon) somme += v * v;
+  return Math.sqrt(somme / micro.tampon.length);
+}
+
+function majJauge(n, seuil) {
+  // ×5 : les niveaux utiles sont petits, la jauge doit rester lisible à l'œil.
+  jauge.style.width = Math.min(100, n * 500) + "%";
+  jaugeSeuil.style.left = Math.min(99, seuil * 500) + "%";
+}
+
+// -------------------------------------------------------------------- la détection
+function demarrerVad() {
+  if (minuterieVad) return;
+  vad = { bruit: 0.012, seuil: VAD.seuilMini, debut: performance.now(), mesures: [],
+          debutParle: 0, finSon: performance.now() };
+  afficherEtat("calibration");
+  aide.style.color = "";
+  aide.textContent = "j'écoute le bruit ambiant…";
+  minuterieVad = setInterval(ticVad, 60);
+}
+
+function ticVad() {
+  if (!micro || !vad) return;
+  const t = performance.now();
+  const n = niveau();
+  majJauge(n, vad.seuil * (etatVad === "muet" ? VAD.margeBargeIn : 1));
+
+  if (etatVad === "calibration") {
+    vad.mesures.push(n);
+    if (t - vad.debut > VAD.calibration && vad.mesures.length >= 5) {
+      vad.bruit = quantileBas(vad.mesures);
+      vad.seuil = borne(vad.bruit * VAD.marge);
+      afficherEtat("ecoute");
+      aide.style.color = "";
+      aide.textContent = "mains libres — je t'écoute" +
+        (mainsLibres ? " (parle, je m'arrête tout seul)" : "");
+    }
     return;
   }
-  morceaux = [];
+  if (etatVad !== "ecoute" && etatVad !== "parle" && etatVad !== "muet") return;
+
+  // Pendant la réponse, le micro entend le haut-parleur : on exige plus fort, sinon
+  // l'assistant s'interromprait lui-même. C'est l'échocancellation du navigateur qui fait
+  // le gros du travail ; ce facteur est la ceinture en plus des bretelles.
+  const seuil = vad.seuil * (etatVad === "muet" ? VAD.margeBargeIn : 1);
+
+  if (n > seuil) {
+    vad.finSon = t;
+    if (!enregistreur) {
+      // On enregistre **dès le premier dépassement**, sans attendre confirmation. Attendre
+      // 180 ms coupait le début de la phrase : dans la vérification, « Quel temps
+      // fera-t-il demain à Lyon ? » est arrivé « Et aura-t-il demain à Lyon ? » — le début
+      // était perdu. Ce sont les clics qu'il faut jeter, et c'est `dureeMini` qui s'en
+      // charge, à l'autre bout (un clic dure moins de 350 ms).
+      if (etatVad === "muet") interrompre();   // on a parlé par-dessus la réponse
+      lancerEnregistrement();
+    }
+    return;
+  }
+
+  if (!enregistreur) {
+    // On suit le bruit ambiant tant qu'on n'enregistre pas : s'il monte (ventilateur,
+    // rue), le seuil monte avec lui.
+    vad.bruit = vad.bruit * 0.97 + n * 0.03;
+    vad.seuil = borne(vad.bruit * VAD.marge);
+    return;
+  }
+  // On enregistre : c'est le silence qui décide de la fin.
+  if (t - vad.debutParle >= VAD.dureeMaxi) {
+    arreterEnregistrement(true);
+    return;
+  }
+  if (t - vad.finSon >= VAD.dureeSilence) {
+    arreterEnregistrement(t - vad.debutParle >= VAD.dureeMini);
+  }
+}
+
+function borne(seuil) {
+  return Math.min(Math.max(seuil, VAD.seuilMini), VAD.seuilMaxi);
+}
+
+// ------------------------------------------------------------------ l'enregistrement
+function lancerEnregistrement() {
+  if (enregistreur || !micro) return;
+  morceauxMicro = [];
   // webm/opus est ce que produisent Chrome, Edge et Firefox ; Safari ne le sait pas et
   // enregistre en mp4/aac. Le serveur accepte les deux — c'est le repli PyAV qui s'en
   // charge — donc on prend ce que le navigateur sait faire, sans l'imposer.
   const voulu = "audio/webm;codecs=opus";
   enregistreur = new MediaRecorder(
-    fluxMicro,
+    micro.flux,
     MediaRecorder.isTypeSupported(voulu) ? { mimeType: voulu } : undefined
   );
   enregistreur.addEventListener("dataavailable", (e) => {
-    if (e.data && e.data.size) morceaux.push(e.data);
+    if (e.data && e.data.size) morceauxMicro.push(e.data);
   });
   enregistreur.addEventListener("stop", () => {
     const format = enregistreur.mimeType || "audio/webm";
-    if (fluxMicro) fluxMicro.getTracks().forEach((p) => p.stop());
-    fluxMicro = null;
     enregistreur = null;
-    boutonMicro.classList.remove("enregistre");
-    boutonMicro.textContent = "🎤";
-    transcrire(new Blob(morceaux, { type: format }));
+    const blob = new Blob(morceauxMicro, { type: format });
+    morceauxMicro = [];
+    if (jeterCeBlob || !blob.size) {          // trop court : c'était un bruit
+      jeterCeBlob = false;
+      finDeTour();
+      return;
+    }
+    transcrire(blob);
   });
   enregistreur.start();
-  boutonMicro.classList.add("enregistre");
-  boutonMicro.textContent = "■";
+  vad.debutParle = performance.now();
+  afficherEtat("parle");
   aide.style.color = "";
-  aide.textContent = "enregistre… cliquer pour arrêter";
+  aide.textContent = "enregistre…";
 }
 
+function arreterEnregistrement(garder) {
+  if (!enregistreur) return;
+  jeterCeBlob = !garder;
+  enregistreur.stop();
+}
+
+// ------------------------------------------------------------------- la transcription
 async function transcrire(blob) {
+  afficherEtat("transcrit");
   aide.style.color = "";
   aide.textContent = "transcription…";
   try {
@@ -303,22 +511,113 @@ async function transcrire(blob) {
       panne("Rien entendu — réessayer en parlant plus près du micro.");
       return;
     }
-    // On **ajoute** au champ au lieu de le remplacer : dicter une précision après avoir
-    // commencé à taper est le cas le plus courant.
+    if (mainsLibres) {
+      // En mains libres, on envoie sans relire : c'est tout l'intérêt du mode. Le texte
+      // entendu s'affiche quand même dans la conversation, juste après.
+      zone.value = texte;
+      zone.dispatchEvent(new Event("input"));
+      envoyer();
+      return;
+    }
+    // Hors mains libres : on **ajoute** au champ sans envoyer. Dicter une précision après
+    // avoir commencé à taper est le cas le plus courant, et relire évite d'envoyer un mot
+    // mal entendu.
     zone.value = zone.value.trim() ? zone.value.replace(/\s+$/, "") + " " + texte : texte;
-    zone.dispatchEvent(new Event("input"));  // la zone grandit comme à la frappe
+    zone.dispatchEvent(new Event("input"));
     zone.focus();
     aide.style.color = "";
-    aide.textContent = "entendu (« " + infos.rtf + " » RTF) — Entrée pour envoyer";
+    aide.textContent = "entendu (" + infos.rtf + " RTF) — Entrée pour envoyer";
   } catch (err) {
     panne("Transcription impossible : " + err.message);
+  } finally {
+    // Aucun chemin ne doit laisser la page coincée sur « transcrit » : on l'a vu pour de
+    // vrai, une erreur de transcription figeait tout le mode mains libres, et il fallait
+    // recharger la page. Quand l'envoi a eu lieu (`envoyer` a mis l'état en veille), c'est
+    // le tour de réponse qui reprend la main — d'où le test sur l'état.
+    if (etatVad === "transcrit") finDeTour();
   }
 }
 
-boutonMicro.onclick = () => {
-  if (enregistreur) enregistreur.stop();
-  else commencer();
+// ---------------------------------------------------------------- le fil du tour
+function finDeTour() {
+  // Après une transcription : en mains libres on se remet à écouter (après la réponse,
+  // s'il y en a une) ; sinon on rend la main au clavier.
+  if (!mainsLibres) { afficherEtat("repos"); return; }
+  if (source) { afficherEtat("muet"); return; }
+  if (!vad) { demarrerVad(); return; }
+  // Rien à réarmer dans la détection : elle ne regarde que le niveau du micro et
+  // l'état de l'enregistreur.
+  afficherEtat("ecoute");
+}
+
+function interrompre() {
+  // On a parlé pendant la réponse : on la coupe et on prend la parole.
+  taire();
+  terminer();
+  aide.style.color = "";
+  aide.textContent = "je t'écoute…";
+}
+
+function attendreFinAudio() {
+  return new Promise((fini) => {
+    const verifier = () => {
+      if (!joue && !fileAudio.length) fini();
+      else setTimeout(verifier, 150);
+    };
+    verifier();
+  });
+}
+
+function armerEcoute() {
+  if (!mainsLibres || enregistreur) return;
+  if (etatVad === "parle" || etatVad === "transcrit") return;  // un tour est en cours
+  if (!vad) { demarrerVad(); return; }
+  // Rien à réarmer dans la détection : elle ne regarde que le niveau du micro et
+  // l'état de l'enregistreur.
+  afficherEtat("ecoute");
+  aide.style.color = "";
+  aide.textContent = "mains libres — je t'écoute";
+}
+
+async function basculerMainsLibres(actif) {
+  mainsLibres = actif;
+  boutonMains.classList.toggle("actif", actif);
+  boutonMains.setAttribute("aria-pressed", actif ? "true" : "false");
+  try { localStorage.setItem("voicechat-mains-libres", actif ? "1" : "0"); } catch (e) {}
+  if (!actif) { toutArreter(); return; }
+  const m = await ouvrirMicro();
+  if (!m) { mainsLibres = false; boutonMains.classList.remove("actif"); return; }
+  demarrerVad();
+}
+
+function toutArreter() {
+  if (enregistreur) arreterEnregistrement(false);
+  if (minuterieVad) { clearInterval(minuterieVad); minuterieVad = null; }
+  vad = null;
+  if (!mainsLibres) libererMicro();
+  afficherEtat("repos");
+  aide.style.color = "";
+  aide.textContent = mainsLibres ? "mains libres : appuyer sur 🎤 pour écouter" : "prêt";
+}
+
+boutonMicro.onclick = async () => {
+  if (etatVad !== "repos") { toutArreter(); return; }   // un appui pendant qu'on écoute = stop
+  const m = await ouvrirMicro();
+  if (!m) return;
+  if (mainsLibres) demarrerVad();
+  else { lancerEnregistrement(); }
 };
+
+boutonMains.onclick = () => basculerMainsLibres(!mainsLibres);
+
+// Le mode se souvient d'une visite à l'autre : sur un téléphone, le régler à chaque fois
+// serait pénible. On ne le restaure que si `mediaDevices` existe, sinon on afficherait une
+// explication « il faut HTTPS » au chargement, avant même que l'utilisateur ait demandé.
+try {
+  if (localStorage.getItem("voicechat-mains-libres") === "1" && navigator.mediaDevices) {
+    basculerMainsLibres(true);
+  }
+} catch (e) {}
 
 // ------------------------------------------------------------------- départ
 boutonEnvoi.onclick = envoyer;
