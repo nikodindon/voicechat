@@ -240,3 +240,70 @@ def test_export_conversation_vide(tmp_path):
 def test_export_sans_voix_n_affiche_pas_la_ligne(tmp_path):
     texte = store.exporter_markdown(MESSAGES, tmp_path / "c.md").read_text(encoding="utf-8")
     assert "**Voix**" not in texte
+
+
+# ------------------------------------------------- profils : en-tête de réglages
+def test_profil_sans_entete_est_un_simple_prompt():
+    profil = store.analyser_profil("Tu es un assistant concis.\n")
+    assert profil.prompt == "Tu es un assistant concis."
+    assert profil.voix is None and profil.vitesse is None and profil.langue is None
+
+
+def test_profil_avec_entete():
+    profil = store.analyser_profil(
+        "voix: ff_siwis:3+ef_dora:1\n"
+        "vitesse: 1.15\n"
+        "langue: f\n"
+        "\n"
+        "Tu es un assistant concis.\n"
+    )
+    assert profil.prompt == "Tu es un assistant concis."
+    assert profil.voix == "ff_siwis:3+ef_dora:1"
+    assert profil.vitesse == 1.15
+    assert profil.langue == "f"
+
+
+def test_profil_entete_sans_ligne_vide():
+    """Le premier réglage peut toucher le prompt : on ne le mange pas."""
+    profil = store.analyser_profil("voix: af_heart\nTu réponds en anglais.\n")
+    assert profil.voix == "af_heart"
+    assert profil.prompt == "Tu réponds en anglais."
+
+
+def test_profil_cle_inconnue_laissee_dans_le_prompt():
+    """Une clé non reconnue ne doit jamais être consommée : ce serait perdre du texte."""
+    profil = store.analyser_profil("raisonnement: très long\nTu es concis.\n")
+    assert profil.voix is None
+    assert profil.prompt == "raisonnement: très long\nTu es concis."
+
+
+def test_profil_vitesse_illisible_ignoree_sans_planter():
+    profil = store.analyser_profil("vitesse: rapide\n\nTu es concis.\n")
+    assert profil.vitesse is None
+    assert profil.prompt == "Tu es concis."
+
+
+def test_profil_voix_vide_vaut_aucune_voix():
+    profil = store.analyser_profil("voix:\n\nTu es concis.\n")
+    assert profil.voix is None
+
+
+def test_profil_aller_retour_avec_voix(profils_isoles):
+    store.enregistrer_profil("duo", "Tu es concis.", voix="ff_siwis:3+ef_dora:1",
+                            vitesse=1.15)
+    profil = store.lire_profil("duo")
+    assert profil.prompt == "Tu es concis."
+    assert profil.voix == "ff_siwis:3+ef_dora:1"
+    assert profil.vitesse == 1.15
+
+
+def test_profil_sans_reglage_nécrit_pas_dentete(profils_isoles):
+    """Un profil qui ne change rien reste un fichier de prompt, comme avant la v0.5."""
+    chemin = store.enregistrer_profil("simple", "Tu es concis.")
+    assert chemin.read_text(encoding="utf-8") == "Tu es concis.\n"
+
+
+def test_charger_profil_reste_compatible(profils_isoles):
+    """`charger_profil` (utilisé ailleurs) rend le prompt, sans les réglages."""
+    store.enregistrer_profil("duo", "Tu es concis.", voix="af_heart")
+    assert store.charger_profil("duo") == "Tu es concis."

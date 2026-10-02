@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import pytest
 
-from voicechat import cli
+from voicechat import cli, store
 from voicechat.config import Config
 
 
@@ -119,3 +119,54 @@ def test_appliquer_remplace_l_etat(session):
     assert session.messages[0] == {"role": "system", "content": "prompt du fichier"}
     assert len(session.messages) == 3, "un seul message système en tête"
     assert session.conversation == "essai"
+
+
+# ------------------------------------------------- persona → voix (v0.5)
+def test_profil_avec_voix_applique_au_demarrage(tmp_path, monkeypatch):
+    """Régression : --profil levait AttributeError sur self.tts pas encore créé.
+
+    Le profil était appliqué dans le constructeur, avant l'initialisation de
+    `self.tts` — que `_reglages_profil` consulte. Tout profil portant une voix
+    faisait donc planter le lancement.
+    """
+    monkeypatch.setenv("VOICECHAT_PROFILS", str(tmp_path / "profils"))
+    store.enregistrer_profil(
+        "narrateur", "Tu racontes.", voix="ff_siwis:3+ef_dora:1", vitesse=1.1
+    )
+    session = cli.ChatSession(Config(profil="narrateur"))
+    assert session.cfg.system == "Tu racontes."
+    assert session.cfg.voice == "ff_siwis:3+ef_dora:1"
+    assert session.cfg.speed == 1.1
+    assert session.profil == "narrateur"
+
+
+def test_profil_avec_voix_ne_charge_pas_le_tts_sans_le_demander(tmp_path, monkeypatch):
+    """Au démarrage le TTS n'existe pas encore : les réglages vont dans la config."""
+    monkeypatch.setenv("VOICECHAT_PROFILS", str(tmp_path / "profils"))
+    store.enregistrer_profil("narrateur", "Tu racontes.", voix="af_heart")
+    session = cli.ChatSession(Config(profil="narrateur"))
+    assert session.tts is None
+    assert session.cfg.voice == "af_heart"
+
+
+def test_profil_save_n_ecrit_pas_la_voix_par_defaut(session):
+    """Un profil qui ne change pas la voix reste un simple fichier de prompt."""
+    session.handle_command("/profil save memo")
+    contenu = (store.dossier_profils() / "memo.md").read_text(encoding="utf-8")
+    assert "voix:" not in contenu
+    assert "vitesse:" not in contenu
+
+
+def test_profil_save_ecrit_la_voix_quand_elle_change(session):
+    session.cfg.voice = "ff_siwis:3+ef_dora:1"
+    session.cfg.speed = 1.2
+    session.handle_command("/profil save duo")
+    contenu = (store.dossier_profils() / "duo.md").read_text(encoding="utf-8")
+    assert "voix: ff_siwis:3+ef_dora:1" in contenu
+    assert "vitesse: 1.2" in contenu
+
+
+def test_voice_mal_saisie_donne_un_message_pas_un_plantage(session):
+    """`/voice` valide la syntaxe avant de toucher au TTS."""
+    assert session.handle_command("/voice ff_siwis:beaucoup") is True
+    assert session.cfg.voice == "ff_siwis", "la voix ne doit pas changer"

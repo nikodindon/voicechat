@@ -37,9 +37,11 @@ sur la machine avec laquelle on parle. On ne dépend donc jamais d'un service TT
 | Transcription d'un fichier, diagnostic micro (`--transcrire`, `--diag-micro`) | ✅ implémenté et vérifié (v0.4) |
 | **Nettoyage markdown avant synthèse** (titres, listes, tableaux, liens, code) | ✅ implémenté et vérifié (v0.5) — mesuré de bout en bout sur ce qui part à la synthèse, cf. §11 |
 | **Unités et abréviations FR** (`%`, `°C`, `€`, `km/h`, `M.`, `Mme`, `n°`) | ✅ implémenté et vérifié (v0.5) |
+| **Mélange de voix pondéré** (`ff_siwis:3+ef_dora:1`) | ✅ implémenté et vérifié (v0.5) — intelligibilité mesurée par Whisper, cf. §11 |
+| **Voix portée par le persona** (en-tête de profil) | ✅ implémenté et vérifié (v0.5) |
 | Sélection GPU `auto/cuda/cpu` | ✅ **GPU opérationnel** — RTF 0,09 (cf. §8 pour l'obligation de build cu126 sur Pascal) |
 | Serveur LLM `100.91.114.49:8080` (niko-1650-super) | ✅ **joignable** — Ornith-1.5-35B-A3B Q4_K_M |
-| Suite de tests hors ligne | ✅ 158 tests passent |
+| Suite de tests hors ligne | ✅ 189 tests passent |
 
 > **Cible réelle du serveur LLM** — `100.91.114.49` = `niko-1650-super` dans le tailnet,
 > llama.cpp exposant une API OpenAI-compatible :
@@ -156,7 +158,7 @@ de commande (l'option gagne). Aucune clé n'est obligatoire : llama.cpp ignore `
 | `VOICECHAT_BASE_URL` | `http://100.91.114.49:8080/v1` | racine de l'API OpenAI-compatible |
 | `VOICECHAT_MODEL` | *(auto)* | nom du modèle ; si vide → détecté via `/v1/models` |
 | `VOICECHAT_API_KEY` | *(vide)* | jeton éventuel |
-| `VOICECHAT_VOICE` | `ff_siwis` | voix Kokoro (français) |
+| `VOICECHAT_VOICE` | `ff_siwis` | voix Kokoro, ou mélange pondéré (`ff_siwis:3+ef_dora:1`) — cf. §11 |
 | `VOICECHAT_LANG` | `f` | code langue Kokoro (`a`=en, `f`=fr, `e`=es, `i`=it, `p`=pt, `j`=ja, `z`=zh, `h`=hi) |
 | `VOICECHAT_SPEED` | `1.0` | vitesse de lecture |
 | `VOICECHAT_DEVICE` | `auto` | `auto` / `cuda` / `cpu` |
@@ -211,7 +213,7 @@ de commande (l'option gagne). Aucune clé n'est obligatoire : llama.cpp ignore `
 | `/help` | aide |
 | `/quit` (`/q`) | quitter |
 | `/reset` | vide l'historique de conversation |
-| `/voice <nom>` | change la voix à chaud |
+| `/voice <nom>` | change la voix, ou mélange : `/voice ff_siwis:3+ef_dora:1` |
 | `/lang <code>` | change la langue Kokoro |
 | `/speed <x>` | change la vitesse (ex. `/speed 1.15`) |
 | `/tts on\|off` | active/coupe la voix |
@@ -465,6 +467,8 @@ Trois scripts de vérification bout en bout pilotent le vrai CLI dans un pseudo-
 .venv/bin/python tests/verif_ecoute.py        # micro → VAD → transcription (boucle monitor)
 .venv/bin/python tests/bench_capture.py       # notre capture vs parec, par corrélation
 .venv/bin/python tests/verif_nettoyage.py     # ce qui part VRAIMENT à la synthèse (markdown)
+.venv/bin/python tests/bench_voix.py          # mélanges de voix : intelligibilité + timbre
+.venv/bin/python tests/verif_profil_voix.py   # un profil porte bien sa voix
 ```
 
 ---
@@ -503,11 +507,11 @@ Trois scripts de vérification bout en bout pilotent le vrai CLI dans un pseudo-
 - [ ] **Qualité de capture** : PortAudio hache la parole sur cette machine (`parec` est
       propre sur la même source). Cause racine non identifiée — voir §10.
 
-### v0.5 — voix de meilleure qualité
+### v0.5 — voix de meilleure qualité ✅
 - [x] **Normalisation des réponses markdown avant synthèse** (listes, code, liens, tableaux)
 - [x] **Césures/abréviations et unités FR** (nombres, sigles, `%`, `°C`, `€`)
-- [ ] Mélange de voix Kokoro (mix de styles, cf. `kokoro.StyleTTS`)
-- [ ] Sélection de voix par persona dans le prompt système
+- [x] Mélange de voix Kokoro, pondéré (`ff_siwis:3+ef_dora:1`)
+- [x] Sélection de voix par persona (en-tête `voix:` du profil)
 
 ### v0.6 — robustesse réseau
 - [ ] Reconnexion automatique + retry exponentiel si le serveur redémarre
@@ -965,8 +969,10 @@ i = italien, p = portugais, j = japonais, z = chinois, h = hindi
 ```
 
 ⚠️ Kokoro-82M ne propose **qu'une seule voix française : `ff_siwis`** (féminine). Pour varier
-la voix en français sans changer de langue, voir la piste « mélange de styles » en v0.5 de la
-roadmap. Les 53 autres voix servent aux langues ci-dessus.
+la voix en français sans changer de langue, la v0.5 ajoute le **mélange pondéré** de styles :
+`/voice ff_siwis:3+ef_dora:1` — les voix d'autres langues servent de source de timbre, la
+prononciation restant française. Mesures et syntaxe complète en **§11**. Les 53 autres voix
+servent aux langues ci-dessus.
 
 ### Entrée vocale : ce qui a été mesuré (v0.4)
 
@@ -1041,6 +1047,52 @@ $ .venv/bin/python -m pytest tests/ -q
 ........................................................................ [ 51%]
 ....................................................................     [100%]
 140 passed in 12.16s
+```
+
+### Mélanges de voix : une hypothèse de roadmap fausse (v0.5)
+
+La roadmap disait « mélange de styles, cf. `kokoro.StyleTTS` ». **Vérification faite avant
+d'écrire quoi que ce soit** : cette classe n'existe pas dans la version installée.
+
+```
+$ .venv/bin/python -c "import kokoro; print([n for n in dir(kokoro) if not n.startswith('_')])"
+['KModel', 'KPipeline', 'custom_stft', 'istftnet', 'logger', 'model', 'modules', 'pipeline', 'sys']
+```
+
+En revanche, en lisant `KPipeline.load_voice`, une bonne surprise :
+
+```python
+packs = [self.load_single_voice(v) for v in voice.split(delimiter)]
+if len(packs) == 1:
+    return packs[0]
+self.voices[voice] = torch.mean(torch.stack(packs), dim=0)
+```
+
+Kokoro sait donc **déjà** mélanger des voix — mais seulement en moyenne simple, sans poids.
+Et une ligne plus haut, le même code accepte un `torch.FloatTensor` en entrée. D'où la
+solution : composer le mélange pondéré nous-mêmes et le lui passer. Mesures en §11.
+
+### Un bug trouvé par la vérification, pas par les tests (v0.5)
+
+`tests/verif_profil_voix.py` — écrit justement pour prouver qu'un profil porte sa voix — a
+planté au premier essai :
+
+```
+AttributeError: 'ChatSession' object has no attribute 'tts'
+```
+
+Le formulaire `--profil` appliquait ses réglages dans le constructeur, avant la création de
+`self.tts`. Tout profil portant une voix aurait donc empêché le lancement. Les tests
+unitaires ne l'ont pas vu parce qu'aucun d'eux ne construisait de session à partir d'un
+profil : c'est le fait de **lancer pour de vrai** qui l'a révélé. Corrigé, et cinq tests
+ajoutés pour que ça ne revienne pas.
+
+```
+$ .venv/bin/python -m pytest tests/ -q
+........................................................................ [ 38%]
+........................................................................ [ 76%]
+.............................................                            [100%]
+189 passed in 12.14s
 ```
 
 ---
@@ -1345,10 +1397,114 @@ envoyée au synthétiseur — c'est le seul moyen de savoir ce que la voix dira 
 VOICECHAT_TRACE_TTS=1 .venv/bin/python -m voicechat
 ```
 
-### Reste à faire en v0.5
+### Mélange de voix
 
-- mélange de voix Kokoro (mixer des styles, pour sortir de l'unique voix française `ff_siwis`) ;
-- sélection de voix par persona dans le profil de prompt système.
+Kokoro-82M ne propose **qu'une seule voix française** (`ff_siwis`). Sortir de cette voix
+unique demande donc de mélanger des styles.
+
+**Ce que Kokoro sait faire, et ce qu'il ne sait pas.** Son `load_voice` accepte plusieurs
+noms séparés par des virgules et renvoie la **moyenne** des styles — donc `ff_siwis,ef_dora`
+donne 50/50, mais aucun moyen de pondérer. En lisant son code on voit en revanche qu'il
+accepte aussi un **tenseur de style** en entrée : on compose donc le mélange pondéré
+nous-mêmes (`sum(poids × style)`) et on le lui passe. Une voix seule continue de passer par
+le chemin normal, donc son rendu ne change pas d'un iota.
+
+Le mélange inter-langues est **volontaire** : `ef_dora` (espagnol) ou `if_sara` (italien)
+servent de source de timbre, tandis que la prononciation reste française (c'est le G2P du
+pipeline qui décide). Kokoro avertit « Language mismatch » dans ce cas — on tait ce message
+précis, et lui seul.
+
+**Mesuré** (`tests/bench_voix.py` : la phrase est synthétisée, puis retranscrite par Whisper
+pour vérifier qu'elle reste intelligible ; le « timbre » est la similarité spectrale avec
+`ff_siwis`) :
+
+```
+  ff_siwis (référence)     : 6.95 s | justesse  90.5% | timbre vs réf. 1.000 | RTF 0.13
+  + ef_dora (es) 50/50     : 6.22 s | justesse  90.5% | timbre vs réf. 0.916 | RTF 0.12
+  + if_sara (it) 50/50     : 6.33 s | justesse 100.0% | timbre vs réf. 0.963 | RTF 0.11
+  + af_heart (en) 50/50    : 6.88 s | justesse  90.5% | timbre vs réf. 0.964 | RTF 0.11
+  + ef_dora 80/20          : 6.70 s | justesse 100.0% | timbre vs réf. 0.980 | RTF 0.09
+  + if_sara 80/20          : 6.65 s | justesse 100.0% | timbre vs réf. 0.989 | RTF 0.09
+  + ef_dora 60/40          : 6.38 s | justesse 100.0% | timbre vs réf. 0.936 | RTF 0.09
+  3 voix 60/20/20          : 6.38 s | justesse 100.0% | timbre vs réf. 0.965 | RTF 0.09
+```
+
+Trois exécutions donnent les mêmes durées, la même justesse et le même timbre (au millième
+près). **Seul le RTF bouge** d'une exécution à l'autre — c'est une mesure de temps, elle
+dépend de la charge de la machine. Les valeurs ci-dessus sont celles du dernier passage.
+
+Trois enseignements :
+
+- **aucun mélange n'est moins intelligible que la référence** — plusieurs font même mieux
+  (100 % contre 90,5 %). Sur cette phrase, la voix d'origine est celle qui se trompe le plus
+  (« dort » entendu « d'or », « allumée » entendu « allumé ») ;
+- **le timbre bouge vraiment** : de 0,916 (ef_dora à 50 %) à 0,989. À noter que 80/20 donne
+  0,980–0,989 contre 0,916–0,963 à 50/50 : les poids sont donc bien respectés, un mélange
+  léger s'écarte moins de la référence qu'un mélange fort ;
+- **le mélange ne coûte rien** en vitesse (RTF 0,09–0,11, contre 0,13 pour la référence).
+
+⚠️ **Ce que cette mesure ne dit pas** : si une voix *sonne bien*. Ça, aucune métrique ne le
+dit. Le script écrit donc un WAV par variante dans `/tmp/voix/` pour que l'oreille tranche :
+
+```bash
+.venv/bin/python tests/bench_voix.py
+# → Échantillons écrits dans /tmp/voix — écoute-les
+#   /tmp/voix/ff-siwis-reference.wav
+#   /tmp/voix/ef-dora-es-50-50.wav
+#   ...
+```
+
+### Voix portée par le persona
+
+Un profil de prompt peut désormais porter sa voix, sa vitesse et sa langue dans un **en-tête
+facultatif**, ce qui garde le fichier lisible et modifiable à la main :
+
+```
+voix: ff_siwis:3+ef_dora:1
+vitesse: 1.1
+
+Tu es un narrateur posé, tu réponds en français.
+```
+
+Chargement et enregistrement :
+
+```bash
+voicechat --profil narrateur          # au lancement : prompt + voix + vitesse
+/profil narrateur                     # ou à chaud, en session
+/profil save narrateur                # enregistre le prompt courant ET sa voix
+```
+
+`/profil save` n'écrit un réglage **que s'il s'écarte du défaut** : un profil qui ne change
+pas la voix reste un simple fichier de prompt, comme avant la v0.5. Seules `voix`, `vitesse`
+et `langue` sont reconnues en en-tête ; toute autre clé est laissée dans le prompt, pour ne
+jamais perdre de texte par inadvertance.
+
+**Un bug trouvé par la vérification, pas par les tests unitaires.** `tests/verif_profil_voix.py`
+a planté au premier essai :
+
+```
+AttributeError: 'ChatSession' object has no attribute 'tts'
+```
+
+Le profil était appliqué dans le constructeur de `ChatSession`, **avant** la création de
+`self.tts`, que les réglages consultent. Conséquence : tout profil portant une voix aurait
+fait échouer le lancement. Les champs `tts`/`speaker`/`speech` sont désormais initialisés en
+premier, et cinq tests verrouillent le comportement (`tests/test_cli.py`).
+
+```
+$ .venv/bin/python tests/verif_profil_voix.py
+[1/4] profil écrit : /tmp/vc-profils-…/narrateur.md
+[2/4] profil appliqué par ChatSession :
+      OK  prompt système
+      OK  voix
+      OK  vitesse
+[3/4] chargement de Kokoro avec le mélange…
+Voix   : chargement de Kokoro « ff_siwis 75% + ef_dora 25% »…
+[4/4] synthèse réelle avec la voix du profil :
+      71400 échantillons = 2.98 s d'audio
+
+>>> OK : le profil a porté sa voix jusqu'à la synthèse
+```
 
 ---
 

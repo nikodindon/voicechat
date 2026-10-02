@@ -10,12 +10,20 @@ from pathlib import Path
 
 from . import __version__, store, text as txt
 from .audio import Speaker
-from .config import Config, nom_court
+from .config import DEFAULT_LANG, DEFAULT_SPEED, DEFAULT_VOICE, Config, nom_court
 from .editor import ClavierGeneration, LineEditor
 from .llm import LLMError, list_models, stream_with_usage
 from .micro import DetecteurParole, Ecouteur, Microphone
 from .stt import Transcriber
-from .tts import KokoroTTS, SpeechPipeline, list_voices, resolve_device
+from .tts import (
+    KokoroTTS,
+    SpeechPipeline,
+    analyser_voix,
+    decrire_voix,
+    est_melange,
+    list_voices,
+    resolve_device,
+)
 
 BANNER = r"""
  __     __    _         _____ _           _
@@ -30,7 +38,7 @@ COMMANDES: list[tuple[str, str]] = [
     ("/help", "cette aide"),
     ("/quit", "quitter (alias /exit, /q)"),
     ("/reset", "vide l'historique de conversation"),
-    ("/voice <nom>", "change la voix Kokoro (ex. /voice af_heart)"),
+    ("/voice <nom>", "voix Kokoro, ou mélange : « ff_siwis:3+ef_dora:1 » (ex. /voice af_heart)"),
     ("/lang <code>", "langue Kokoro : a en, b en-GB, f fr, e es, i it, p pt, j ja, z zh, h hi"),
     ("/speed <x>", "vitesse de lecture (ex. /speed 1.15)"),
     ("/tts on|off", "active ou coupe la voix"),
@@ -97,7 +105,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--model", help="nom du modèle (défaut : détecté via /v1/models)")
     p.add_argument("--api-key", help="jeton Bearer si le serveur en exige un")
     p.add_argument("--system", help="prompt système")
-    p.add_argument("--voice", help="voix Kokoro (ex. ff_siwis, af_heart)")
+    p.add_argument("--voice", help="voix Kokoro (ff_siwis), ou mélange : ff_siwis:3+ef_dora:1")
     p.add_argument("--lang", help="code langue Kokoro (a=en, b=en-GB, f=fr, e=es, i=it, p=pt, j=ja, z=zh, h=hi)")
     p.add_argument("--speed", type=float, help="vitesse de lecture (1.0 = normal)")
     p.add_argument("--device", choices=["auto", "cuda", "cpu"], help="périphérique de synthèse")
@@ -280,6 +288,11 @@ def do_list_voices() -> int:
         par_langue.setdefault(v[0], []).append(v)
     for code in sorted(par_langue):
         print(f"  [{code}] " + ", ".join(par_langue[code]))
+    print()
+    print("Mélanger deux voix : /voice ff_siwis,ef_dora   (moitié-moitié)")
+    print("Pondérer :           /voice ff_siwis:3+ef_dora:1   (75 % / 25 %)")
+    print("Mélanger des voix d'autres langues est permis : Kokoro prévient, on le tait.")
+    print(f"Écouter des exemples : .venv/bin/python tests/bench_voix.py")
     return 0
 
 
@@ -287,17 +300,24 @@ def do_list_voices() -> int:
 class ChatSession:
     def __init__(self, cfg: Config) -> None:
         self.cfg = cfg
+        # Déclarés avant tout le reste : l'application du profil (juste en dessous)
+        # passe par `_reglages_profil`, qui regarde `self.tts` pour savoir si le TTS
+        # est déjà chargé. Sans ça, --profil plantait sur un AttributeError.
+        self.tts: KokoroTTS | None = None
+        self.speaker: Speaker | None = None
+        self.speech: SpeechPipeline | None = None
         self.profil = ""
         if cfg.profil:  # --profil : le prompt système vient d'un fichier
             try:
-                cfg.system = store.charger_profil(cfg.profil)
+                profil = store.lire_profil(cfg.profil)
+                if not profil.prompt:
+                    raise ValueError(f"le profil « {cfg.profil} » ne contient aucun prompt")
+                cfg.system = profil.prompt
+                self._reglages_profil(profil)  # voix / vitesse / langue, si fournis
                 self.profil = store.nom_fichier(cfg.profil)
             except (FileNotFoundError, ValueError) as exc:
                 print(f"[profil] {exc}")
         self.messages: list[dict] = [{"role": "system", "content": cfg.system}]
-        self.tts: KokoroTTS | None = None
-        self.speaker: Speaker | None = None
-        self.speech: SpeechPipeline | None = None
         self.editor = LineEditor(completeur=self._completeur)
         self.last_stats = ""
         self.conversation = ""  # nom de la conversation courante, pour /save
@@ -328,7 +348,7 @@ class ChatSession:
             self.cfg.tts = False
             return
 
-        print(f"Voix   : chargement de Kokoro « {cfg.voice} »…")
+        print(f"Voix   : chargement de Kokoro « {decrire_voix(cfg.voice)} »…")
         self.tts = KokoroTTS(voice=cfg.voice, lang_code=cfg.lang, speed=cfg.speed, device=cfg.device)
         if not self.tts.load():
             print(f"Voix   : INDISPONIBLE — {self.tts.load_error}")
@@ -341,7 +361,49 @@ class ChatSession:
         self.speech = SpeechPipeline(self.tts, self.speaker, cleaner=txt.clean_for_speech)
         self.speech.start()
 
-    # ------------------------------------------------------------ entrée vocale
+    # ------------------------------------------------------------------ profils
+    def _reglages_profil(self, profil: store.Profil) -> None:
+        """Applique les réglages d'un profil : voix, vitesse, langue.
+
+        Au démarrage, le TTS n'existe pas encore : on ne renseigne que la
+        configuration, que ``setup_voice`` lira ensuite. En session, on applique
+        aussi au TTS vivant.
+
+        La langue passe **avant** la voix : ``set_lang`` reconstruit le pipeline et
+        recharge la voix courante, donc changer la voix après évite de la charger
+        deux fois.
+        """
+        if profil.langue:
+            self.cfg.lang = profil.langue
+            if self.tts:
+                self.tts.set_lang(profil.langue)
+        if profil.voix:
+            self.cfg.voice = profil.voix
+            if self.tts:
+                self.tts.set_voice(profil.voix)
+        if profil.vitesse:
+            self.cfg.speed = profil.vitesse
+            if self.tts:
+                self.tts.speed = profil.vitesse
+
+    def _appliquer_profil(self, nom: str) -> None:
+        """Charge un profil en session : prompt système, puis ses réglages."""
+        profil = store.lire_profil(nom)
+        if not profil.prompt:
+            raise ValueError(f"le profil « {nom} » ne contient aucun prompt")
+        self._reglages_profil(profil)
+        self.cfg.system = profil.prompt
+        self.messages[0] = {"role": "system", "content": profil.prompt}
+        self.profil = store.nom_fichier(nom)
+        print(f"profil « {self.profil} » chargé ({len(profil.prompt)} caractères)")
+        if profil.langue:
+            print(f"  langue  : {profil.langue}")
+        if profil.voix:
+            print(f"  voix    : {decrire_voix(profil.voix)}")
+        if profil.vitesse:
+            print(f"  vitesse : {profil.vitesse}")
+
+    # ------------------------------------------------------------- entrée vocale
     def _assurer_stt(self) -> bool:
         """Charge Whisper au premier besoin, pas au démarrage.
 
@@ -654,11 +716,19 @@ class ChatSession:
                 print("TTS indisponible")
             else:
                 try:
-                    self.tts.set_voice(arg)
-                    self.cfg.voice = arg
-                    print(f"voix = {arg}")
-                except Exception as exc:
+                    # Valider la syntaxe avant de toucher au TTS : une faute de frappe
+                    # doit donner un message clair, pas une trace d'exception.
+                    analyser_voix(arg)
+                except ValueError as exc:
                     print(f"échec : {exc}")
+                    print("  syntaxe : nom  |  nom1,nom2  |  nom1:3+nom2:1")
+                else:
+                    try:
+                        self.tts.set_voice(arg)
+                        self.cfg.voice = arg
+                        print(f"voix = {decrire_voix(arg)}")
+                    except Exception as exc:
+                        print(f"échec : {exc}")
 
         elif cmd == "/lang" and arg:
             if not self.tts:
@@ -760,25 +830,36 @@ class ChatSession:
                 if not nom:
                     print("usage : /profil save <nom>")
                 else:
+                    # On n'écrit un réglage que s'il s'écarte du défaut : un profil qui
+                    # ne change pas la voix reste un simple fichier de prompt, comme
+                    # avant la v0.5. C'est ce qui rend la relecture du fichier utile.
+                    voix_ecrite = self.cfg.voice if self.cfg.voice != DEFAULT_VOICE else None
                     try:
-                        chemin = store.enregistrer_profil(nom, self.cfg.system)
+                        chemin = store.enregistrer_profil(
+                            nom,
+                            self.cfg.system,
+                            voix=voix_ecrite,
+                            vitesse=(
+                                self.cfg.speed if self.cfg.speed != DEFAULT_SPEED else None
+                            ),
+                            langue=(
+                                self.cfg.lang if self.cfg.lang != DEFAULT_LANG else None
+                            ),
+                        )
                     except (ValueError, OSError) as exc:
                         print(f"échec : {exc}")
                     else:
                         self.profil = chemin.stem
                         print(f"profil « {chemin.stem} » enregistré")
                         print(f"  {chemin}")
+                        if voix_ecrite:
+                            print(f"  voix    : {decrire_voix(voix_ecrite)}")
 
             else:
                 try:
-                    prompt = store.charger_profil(arg)
+                    self._appliquer_profil(arg)
                 except (FileNotFoundError, ValueError) as exc:
                     print(f"échec : {exc}")
-                else:
-                    self.cfg.system = prompt
-                    self.profil = store.nom_fichier(arg)
-                    self.messages[0] = {"role": "system", "content": prompt}
-                    print(f"profil « {self.profil} » chargé ({len(prompt)} caractères)")
 
         elif cmd == "/export":
             nom_fichier = arg or f"conversation-{time.strftime('%Y%m%d-%H%M')}.md"

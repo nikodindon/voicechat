@@ -8,8 +8,11 @@ Deux niveaux :
 
 from __future__ import annotations
 
+import contextlib
+import logging
 import os
 import queue
+import re
 import sys
 import threading
 import time
@@ -113,6 +116,90 @@ def list_voices() -> list[str]:
     )
 
 
+# ------------------------------------------------------------------ voix
+
+@contextlib.contextmanager
+def _sans_avertissement_langue():
+    """Tait le « Language mismatch » de Kokoro le temps d'un chargement.
+
+    Kokoro avertit quand on charge une voix d'une autre langue que celle du pipeline.
+    Dans un mélange de voix, c'est justement ce qu'on demande : le message est du
+    bruit. On filtre ce message-là et aucun autre.
+    """
+    class _Filtre(logging.Filter):
+        def filter(self, record: logging.LogRecord) -> bool:
+            try:
+                return not record.getMessage().startswith("Language mismatch")
+            except Exception:
+                return True
+
+    filtre = _Filtre()
+    loggers = [
+        logging.getLogger(nom)
+        for nom in ("kokoro", "kokoro.pipeline", "kokoro.model", "kokoro.istftnet")
+    ]
+    for logger in loggers:
+        logger.addFilter(filtre)
+    try:
+        yield
+    finally:
+        for logger in loggers:
+            logger.removeFilter(filtre)
+
+
+def analyser_voix(spec: str) -> list[tuple[str, float]]:
+    """« ff_siwis:3+ef_dora:1 » → ``[('ff_siwis', 0.75), ('ef_dora', 0.25)]``.
+
+    Les poids sont normalisés pour sommer à 1 : c'est l'échelle du mélange natif de
+    Kokoro, qui fait la moyenne des styles. Une voix seule garde donc exactement le
+    rendu d'avant, et `ff_siwis,ef_dora` (la syntaxe Kokoro) donne bien 50/50.
+    """
+    parts: list[tuple[str, float]] = []
+    for morceau in re.split(r"[+,]", spec):
+        morceau = morceau.strip()
+        if not morceau:
+            continue
+        nom, _, poids_txt = morceau.partition(":")
+        nom = nom.strip()
+        if not nom:
+            raise ValueError(f"nom de voix vide dans « {spec} »")
+        poids = 1.0
+        if poids_txt.strip():
+            try:
+                poids = float(poids_txt)
+            except ValueError:
+                raise ValueError(
+                    f"poids illisible « {poids_txt.strip()} » dans « {spec} »"
+                ) from None
+            if poids <= 0:
+                raise ValueError(f"poids nul ou négatif pour « {nom} »")
+        parts.append((nom, poids))
+    if not parts:
+        raise ValueError(f"aucune voix dans « {spec} »")
+    total = sum(p for _, p in parts)
+    return [(nom, p / total) for nom, p in parts]
+
+
+def est_melange(spec: str) -> bool:
+    """Vrai si la spécification demande plusieurs voix (donc un mélange à composer)."""
+    return len(analyser_voix(spec)) > 1
+
+
+def decrire_voix(spec: str) -> str:
+    """Résumé lisible : ``ff_siwis 80 % + ef_dora 20 %``.
+
+    Ne lève jamais : sur une spécification illisible on rend le texte brut, pour que
+    l'affichage d'une erreur ne provoque pas une seconde erreur.
+    """
+    try:
+        parts = analyser_voix(spec)
+    except ValueError:
+        return spec
+    if len(parts) == 1:
+        return parts[0][0]
+    return " + ".join(f"{nom} {poids:.0%}" for nom, poids in parts)
+
+
 # ------------------------------------------------------------------ synthétiseur
 class KokoroTTS:
     """Charge une voix Kokoro et la garde en mémoire entre deux phrases."""
@@ -133,6 +220,9 @@ class KokoroTTS:
         self.load_error: str | None = None
         self._pipeline = None
         self._loaded_voice: str | None = None
+        # Ce qu'on passe réellement au pipeline : un nom de voix, ou un tenseur de
+        # style quand c'est un mélange pondéré (Kokoro ne sait pas pondérer).
+        self._voix_chargee = None
         self.synth_s = 0.0  # temps cumulé passé à synthétiser
         self.audio_s = 0.0  # durée cumulée d'audio produit
 
@@ -178,7 +268,29 @@ class KokoroTTS:
         return True
 
     def _load_voice(self, voice: str) -> None:
-        self._pipeline.load_voice(voice)
+        """Charge la voix, ou compose le mélange pondéré.
+
+        Kokoro sait moyenner plusieurs voix (`ff_siwis,ef_dora`) mais pas les pondérer.
+        Il accepte en revanche un **tenseur de style** : on compose donc le mélange
+        nous-mêmes et on le lui passe tel quel. Une voix seule suit le chemin normal,
+        donc son rendu ne change pas d'un iota.
+        """
+        parts = analyser_voix(voice)
+        if len(parts) == 1:
+            self._pipeline.load_voice(parts[0][0])
+            self._voix_chargee = parts[0][0]
+        else:
+            # Les voix d'autres langues déclenchent un « Language mismatch » — c'est
+            # précisément ce qu'on demande dans un mélange, donc on le fait taire.
+            with _sans_avertissement_langue():
+                packs = [
+                    (self._pipeline.load_single_voice(nom), poids)
+                    for nom, poids in parts
+                ]
+            melange = packs[0][0] * packs[0][1]
+            for pack, poids in packs[1:]:
+                melange = melange + pack * poids
+            self._voix_chargee = melange
         self._loaded_voice = voice
 
     def set_voice(self, voice: str) -> None:
@@ -205,7 +317,7 @@ class KokoroTTS:
             raise RuntimeError(self.load_error or "TTS non chargé")
         t0 = time.monotonic()
         morceaux: list[np.ndarray] = []
-        for _, _, audio in self._pipeline(text, voice=self.voice, speed=self.speed):
+        for _, _, audio in self._pipeline(text, voice=self._voix_chargee, speed=self.speed):
             if audio is None:
                 continue
             if hasattr(audio, "detach"):  # tenseur torch

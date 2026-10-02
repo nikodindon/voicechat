@@ -9,6 +9,7 @@ from pathlib import Path
 DEFAULT_BASE_URL = "http://100.91.114.49:8080/v1"
 DEFAULT_VOICE = "ff_siwis"  # français féminin
 DEFAULT_LANG = "f"
+DEFAULT_SPEED = 1.0
 DEFAULT_SYSTEM = (
     "Tu es un assistant francophone concis et précis. "
     "Réponds en phrases courtes et parlées, sans listes à puces ni markdown."
@@ -55,7 +56,7 @@ class Config:
 
     voice: str = DEFAULT_VOICE
     lang: str = DEFAULT_LANG
-    speed: float = 1.0
+    speed: float = DEFAULT_SPEED
     device: str = "auto"  # auto | cuda | cpu
     output_device: int | None = None
     tts: bool = True

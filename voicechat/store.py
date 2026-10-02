@@ -207,22 +207,106 @@ def lister_profils() -> list[str]:
 
 def charger_profil(nom: str) -> str:
     """Contenu d'un profil de prompt. Lève FileNotFoundError s'il n'existe pas."""
+    return lire_profil(nom).prompt
+
+
+# Clés reconnues en en-tête d'un profil. Une clé inconnue n'est pas consommée :
+# elle fait partie du prompt, pour ne jamais perdre de texte par inadvertance.
+_CLES_PROFIL = ("voix", "vitesse", "langue")
+_ENTETE_RE = re.compile(r"^\s*([A-Za-z_]+)\s*:\s*(.*)$")
+
+
+@dataclass
+class Profil:
+    """Un profil de persona : le prompt système, plus des réglages optionnels.
+
+    L'en-tête est facultatif et se place au tout début du fichier ::
+
+        voix: ff_siwis:4+ef_dora:1
+        vitesse: 1.1
+
+        Tu es un assistant...
+    """
+
+    prompt: str
+    voix: str | None = None
+    vitesse: float | None = None
+    langue: str | None = None
+
+
+def analyser_profil(texte: str) -> Profil:
+    """Sépare l'en-tête de réglages du prompt. Fonction pure."""
+    voix = vitesse = langue = None
+    lignes = texte.splitlines()
+    i = 0
+    while i < len(lignes):
+        ligne = lignes[i]
+        if not ligne.strip():
+            break  # ligne vide = fin de l'en-tête
+        correspondance = _ENTETE_RE.match(ligne)
+        if not correspondance or correspondance.group(1).lower() not in _CLES_PROFIL:
+            break  # ce n'est pas un réglage : le prompt commence ici
+        cle = correspondance.group(1).lower()
+        valeur = correspondance.group(2).strip()
+        if cle == "voix":
+            voix = valeur or None
+        elif cle == "langue":
+            langue = valeur or None
+        elif cle == "vitesse":
+            try:
+                vitesse = float(valeur)
+            except ValueError:
+                vitesse = None  # valeur illisible : on l'ignore plutôt que planter
+        i += 1
+    # La ligne vide qui sépare l'en-tête du prompt est sautée, mais pas celles
+    # qui suivent (elles appartiennent au prompt).
+    if i < len(lignes) and not lignes[i].strip():
+        i += 1
+    return Profil(
+        prompt="\n".join(lignes[i:]).strip(),
+        voix=voix,
+        vitesse=vitesse,
+        langue=langue,
+    )
+
+
+def lire_profil(nom: str) -> Profil:
+    """Charge un profil avec ses réglages. Lève FileNotFoundError s'il n'existe pas."""
     fichier = nom_fichier(nom)
     dossier_cible = dossier_profils()
     for extension in (".md", ".txt"):
         chemin = dossier_cible / f"{fichier}{extension}"
         if chemin.is_file():
-            return chemin.read_text(encoding="utf-8").strip()
+            return analyser_profil(chemin.read_text(encoding="utf-8"))
     raise FileNotFoundError(f"aucun profil « {nom} » dans {dossier_cible}")
 
 
-def enregistrer_profil(nom: str, prompt: str) -> Path:
-    """Écrit un profil de prompt système."""
+def enregistrer_profil(
+    nom: str,
+    prompt: str,
+    voix: str | None = None,
+    vitesse: float | None = None,
+    langue: str | None = None,
+) -> Path:
+    """Écrit un profil de prompt système, avec ses réglages en en-tête.
+
+    Les réglages ne sont écrits que s'ils sont fournis : un profil sans voix reste
+    un simple fichier de prompt, comme avant.
+    """
     if not prompt.strip():
         raise ValueError("prompt vide")
+    entete = ""
+    if langue:
+        entete += f"langue: {langue}\n"
+    if voix:
+        entete += f"voix: {voix}\n"
+    if vitesse:
+        entete += f"vitesse: {vitesse}\n"
+    if entete:
+        entete += "\n"
     chemin = dossier_profils() / f"{nom_fichier(nom)}.md"
     chemin.parent.mkdir(parents=True, exist_ok=True)
-    chemin.write_text(prompt.strip() + "\n", encoding="utf-8")
+    chemin.write_text(entete + prompt.strip() + "\n", encoding="utf-8")
     return chemin
 
 
