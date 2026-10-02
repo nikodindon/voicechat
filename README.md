@@ -24,9 +24,10 @@ sur la machine avec laquelle on parle. On ne dépend donc jamais d'un service TT
 |---|---|
 | Client console + streaming SSE | ✅ implémenté et vérifié (v0.1) |
 | Kokoro TTS local + lecture audio | ✅ implémenté et vérifié (v0.1) |
+| Saisie clavier : collage multi-lignes = un seul message | ✅ implémenté et vérifié (v0.1) |
 | Sélection GPU `auto/cuda/cpu` | ✅ **GPU opérationnel** — RTF 0,09 (cf. §8 pour l'obligation de build cu126 sur Pascal) |
 | Serveur LLM `100.91.114.49:8080` (niko-1650-super) | ✅ **joignable** — Ornith-1.5-35B-A3B Q4_K_M |
-| Suite de tests hors ligne | ✅ 20 tests passent |
+| Suite de tests hors ligne | ✅ 38 tests passent |
 
 > **Cible réelle du serveur LLM** — `100.91.114.49` = `niko-1650-super` dans le tailnet,
 > llama.cpp exposant une API OpenAI-compatible :
@@ -182,8 +183,58 @@ de commande (l'option gagne). Aucune clé n'est obligatoire : llama.cpp ignore `
 | `/tts on\|off` | active/coupe la voix |
 | `/model <nom>` | change de modèle pour les tours suivants |
 | `/system <texte>` | remplace le prompt système |
+| `/voices` | liste les voix Kokoro |
+| `/device` | liste les sorties audio détectées |
 | `/stats` | latences (TTFT, débit, RTF TTS) |
 | `/debug` | bascule l'affichage des stats à chaque tour |
+
+### Saisie clavier et collage
+
+`input()` ne convenait pas : quand on colle un texte de plusieurs lignes, le terminal
+livre chaque ligne comme si l'utilisateur les avait tapées une par une. `input()` en
+consommait une, et la boucle traitait toutes les suivantes comme autant de nouveaux
+messages. Mesuré, avec l'ancien code :
+
+```
+prompt:   -> tour 1 : 'Ligne un'
+  -> tour 2 : 'Ligne deux'
+  -> tour 3 : 'Ligne trois'
+```
+
+`voicechat/editor.py` lit donc le clavier en **mode brut** et distingue trois choses :
+
+* une **frappe** — le texte s'affiche au fil de l'eau ;
+* un **collage**, repéré par les marqueurs du *bracketed paste* (`\x1b[?2004h`, activé
+  par le programme) : les sauts de ligne sont conservés **à l'intérieur** du message et
+  **rien n'est envoyé** ;
+* la touche **Entrée**, seul et unique déclencheur d'envoi.
+
+| Touche | Effet |
+|---|---|
+| `Entrée` | envoyer le message |
+| `↑` / `↓` | historique des messages |
+| `←` / `→` | déplacer le curseur |
+| `Ctrl+U` / `Ctrl+W` | effacer la ligne / le mot précédent |
+| `Ctrl+C` | effacer le brouillon (sur ligne vide : quitter) |
+| `Ctrl+D` | quitter |
+
+Un texte collé est résumé à l'écran plutôt que redessiné frappe par frappe :
+
+```
+vous › [12 lignes, 842 car.] Voici un long texte que je te copie-colle…  ⏎ envoyer · Ctrl+C annuler
+```
+
+**Repli** : si le terminal n'implémente pas le bracketed paste, un saut de ligne reçu
+moins de 30 ms après le caractère précédent est considéré comme faisant partie d'un
+collage — un humain n'enchaîne pas aussi vite.
+
+**Limites assumées** : pas de `Ctrl+R` (recherche dans l'historique) ; au-delà d'une
+ligne écran le message est résumé au lieu d'être redessiné — l'édition (retour arrière,
+`Ctrl+U`) reste exacte, seul l'affichage est condensé.
+
+En entrée **non** interactive (tube, redirection), le comportement est inchangé : une
+ligne = un message. Un script qui écrit plusieurs lignes attend plusieurs tours de
+conversation, ce n'est pas un collage.
 
 ---
 
@@ -197,6 +248,7 @@ voicechat/
 ├── text.py         # découpage du flux en phrases + nettoyage markdown (pur, testable)
 ├── tts.py          # KokoroTTS (synthèse) + SpeechPipeline (file de phrases → voix → son)
 ├── audio.py        # Speaker : file de tampons audio + thread de lecture PortAudio
+├── editor.py       # lecture clavier en mode brut : frappe / collage / Entrée
 └── cli.py          # boucle console, routage des commandes, orchestration
 tests/              # pytest hors ligne + fake_llm_server.py (faux serveur OpenAI)
 ```
@@ -234,13 +286,14 @@ python3 tests/fake_llm_server.py 8099          # terminal 1
 - [x] Détection automatique du nom du modèle via `/v1/models`
 - [x] `--probe` : diagnostic réseau clair quand le serveur est éteint
 - [x] Messages d'erreur lisibles (timeout, 404 API, modèle inconnu)
+- [x] Saisie clavier maison : un collage multi-lignes reste **un seul message**, Entrée seule déclenche l'envoi
 - [x] Tests unitaires hors ligne + faux serveur OpenAI-compatible
 
 ### v0.2 — confort d'usage
 - [ ] Interruption à chaud : `Ctrl+C` coupe la lecture **et** la génération en cours
 - [ ] Afficher un **nom de modèle court** au lieu du chemin complet renvoyé par llama.cpp
 - [ ] `/save` et `/load` : persistance des conversations en JSON
-- [ ] Historique de saisie (readline) + complétion des `/commandes`
+- [ ] Historique de saisie : recherche `Ctrl+R` et complétion des `/commandes` (Tab)
 - [ ] Streaming audio par morceaux (moins de trou entre deux phrases)
 - [ ] Comptage des tokens et affichage coût/latence en continu
 
@@ -540,6 +593,43 @@ automatique via `/v1/models` vaut mieux qu'un nom codé en dur. Pour un affichag
 
 ```bash
 .venv/bin/python -m voicechat --model Ornith-1.5-35B-A3B-APEX-i-mini.gguf
+```
+
+### Collage multi-lignes : avant / après
+
+Le bug rapporté, reproduit puis vérifié corrigé en pilotant le vrai CLI dans un
+pseudo-terminal :
+
+```bash
+$ .venv/bin/python tests/verif_collage.py
+```
+
+```
+=== après le collage, AVANT Entrée ===
+    réponses du modèle : 0   (attendu : 0)
+
+=== après Entrée ===
+    réponses du modèle : 1   (attendu : 1)
+    extrait : ia › Bonjour ! Voici une réponse de test, découpée en plusieurs phrases. […]
+```
+
+Et la confirmation du mécanisme d'origine — avec `input()`, le même collage devenait
+trois conversations :
+
+```
+prompt:   -> tour 1 : 'Ligne un'
+  -> tour 2 : 'Ligne deux'
+  -> tour 3 : 'Ligne trois'
+```
+
+`tests/test_editor.py` verrouille tout ça (18 tests) via de vrais pseudo-terminaux :
+collage balisé, collage non balisé détecté par rafale, frappe lente qui ne doit **pas**
+ressembler à un collage, retours arrière, `Ctrl+U`, historique, et entrée non interactive.
+
+```
+$ .venv/bin/python -m pytest tests/ -q
+......................................                                   [100%]
+38 passed in 5.09s
 ```
 
 ### Voix disponibles

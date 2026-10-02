@@ -9,6 +9,7 @@ import time
 from . import __version__, text as txt
 from .audio import Speaker
 from .config import Config
+from .editor import LineEditor
 from .llm import LLMError, list_models, stream_with_usage
 from .tts import KokoroTTS, SpeechPipeline, list_voices, resolve_device
 
@@ -33,7 +34,16 @@ HELP = """Commandes disponibles :
   /voices            liste les voix Kokoro (nécessite Hugging Face)
   /device            liste les sorties audio détectées
   /stats             dernières mesures (latence, débit, RTF du TTS)
-  /debug             bascule l'affichage des stats à chaque tour"""
+  /debug             bascule l'affichage des stats à chaque tour
+
+Clavier :
+  Coller un texte multi-lignes : il est conservé tel quel, rien n'est envoyé
+                                 tant que vous n'avez pas frappé Entrée
+  ⏎ Entrée        envoyer le message
+  ↑ / ↓            historique des messages
+  ← / →            déplacer le curseur · Ctrl+U effacer · Ctrl+W effacer le mot
+  Ctrl+C           effacer le brouillon (sur ligne vide : quitter)
+  Ctrl+D           quitter"""
 
 
 
@@ -126,6 +136,7 @@ class ChatSession:
         self.tts: KokoroTTS | None = None
         self.speaker: Speaker | None = None
         self.speech: SpeechPipeline | None = None
+        self.editor = LineEditor()
         self.last_stats = ""
 
     # ------------------------------------------------------------------ démarrage
@@ -335,16 +346,19 @@ class ChatSession:
         self.setup_voice()
 
         print()
-        print("Tapez votre message. /help pour l'aide, /quit pour sortir.")
+        print("Tapez votre message, ou collez un texte — Entrée pour l'envoyer.")
+        print("/help pour l'aide, /quit pour sortir.")
         print("─" * 60)
 
         while True:
             try:
-                ligne = input("\nvous › ").strip()
-            except (EOFError, KeyboardInterrupt):
+                ligne = self.editor.read()
+            except KeyboardInterrupt:
                 print()
                 break
-
+            if ligne is None:  # Ctrl+D ou fin d'entrée
+                print()
+                break
             if not ligne:
                 continue
             if ligne.startswith("/"):
