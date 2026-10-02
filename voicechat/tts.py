@@ -17,6 +17,7 @@ import numpy as np
 from .audio import Speaker
 
 SAMPLE_RATE = 24000  # Kokoro-82M génère en 24 kHz mono
+REPO_ID = "hexgrad/Kokoro-82M"  # passé explicitement : sinon Kokoro logue un avertissement
 
 
 # ------------------------------------------------------------------ utilitaires
@@ -95,7 +96,7 @@ def list_voices() -> list[str]:
     except Exception:
         return []
     try:
-        fichiers = list_repo_files("hexgrad/Kokoro-82M", repo_type="model")
+        fichiers = list_repo_files(REPO_ID, repo_type="model")
     except Exception:
         return []
     return sorted(
@@ -148,8 +149,10 @@ class KokoroTTS:
             import inspect
 
             params = inspect.signature(KPipeline.__init__).parameters
-            kwargs = {"device": self.device} if "device" in params else {}
-            if not kwargs and self.device == "cpu":
+            kwargs = {"repo_id": REPO_ID}
+            if "device" in params:
+                kwargs["device"] = self.device
+            elif self.device == "cpu":
                 # Repli : forcer la détection interne de torch vers le CPU.
                 torch.cuda.is_available = lambda: False  # type: ignore[assignment]
                 self.device_reason += " (forcé via torch.cuda.is_available)"
@@ -180,7 +183,7 @@ class KokoroTTS:
         from kokoro import KPipeline
 
         self.lang_code = lang_code
-        self._pipeline = KPipeline(lang_code=lang_code, device=self.device)
+        self._pipeline = KPipeline(lang_code=lang_code, device=self.device, repo_id=REPO_ID)
         self._loaded_voice = None
         self._load_voice(self.voice)
 
