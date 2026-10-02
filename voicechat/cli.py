@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import itertools
 import sys
 import threading
 import time
@@ -12,7 +13,7 @@ from . import __version__, store, text as txt
 from .audio import Speaker
 from .config import DEFAULT_LANG, DEFAULT_SPEED, DEFAULT_VOICE, Config, nom_court
 from .editor import ClavierGeneration, LineEditor
-from .llm import LLMError, list_models, stream_with_usage
+from .llm import Connexion, LLMError, list_models, premier_serveur, stream_with_usage
 from .micro import DetecteurParole, Ecouteur, Microphone
 from .stt import Transcriber
 from .tts import (
@@ -55,6 +56,7 @@ COMMANDES: list[tuple[str, str]] = [
     ("/device", "liste les sorties audio détectées"),
     ("/ecoute", "écouter le micro et envoyer ce qui est dit"),
     ("/micro on|off", "mode mains libres : écoute après chaque réponse"),
+    ("/rejoue", "réentendre les phrases non synthétisées (GPU revenu)"),
     ("/stats", "dernières mesures (latence, débit, RTF du TTS)"),
     ("/debug", "bascule l'affichage des stats à chaque tour"),
 ]
@@ -102,6 +104,7 @@ def build_parser() -> argparse.ArgumentParser:
         description="Chat console avec un LLM local, réponses synthétisées par Kokoro.",
     )
     p.add_argument("--base-url", help="racine de l'API OpenAI-compatible (ex. http://hote:8080/v1)")
+    p.add_argument("--secours", help="serveurs de secours, séparés par des virgules (essayés dans l'ordre)")
     p.add_argument("--model", help="nom du modèle (défaut : détecté via /v1/models)")
     p.add_argument("--api-key", help="jeton Bearer si le serveur en exige un")
     p.add_argument("--system", help="prompt système")
@@ -143,6 +146,11 @@ def config_from_args(args: argparse.Namespace) -> Config:
             pass  # nom de périphérique : sounddevice accepte aussi une chaîne
     return cfg.with_overrides(
         base_url=args.base_url.rstrip("/") if args.base_url else None,
+        secours=(
+            [u.strip().rstrip("/") for u in args.secours.replace(";", ",").split(",") if u.strip()]
+            if args.secours
+            else None
+        ),
         model=args.model,
         api_key=args.api_key,
         system=args.system,
@@ -166,17 +174,37 @@ def config_from_args(args: argparse.Namespace) -> Config:
 
 # ----------------------------------------------------------------------- modes courts
 def do_probe(cfg: Config) -> int:
-    print(f"Serveur   : {cfg.base_url}")
-    print(f"Test      : GET {cfg.models_url}")
-    t0 = time.monotonic()
-    try:
-        modeles = list_models(cfg.base_url, cfg.api_key, timeout=10.0)
-    except LLMError as exc:
-        print(f"ÉCHEC après {time.monotonic() - t0:.1f} s\n  {exc}")
+    """Teste chaque serveur dans l'ordre et dit lequel répond.
+
+    Tester les cibles une par une (au lieu de s'arrêter à la première qui échoue)
+    est justement l'intérêt : on veut savoir ce qui est joignable et ce qui ne
+    l'est pas, pas seulement si « ça marche ».
+    """
+    cibles = cfg.cibles
+    print(f"Cibles    : {len(cibles)} serveur(s), essayés dans l'ordre")
+    premier: str | None = None
+    for cible in cibles:
+        marque = "(principal)" if cible == cfg.base_url else "(secours)"
+        t0 = time.monotonic()
+        try:
+            modeles = list_models(cible, cfg.api_key, timeout=10.0)
+        except LLMError as exc:
+            print(f"  ÉCHEC {cible} {marque} en {time.monotonic() - t0:.1f} s")
+            for ligne in str(exc).splitlines():
+                print(f"        {ligne}")
+            continue
+        print(f"  OK    {cible} {marque} en {time.monotonic() - t0:.2f} s "
+              f"— {len(modeles)} modèle(s)")
+        if premier is None:
+            premier = cible
+            for nom in modeles:
+                print(f"        • {nom}")
+    if premier is None:
+        print("\nAucun serveur ne répond.")
+        print("  → machine éteinte, tailscale down, ou serveur lancé sans --host 0.0.0.0")
         return 2
-    print(f"OK en {time.monotonic() - t0:.2f} s — {len(modeles)} modèle(s)")
-    for nom in modeles:
-        print(f"  • {nom}")
+    if premier != cfg.base_url:
+        print(f"\nLa cible principale ne répond pas : c'est « {premier} » qui servira.")
     return 0
 
 
@@ -320,6 +348,8 @@ class ChatSession:
         self.messages: list[dict] = [{"role": "system", "content": cfg.system}]
         self.editor = LineEditor(completeur=self._completeur)
         self.last_stats = ""
+        self.serveur_actif = ""  # renseigné si on a dû basculer sur un secours
+        self._attente_vue = 0  # phrases non synthétisées déjà signalées
         self.conversation = ""  # nom de la conversation courante, pour /save
         self.debut = time.time()
         self.frappes = ""  # frappes faites pendant la réponse, rendues au prochain prompt
@@ -478,15 +508,48 @@ class ChatSession:
         print(f"vous (voix) › {resultat.texte}")
         return resultat.texte
 
+    def _avis_reseau(self, numero: int, attente: float, raison: str) -> None:
+        """Dit qu'on réessaie, et pourquoi.
+
+        Un retry silencieux ressemble à un blocage : l'utilisateur voit le curseur
+        immobile et croit que c'est cassé. Ici, il apprend qu'on attend, combien de
+        temps, et sur quel échec.
+        """
+        premiere_ligne = next(
+            (l.strip() for l in raison.splitlines() if l.strip()), "échec sans détail"
+        )
+        print(
+            f"\n[réseau] essai {numero} échoué — nouvelle tentative dans {attente:.1f} s",
+            flush=True,
+        )
+        print(f"         ({premiere_ligne[:100]})", flush=True)
+
+    def _avis_voix_manquante(self) -> None:
+        """Signale les phrases que la voix n'a pas pu dire — seulement s'il y en a de nouvelles.
+
+        Le texte reste à l'écran, donc rien n'est perdu pour la lecture : ce qui
+        manque, c'est le son. Sans cette ligne, l'utilisateur croirait que la voix a
+        sauté un passage sans raison.
+        """
+        attente = self.speech.en_attente if self.speech else 0
+        if attente > self._attente_vue:
+            print(f"[voix] {attente} phrase(s) non synthétisée(s) — "
+                  f"/rejoue quand le GPU est revenu")
+            self._attente_vue = attente
+
     def resolve_model(self) -> bool:
         if self.cfg.model:
             return True
         try:
-            modeles = list_models(self.cfg.base_url, self.cfg.api_key, timeout=10.0)
+            modeles, cible = premier_serveur(self.cfg.cibles, self.cfg.api_key, timeout=10.0)
         except LLMError as exc:
             print(f"\n[ERREUR] {exc}\n")
-            print("Astuce : `--probe` refait ce test seul, `--no-tts` n'y change rien.")
+            print("Astuce : `--probe` teste chaque serveur séparément.")
             return False
+        if cible != self.cfg.base_url:
+            print(f"Serveur: la cible principale ({self.cfg.base_url}) ne répond pas.")
+            print(f"         réponse de {cible}")
+            self.serveur_actif = cible
         if not modeles:
             print("[ERREUR] /v1/models ne liste aucun modèle. Passer --model <nom>.")
             return False
@@ -538,14 +601,30 @@ class ChatSession:
         self.messages.append({"role": "user", "content": question})
         self._trim_history()
 
+        connexion = Connexion()
         flux, usage = stream_with_usage(
-            base_url=self.cfg.base_url,
+            base_url=self.cfg.cibles,
             model=self.cfg.model,
             messages=self.messages,
             api_key=self.cfg.api_key,
             temperature=self.cfg.temperature,
             timeout=self.cfg.timeout,
+            connexion=connexion,
+            on_essai=self._avis_reseau,
         )
+
+        # Le premier morceau ouvre réellement la connexion : c'est là qu'on apprend
+        # quel serveur a répondu. On le demande donc avant d'afficher « ia › », pour
+        # que la mention de bascule ne tombe pas au milieu de la réponse.
+        premier: str | None = None
+        try:
+            premier = next(flux)
+        except StopIteration:
+            pass
+
+        if connexion.bascule and connexion.url:
+            print(f"[réseau] {self.cfg.base_url} n'a pas répondu → réponse de {connexion.url}")
+            self.serveur_actif = connexion.url
 
         print("ia › ", end="", flush=True)
         tampon = ""
@@ -558,7 +637,8 @@ class ChatSession:
         # perdre la réponse, et les frappes faites entre-temps ne sont pas jetées.
         with ClavierGeneration() as clavier:
             try:
-                for morceau in flux:
+                morceaux = flux if premier is None else itertools.chain([premier], flux)
+                for morceau in morceaux:
                     print(morceau, end="", flush=True)
                     reponse += morceau
                     tampon += morceau
@@ -598,6 +678,8 @@ class ChatSession:
             # On conserve une réponse partielle : c'est ce que l'utilisateur a lu.
             if reponse.strip() and not erreur:
                 self.messages.append({"role": "assistant", "content": reponse})
+
+        self._avis_voix_manquante()
 
         self.frappes = clavier.tampon
         self._maj_stats(usage, interrompu, coupee)
@@ -710,6 +792,16 @@ class ChatSession:
         elif cmd == "/tts" and arg:
             self.cfg.tts = arg.lower() in ("on", "1", "true", "oui")
             print(f"voix {'activée' if self.cfg.tts else 'coupée'}")
+
+        elif cmd == "/rejoue":
+            if not self.speech:
+                print("voix indisponible dans cette session")
+            elif not self.speech.en_panne:
+                print("rien à rejouer : toutes les phrases ont été synthétisées")
+            else:
+                combien = self.speech.rejouer()
+                self._attente_vue = 0
+                print(f"{combien} phrase(s) remise(s) en file pour la voix")
 
         elif cmd == "/voice" and arg:
             if not self.tts:

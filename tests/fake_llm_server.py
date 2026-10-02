@@ -75,13 +75,15 @@ class Handler(BaseHTTPRequestHandler):
         options = demande.get("stream_options") or {}
         avec_usage = bool(options.get("include_usage"))
 
-        # Le contenu peut être une chaîne ou une liste de parties (multimodal) :
-        # on ne garde que les chaînes, pour chercher le mot-clé sans planter.
-        demande_texte = " ".join(
+        # Le mot-clé se cherche dans les messages **utilisateur** uniquement : le prompt
+        # système par défaut contient « markdown » (il demande de ne pas en produire),
+        # ce qui déclenchait sinon la réponse markdown pour absolument toutes les
+        # questions — et faisait passer certains tests pour la mauvaise raison.
+        demandes = " ".join(
             m.get("content", "") for m in demande.get("messages", [])
-            if isinstance(m.get("content"), str)
+            if m.get("role") == "user" and isinstance(m.get("content"), str)
         )
-        reponse = REPONSE_MARKDOWN if "markdown" in demande_texte.lower() else REPONSE
+        reponse = REPONSE_MARKDOWN if "markdown" in demandes.lower() else REPONSE
 
         if not stream:
             corps = json.dumps(

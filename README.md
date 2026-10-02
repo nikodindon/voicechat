@@ -39,9 +39,12 @@ sur la machine avec laquelle on parle. On ne dépend donc jamais d'un service TT
 | **Unités et abréviations FR** (`%`, `°C`, `€`, `km/h`, `M.`, `Mme`, `n°`) | ✅ implémenté et vérifié (v0.5) |
 | **Mélange de voix pondéré** (`ff_siwis:3+ef_dora:1`) | ✅ implémenté et vérifié (v0.5) — intelligibilité mesurée par Whisper, cf. §11 |
 | **Voix portée par le persona** (en-tête de profil) | ✅ implémenté et vérifié (v0.5) |
+| **Réessais avec délai croissant** (connexion refusée, 5xx, 429) | ✅ implémenté et vérifié (v0.6) — 3 essais, 0,5 s → 1 s → 2 s |
+| **Serveurs de secours** (`--secours`, `VOICECHAT_SECOURS`) | ✅ implémenté et vérifié (v0.6) — bascule annoncée à l'écran, jamais silencieuse |
+| **Mode dégradé** : phrases non synthétisées gardées et rejouables (`/rejoue`) | ✅ implémenté et vérifié (v0.6) |
 | Sélection GPU `auto/cuda/cpu` | ✅ **GPU opérationnel** — RTF 0,09 (cf. §8 pour l'obligation de build cu126 sur Pascal) |
 | Serveur LLM `100.91.114.49:8080` (niko-1650-super) | ✅ **joignable** — Ornith-1.5-35B-A3B Q4_K_M |
-| Suite de tests hors ligne | ✅ 189 tests passent |
+| Suite de tests hors ligne | ✅ 212 tests passent |
 
 > **Cible réelle du serveur LLM** — `100.91.114.49` = `niko-1650-super` dans le tailnet,
 > llama.cpp exposant une API OpenAI-compatible :
@@ -156,6 +159,7 @@ de commande (l'option gagne). Aucune clé n'est obligatoire : llama.cpp ignore `
 | Variable | Défaut | Rôle |
 |---|---|---|
 | `VOICECHAT_BASE_URL` | `http://100.91.114.49:8080/v1` | racine de l'API OpenAI-compatible |
+| `VOICECHAT_SECOURS` | *(vide)* | autres serveurs, séparés par des `,` — essayés dans l'ordre (cf. §12) |
 | `VOICECHAT_MODEL` | *(auto)* | nom du modèle ; si vide → détecté via `/v1/models` |
 | `VOICECHAT_API_KEY` | *(vide)* | jeton éventuel |
 | `VOICECHAT_VOICE` | `ff_siwis` | voix Kokoro, ou mélange pondéré (`ff_siwis:3+ef_dora:1`) — cf. §11 |
@@ -230,6 +234,7 @@ de commande (l'option gagne). Aucune clé n'est obligatoire : llama.cpp ignore `
 | `/device` | liste les sorties audio détectées |
 | `/ecoute` | écoute le micro et envoie ce qui est dit (puis retour clavier) |
 | `/micro on\|off` | bascule le mode mains libres |
+| `/rejoue` | réentend les phrases que la synthèse n'avait pas pu produire |
 | `/stats` | latences (TTFT, débit en tokens, RTF TTS) |
 | `/debug` | bascule l'affichage des stats à chaque tour |
 
@@ -469,6 +474,7 @@ Trois scripts de vérification bout en bout pilotent le vrai CLI dans un pseudo-
 .venv/bin/python tests/verif_nettoyage.py     # ce qui part VRAIMENT à la synthèse (markdown)
 .venv/bin/python tests/bench_voix.py          # mélanges de voix : intelligibilité + timbre
 .venv/bin/python tests/verif_profil_voix.py   # un profil porte bien sa voix
+.venv/bin/python tests/verif_reprise.py       # bascule réseau, dans le vrai CLI
 ```
 
 ---
@@ -513,10 +519,11 @@ Trois scripts de vérification bout en bout pilotent le vrai CLI dans un pseudo-
 - [x] Mélange de voix Kokoro, pondéré (`ff_siwis:3+ef_dora:1`)
 - [x] Sélection de voix par persona (en-tête `voix:` du profil)
 
-### v0.6 — robustesse réseau
-- [ ] Reconnexion automatique + retry exponentiel si le serveur redémarre
-- [ ] Bascule automatique vers un serveur de secours (ex. `niko-tv`, aujourd'hui éteint)
-- [ ] Mode dégradé : réponses texte, voix mise en file puis rejouée au retour du GPU
+### v0.6 — robustesse réseau ✅
+- [x] Reconnexion automatique + réessais à délai croissant si le serveur redémarre
+- [x] Bascule automatique vers un serveur de secours (`--secours`, `VOICECHAT_SECOURS`)
+- [x] Mode dégradé : phrases non synthétisées **gardées** au lieu d'être jetées, rejouables
+      avec `/rejoue` — le texte reste à l'écran dans tous les cas
 
 ### v1.0 — distribué
 - [ ] Serveur TTS partagé (le poste léger envoie le texte, un poste GPU synthétise)
@@ -1095,6 +1102,42 @@ $ .venv/bin/python -m pytest tests/ -q
 189 passed in 12.14s
 ```
 
+### Robustesse réseau : ce qui a été mis en place (v0.6)
+
+Trois pannes différentes, trois réponses. Le détail est en §12 ; ce qui suit est le chemin.
+
+**Ce qui a été fait en premier : lire le code existant.** Le client ne réessayait rien du
+tout : une connexion refusée levait une `LLMError` immédiatement. Et côté voix, une phrase
+dont la synthèse échouait était comptée puis jetée (`continue`) — le son manquait, et rien
+ne le disait. C'est ce second point qui était le plus gênant : un échec silencieux.
+
+**Le choix qui mérite d'être noté** : ne jamais réessayer en cours de flux. Après le premier
+mot reçu, un nouvel essai rejouerait le début de la réponse. On signale donc la coupure et on
+garde la réponse partielle, ce qui est aussi ce qui a été fait pour `Ctrl+C` depuis la v0.2.
+
+**Deux erreurs de ma part, trouvées par les tests :**
+
+1. `stream_chat()` refusait `delai` — je l'avais ajouté à `_ouvrir_flux` sans le faire
+   remonter. Six tests ont échoué d'un coup sur `TypeError`.
+2. Mon faux serveur « fragile » interceptait `_send`, mais le chemin **streaming** écrit
+   directement dans `wfile` : les 503 n'atteignaient jamais les vraies requêtes de chat. Le
+   serveur n'échouait donc jamais, et les tests de reprise ne testaient rien — ils passaient
+   même au vert pour certains. Corrigé en interceptant `do_GET`/`do_POST`.
+
+Puis, en relançant les vérifications, un troisième problème — cette fois dans le faux serveur
+partagé : son mot-clé « markdown » matchait aussi le **prompt système par défaut**, qui
+contient le mot (« sans listes à puces ni markdown »). Toutes les questions recevaient donc la
+réponse markdown. Le mot-clé ne se cherche plus que dans les messages utilisateur, et les
+vérifications de la v0.5 ont été relancées pour confirmer qu'elles passaient encore.
+
+```
+$ .venv/bin/python -m pytest tests/ -q
+........................................................................ [ 33%]
+........................................................................ [ 67%]
+....................................................................     [100%]
+212 passed in 22.40s
+```
+
 ---
 
 ## 10. Entrée vocale (v0.4) — ⚠️ expérimental
@@ -1508,6 +1551,129 @@ Voix   : chargement de Kokoro « ff_siwis 75% + ef_dora 25% »…
 
 ---
 
-## 12. Licence
+## 12. Robustesse réseau (v0.6)
+
+Trois mécanismes, pour trois pannes différentes.
+
+### 1. Réessais à délai croissant
+
+**La panne visée** : le serveur LLM redémarre. Pendant quelques secondes, la connexion est
+refusée — et rien ne justifie d'abandonner, il suffit d'attendre. Trois essais, à 0,5 s, 1 s
+puis 2 s : le total reste sous 4 s, donc une machine vraiment éteinte n'impose pas une
+attente interminable.
+
+Ce qui est réessayé, et ce qui ne l'est pas :
+
+| Erreur | Réessayé ? | Pourquoi |
+|---|---|---|
+| Connexion refusée, timeout, erreur réseau | **oui** | transitoire : le serveur redémarre |
+| HTTP 5xx, HTTP 429 | **oui** | surcharge passagère |
+| HTTP 404 | **non** | l'URL est fausse, insister ne la corrigera pas |
+| HTTP 400 hors `stream_options` | **non** | la requête est refusée pour ce qu'elle contient |
+
+**Une exception volontaire : on ne réessaie jamais en cours de flux.** Si la connexion casse
+après le premier mot, réessayer rejouerait le début de la réponse — et l'utilisateur lirait
+« Bonjour, je vais vous expliquer… Bonjour, je vais vous expliquer… ». On signale donc la
+coupure et on garde la réponse partielle. C'est un choix, pas un oubli.
+
+Chaque attente est **annoncée** — un retry silencieux ressemble à un blocage :
+
+```
+[réseau] essai 1 échoué — nouvelle tentative dans 0.5 s
+         (Connexion impossible à 127.0.0.1:60583 (<urlopen error [Errno 111] Connection refused>).)
+[réseau] essai 2 échoué — nouvelle tentative dans 1.0 s
+         (Connexion impossible à 127.0.0.1:60583 (<urlopen error [Errno 111] Connection refused>).)
+[réseau] http://127.0.0.1:60583/v1 n'a pas répondu → réponse de http://127.0.0.1:54061/v1
+ia › Bonjour ! Voici une réponse de test, découpée en plusieurs phrases. […]
+```
+
+### 2. Serveurs de secours
+
+```bash
+voicechat --secours http://100.64.0.9:8080/v1          # en ligne de commande
+VOICECHAT_SECOURS=http://100.64.0.9:8080/v1,http://autre:8080/v1   # ou dans .env
+```
+
+Les cibles sont essayées dans l'ordre : la principale, puis les secours. La bascule a lieu
+**avant** le premier mot, et elle est annoncée — parler à une autre machine que celle qu'on
+croit est exactement le genre de chose qu'il ne faut pas taire.
+
+`--probe` teste chaque cible séparément, et dit laquelle servira :
+
+```bash
+$ .venv/bin/python -m voicechat --probe \
+      --base-url http://127.0.0.1:9/v1 --secours http://100.91.114.49:8080/v1
+Cibles    : 2 serveur(s), essayés dans l'ordre
+  ÉCHEC http://127.0.0.1:9/v1 (principal) en 0.0 s
+        Connexion impossible à 127.0.0.1:9 (<urlopen error [Errno 111] Connection refused>).
+          → la machine distante est probablement éteinte, ou le serveur LLM n'écoute pas sur 0.0.0.0.
+          → vérifier : tailscale status ; ou lancer le serveur avec --host 0.0.0.0
+  OK    http://100.91.114.49:8080/v1 (secours) en 0.01 s — 1 modèle(s)
+        • /mnt/data/sdc2/models/Ornith-1.5-35B-A3B-APEX-i-mini.gguf
+
+La cible principale ne répond pas : c'est « http://100.91.114.49:8080/v1 » qui servira.
+```
+
+### 3. Mode dégradé : la voix ne jette plus les phrases
+
+**La panne visée** : le GPU lâche en pleine session (mémoire pleine, pilote qui tombe) — pas
+le réseau. Jusqu'à la v0.5, la phrase concernée était comptée dans `synth_errors` puis
+**jetée** : le son manquait et rien ne le disait. Elle est maintenant mise de côté, et
+signalée :
+
+```
+[voix] 3 phrase(s) non synthétisée(s) — /rejoue quand le GPU est revenu
+```
+
+`/rejoue` vide cette réserve et remet les phrases dans la file de synthèse. Le rejeu n'est
+**jamais automatique** : le déclencher au milieu d'une réponse mélangerait deux textes. C'est
+l'utilisateur qui sait quand le GPU est revenu.
+
+Deux détails décidés explicitement :
+
+- la réserve est **bornée** (40 phrases, les plus récentes) — une longue session ne doit pas
+  remplir la mémoire ;
+- un `Ctrl+C` (vidage de la file) **ne perd pas** ces phrases : sinon il suffirait
+  d'interrompre une réponse pour perdre définitivement ce que le GPU n'avait pas pu dire.
+
+### Un bug de mes propres tests, trouvé en les relançant
+
+Le faux serveur de test choisissait sa réponse markdown si le mot « markdown » apparaissait
+dans la requête. Or le **prompt système par défaut** contient ce mot :
+
+```
+"Réponds en phrases courtes et parlées, sans listes à puces ni markdown."
+```
+
+Toutes les questions recevaient donc la réponse markdown — et `tests/verif_reprise.py`
+passait « pour la bonne raison » tout en ne testant pas ce qu'il croyait. Le mot-clé se
+cherche désormais dans les messages **utilisateur** uniquement. Les tests de la v0.5 ont été
+relancés pour vérifier qu'ils passaient toujours après cette correction.
+
+### Vérification
+
+```bash
+$ .venv/bin/python tests/verif_reprise.py
+cible principale : http://127.0.0.1:60583/v1   (rien n'écoute)
+secours          : http://127.0.0.1:54061/v1   (faux serveur)
+
+=== contrôles ===
+  OK  la bascule est annoncée
+  OK  le secours est nommé
+  OK  l'URL fautive est nommée
+  OK  une réponse est arrivée
+  OK  aucune erreur bloquante
+
+>>> OK : le secours a servi, et l'utilisateur l'a su
+```
+
+Les réessais et les erreurs définitives sont couverts par `tests/test_reprise.py`, avec un
+faux serveur qui échoue **à la demande** (503, 404) : 15 tests, dont « un 404 ne part qu'une
+fois » et « le délai double à chaque essai ». Le mode dégradé est couvert par
+`tests/test_degrade.py` (8 tests), avec un synthétiseur qui échoue à la demande lui aussi.
+
+---
+
+## 13. Licence
 
 MIT — voir le fichier `LICENSE`. Faire ce qu'on veut, sans garantie.

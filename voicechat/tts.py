@@ -357,6 +357,11 @@ class SpeechPipeline:
         self._epoque = 0
         self.enabled = True
         self.synth_errors = 0
+        # Phrases dont la synthèse a échoué (GPU en vrac, mémoire pleine) : on les
+        # garde au lieu de les jeter, pour pouvoir les réentendre une fois le GPU
+        # revenu. Borné, parce qu'une longue session ne doit pas remplir la mémoire.
+        self._en_attente: list[str] = []
+        self.max_attente = 40
 
     def start(self) -> None:
         if self._thread is not None:
@@ -398,6 +403,39 @@ class SpeechPipeline:
     def pending(self) -> int:
         return self._q.qsize()
 
+    # ------------------------------------------------------------- mode dégradé
+    def _retenir(self, phrase: str) -> None:
+        """Met une phrase de côté après un échec de synthèse.
+
+        On garde les plus **récentes** : c'est la fin de la réponse qui vient d'être
+        lue à l'écran, donc celle dont l'utilisateur se souvient.
+        """
+        self._en_attente.append(phrase)
+        if len(self._en_attente) > self.max_attente:
+            self._en_attente.pop(0)
+
+    @property
+    def en_attente(self) -> int:
+        """Nombre de phrases dont la synthèse a échoué et qui attendent un rejeu."""
+        return len(self._en_attente)
+
+    @property
+    def en_panne(self) -> bool:
+        """Vrai si des phrases ont été perdues pour la voix (le texte, lui, est intact)."""
+        return bool(self._en_attente)
+
+    def rejouer(self) -> int:
+        """Remet en file les phrases non synthétisées. Renvoie combien.
+
+        Le pipeline ne retente **pas** tout seul : rejouer en plein milieu d'une
+        réponse mélangerait deux textes. C'est l'utilisateur qui décide du moment,
+        quand il sait que le GPU est revenu.
+        """
+        phrases, self._en_attente = self._en_attente, []
+        for phrase in phrases:
+            self.say(phrase)
+        return len(phrases)
+
     def _run(self) -> None:
         while not self._stop.is_set():
             item = self._q.get()
@@ -414,6 +452,7 @@ class SpeechPipeline:
                     audio = self.tts.synth(phrase)
                 except Exception:
                     self.synth_errors += 1
+                    self._retenir(phrase)
                     continue
                 if epoque != self._epoque:
                     # Un vidage (Ctrl+C) est passé pendant la synthèse : on jette,

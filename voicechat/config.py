@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 DEFAULT_BASE_URL = "http://100.91.114.49:8080/v1"
@@ -38,6 +38,16 @@ def _env_bool(name: str, default: bool = True) -> bool:
     return raw not in ("0", "false", "no", "off", "")
 
 
+def _liste_urls(brut: str) -> list[str]:
+    """« url1, url2 » → liste de serveurs, dans l'ordre écrit.
+
+    Accepte la virgule, le point-virgule et le saut de ligne comme séparateurs :
+    une longue liste de secours se relit mieux sur plusieurs lignes dans un .env.
+    """
+    propres = (brut or "").replace(";", ",").replace("\n", ",")
+    return [u.strip().rstrip("/") for u in propres.split(",") if u.strip()]
+
+
 def _env_float(name: str, default: float) -> float:
     try:
         return float(_env(name) or default)
@@ -50,6 +60,7 @@ class Config:
     """Toute la configuration de l'application en un seul objet immuable."""
 
     base_url: str = DEFAULT_BASE_URL
+    secours: list[str] = field(default_factory=list)  # autres serveurs, dans l'ordre
     model: str = ""
     api_key: str = ""
     system: str = DEFAULT_SYSTEM
@@ -80,6 +91,7 @@ class Config:
     def from_env(cls) -> "Config":
         return cls(
             base_url=_env("VOICECHAT_BASE_URL", DEFAULT_BASE_URL).rstrip("/"),
+            secours=_liste_urls(_env("VOICECHAT_SECOURS")),
             model=_env("VOICECHAT_MODEL"),
             api_key=_env("VOICECHAT_API_KEY"),
             system=_env("VOICECHAT_SYSTEM", DEFAULT_SYSTEM),
@@ -100,6 +112,20 @@ class Config:
         """Retourne une copie en ignorant les valeurs None (args non fournis)."""
         clean = {k: v for k, v in kwargs.items() if v is not None}
         return replace(self, **clean)
+
+    @property
+    def cibles(self) -> list[str]:
+        """Serveurs à essayer, dans l'ordre : la cible principale, puis les secours.
+
+        Dédoublonné, parce qu'un secours identique à la principale ferait perdre
+        deux fois le même délai d'attente.
+        """
+        vues: list[str] = []
+        for url in [self.base_url, *self.secours]:
+            propre = (url or "").strip().rstrip("/")
+            if propre and propre not in vues:
+                vues.append(propre)
+        return vues
 
     @property
     def chat_url(self) -> str:
