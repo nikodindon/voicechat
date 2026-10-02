@@ -8,7 +8,9 @@ Deux niveaux :
 
 from __future__ import annotations
 
+import os
 import queue
+import sys
 import threading
 import time
 
@@ -18,6 +20,11 @@ from .audio import Speaker
 
 SAMPLE_RATE = 24000  # Kokoro-82M génère en 24 kHz mono
 REPO_ID = "hexgrad/Kokoro-82M"  # passé explicitement : sinon Kokoro logue un avertissement
+
+# Trace de ce qui part réellement à la synthèse. Utile pour vérifier le nettoyage
+# du markdown de bout en bout (on voit le texte après découpage ET nettoyage),
+# là où lire la réponse à l'écran ne prouve rien.
+TRACE_TTS = os.environ.get("VOICECHAT_TRACE_TTS") == "1"
 
 
 # ------------------------------------------------------------------ utilitaires
@@ -289,6 +296,8 @@ class SpeechPipeline:
                 phrase = self.cleaner(item)
                 if not phrase:
                     continue
+                if TRACE_TTS:
+                    print(f"[tts] {phrase}", file=sys.stderr, flush=True)
                 try:
                     audio = self.tts.synth(phrase)
                 except Exception:

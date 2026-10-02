@@ -35,9 +35,11 @@ sur la machine avec laquelle on parle. On ne dépend donc jamais d'un service TT
 | **Export markdown** (`/export`) | ✅ implémenté et vérifié (v0.3) |
 | **Entrée vocale** : micro + VAD Silero v6 + `faster-whisper` (`--micro`, `/ecoute`) | ⚠️ **expérimental** — transcription parfaite depuis un fichier (RTF 0,11 sur GPU), mais la capture micro est hachée par PortAudio sur cette machine : cause racine non identifiée, `parec` est propre (cf. §10) |
 | Transcription d'un fichier, diagnostic micro (`--transcrire`, `--diag-micro`) | ✅ implémenté et vérifié (v0.4) |
+| **Nettoyage markdown avant synthèse** (titres, listes, tableaux, liens, code) | ✅ implémenté et vérifié (v0.5) — mesuré de bout en bout sur ce qui part à la synthèse, cf. §11 |
+| **Unités et abréviations FR** (`%`, `°C`, `€`, `km/h`, `M.`, `Mme`, `n°`) | ✅ implémenté et vérifié (v0.5) |
 | Sélection GPU `auto/cuda/cpu` | ✅ **GPU opérationnel** — RTF 0,09 (cf. §8 pour l'obligation de build cu126 sur Pascal) |
 | Serveur LLM `100.91.114.49:8080` (niko-1650-super) | ✅ **joignable** — Ornith-1.5-35B-A3B Q4_K_M |
-| Suite de tests hors ligne | ✅ 140 tests passent |
+| Suite de tests hors ligne | ✅ 158 tests passent |
 
 > **Cible réelle du serveur LLM** — `100.91.114.49` = `niko-1650-super` dans le tailnet,
 > llama.cpp exposant une API OpenAI-compatible :
@@ -462,6 +464,7 @@ Trois scripts de vérification bout en bout pilotent le vrai CLI dans un pseudo-
 .venv/bin/python tests/bench_audio.py         # surcoût de lecture par phrase
 .venv/bin/python tests/verif_ecoute.py        # micro → VAD → transcription (boucle monitor)
 .venv/bin/python tests/bench_capture.py       # notre capture vs parec, par corrélation
+.venv/bin/python tests/verif_nettoyage.py     # ce qui part VRAIMENT à la synthèse (markdown)
 ```
 
 ---
@@ -501,10 +504,10 @@ Trois scripts de vérification bout en bout pilotent le vrai CLI dans un pseudo-
       propre sur la même source). Cause racine non identifiée — voir §10.
 
 ### v0.5 — voix de meilleure qualité
+- [x] **Normalisation des réponses markdown avant synthèse** (listes, code, liens, tableaux)
+- [x] **Césures/abréviations et unités FR** (nombres, sigles, `%`, `°C`, `€`)
 - [ ] Mélange de voix Kokoro (mix de styles, cf. `kokoro.StyleTTS`)
 - [ ] Sélection de voix par persona dans le prompt système
-- [ ] Césures/abreviations FR affinées (nombres, sigles, unités)
-- [ ] Normalisation des réponses markdown avant synthèse (listes, code, liens)
 
 ### v0.6 — robustesse réseau
 - [ ] Reconnexion automatique + retry exponentiel si le serveur redémarre
@@ -1230,6 +1233,125 @@ verrouillent cette liste pour qu'on ne la « simplifie » pas par erreur.
 
 ---
 
-## 11. Licence
+## 11. Qualité de la voix (v0.5)
+
+### Le problème
+
+Un LLM local répond en markdown. Lu tel quel, l'auditeur entend « astérisque astérisque
+Baisse la luminosité astérisque astérisque », les barres verticales d'un tableau, et les
+crochets d'un lien. Le nettoyage existait depuis la v0.1, mais **il ne voyait qu'une phrase
+à la fois** (il est appliqué juste avant la synthèse, après découpage) et il laissait passer
+des choses. Exemple réel, réponse du modèle :
+
+```
+Brut du modèle                                        Ce que la voix prononçait (avant)
+----------------------------------------------------  ------------------------------------------
+[ce guide Ubuntu](https://doc.ubuntu-fr.org/...)      [ce guide Ubuntu](lien
+- 2. Ferme les processus inutiles.                    2.  /  Ferme les processus inutiles.
+| Réglage | Gain |                                    | Réglage | Gain |
+|---|---|---|---|                                        |---|---|
+- **Baisse la luminosité**                            Baisse la luminosité
+Traitement de M. Dupont sur 1 000 tours               M. Dupont sur 1 000 tours
+Il fait 32 °C, soit 30 % de plus                      32 °C … 30 %
+Bravo 😀🎉                                            Bravo 😀🎉 (emoji conservés)
+```
+
+Le cas du lien est le plus parlant : l'ancien code retirait l'URL et laissait
+`[ce guide Ubuntu](` — l'auditeur entendait littéralement « crochet ».
+
+### Ce que fait le nettoyage maintenant
+
+| Entrée | Ce qui est prononcé |
+|---|---|
+| `[ce guide](https://…)` | `ce guide` |
+| `![capture](img.png)` | *(rien : une image n'est pas du texte)* |
+| `### Titre` / `> citation` | `Titre` / `citation` |
+| `- item`, `* item`, `— item` | `item` |
+| `1. item`, `2) item` | `item` |
+| `\| Réglage \| Gain \|` | `Réglage, Gain` |
+| `\|---\|---\|`, `---` | *(rien)* |
+| ` ```bash … ``` ` | *(rien : le bloc n'est pas prononcé)* |
+| `30 %`, `32 °C`, `15 €`, `90 km/h` | `30 pour cent`, `32 degrés`, `15 euros`, `90 kilomètres par heure` |
+| `M. Dupont`, `Mme Martin`, `Dr House`, `n° 12` | `Monsieur Dupont`, `Madame Martin`, `Docteur House`, `numéro 12` |
+| `1 000` (espaces insécables ou fines) | `1000` |
+| `👍🎉` | *(rien)* |
+| `A → B` | `A puis B` |
+
+### Deux pièges du **flux** (et pas du texte)
+
+C'est la partie qui a demandé le plus de soin : le nettoyage reçoit des fragments, parce que
+le texte arrive morceau par morceau du serveur.
+
+**1. Un bloc de code était prononcé.** Le découpage en phrases se fait sur les sauts de
+ligne, donc ```` ```bash\nls -l\n``` ```` était haché en trois « phrases » avant que le
+nettoyage ne voie quoi que ce soit : l'auditeur entendait `bash`, `ls -l`, puis le backtick
+de clôture. Le découpeur **retient** désormais tout ce qui suit un ```` ``` ```` non refermé,
+et ignore ce qui se trouve à l'intérieur d'un bloc.
+
+**2. Une abréviation ou un marqueur de liste coupé en deux.** Si le paquet réseau s'arrête
+exactement après `M.` ou après `2.`, l'ancienne garde (qui exigeait de voir la suite du
+texte) ne s'appliquait pas : « 2. » partait seul à la synthèse et l'auditeur entendait
+« deux » ; `M. Dupont` arrivait en deux morceaux et n'était plus développé. Ces marqueurs ne
+sont donc **jamais** considérés comme une fin de phrase, même en fin de tampon. Le texte
+retenu n'est pas perdu : le CLI vide son tampon à la fin de la réponse (`cli.py`).
+
+### Vérification de bout en bout
+
+Lire la réponse à l'écran ne prouve rien sur ce que la voix prononce. `tests/verif_nettoyage.py`
+lance le **vrai CLI avec le vrai Kokoro**, contre un faux serveur qui renvoie du markdown, et
+capture la trace de chaque phrase juste avant sa synthèse (`VOICECHAT_TRACE_TTS=1`). Le stderr
+est capturé par un tuyau séparé du pseudo-terminal, pour ne pas confondre la réponse streamée
+avec les traces.
+
+```bash
+$ .venv/bin/python tests/verif_nettoyage.py
+CLI prêt, Kokoro chargé.
+
+=== 10 segments réellement envoyés à la synthèse ===
+   'Trois conseils pour la batterie'
+   'Voici les points qui comptent :'
+   'Baisse la luminosité :'
+   "réduis l'éclairage du panneau."
+   'Ferme les processus inutiles.'
+   'Le mode économie limite la puissance.'
+   'Réglage, Gain'
+   'Écran, 30 pour cent'
+   'Voir la doc Ubuntu, chapitre de Monsieur Dupont.'
+   'La température idéale est 32 degrés et le disque tourne à 1000 tours/min.'
+
+=== contrôles ===
+  OK  aucun bloc de code prononcé
+  OK  aucun backtick
+  OK  aucune barre de tableau
+  OK  aucun crochet de lien
+  OK  lien réduit à son texte
+  OK  abréviation développée
+  OK  pourcentage prononçable
+  OK  degré prononçable
+  OK  marqueur de liste retiré
+
+>>> OK : ce qui est prononcé ne contient plus de balisage markdown
+```
+
+On voit aussi, sur cette sortie, que le premier segment (`Trois conseils pour la batterie`)
+a perdu son `#` et que le tableau a produit deux segments lisibles au lieu de barres.
+
+### Voir ce qui part à la synthèse
+
+`VOICECHAT_TRACE_TTS=1` affiche, sur la sortie d'erreur, chaque phrase telle qu'elle est
+envoyée au synthétiseur — c'est le seul moyen de savoir ce que la voix dira vraiment :
+
+```bash
+VOICECHAT_TRACE_TTS=1 .venv/bin/python -m voicechat
+```
+
+### Reste à faire en v0.5
+
+- mélange de voix Kokoro (mixer des styles, pour sortir de l'unique voix française `ff_siwis`) ;
+- sélection de voix par persona dans le profil de prompt système.
+
+---
+
+## 12. Licence
 
 MIT — faire ce qu'on veut, sans garantie.

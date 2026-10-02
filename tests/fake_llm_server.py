@@ -22,6 +22,28 @@ REPONSE = (
     "Fin du message."
 )
 
+# Réponse volontairement chargée en markdown, pour vérifier ce qui part réellement
+# à la synthèse (v0.5). Elle est servie quand le message contient « markdown ».
+REPONSE_MARKDOWN = """# Trois conseils pour la batterie
+
+Voici les points qui comptent :
+
+- **Baisse la luminosité** : réduis l'éclairage du panneau.
+- 2. Ferme les processus inutiles.
+- Le mode économie limite la puissance.
+
+| Réglage | Gain |
+|---|---|
+| Écran | 30 % |
+
+```bash
+powermetrics --sensor cpu_power
+```
+
+Voir [la doc Ubuntu](https://doc.ubuntu-fr.org/batterie), chapitre de M. Dupont.
+La température idéale est 32 °C et le disque tourne à 1 000 tours/min.
+"""
+
 
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
@@ -53,11 +75,19 @@ class Handler(BaseHTTPRequestHandler):
         options = demande.get("stream_options") or {}
         avec_usage = bool(options.get("include_usage"))
 
+        # Le contenu peut être une chaîne ou une liste de parties (multimodal) :
+        # on ne garde que les chaînes, pour chercher le mot-clé sans planter.
+        demande_texte = " ".join(
+            m.get("content", "") for m in demande.get("messages", [])
+            if isinstance(m.get("content"), str)
+        )
+        reponse = REPONSE_MARKDOWN if "markdown" in demande_texte.lower() else REPONSE
+
         if not stream:
             corps = json.dumps(
                 {
                     "choices": [
-                        {"message": {"role": "assistant", "content": REPONSE}, "index": 0}
+                        {"message": {"role": "assistant", "content": reponse}, "index": 0}
                     ]
                 }
             ).encode()
@@ -75,7 +105,7 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.flush()
 
         base = {"id": "chatcmpl-fake", "object": "chat.completion.chunk", "model": modele}
-        morceaux = REPONSE.split(" ")
+        morceaux = reponse.split(" ")
         try:
             for mot in morceaux:
                 envoyer({**base, "choices": [{"index": 0, "delta": {"content": mot + " "}}]})
