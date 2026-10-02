@@ -25,9 +25,13 @@ sur la machine avec laquelle on parle. On ne dépend donc jamais d'un service TT
 | Client console + streaming SSE | ✅ implémenté et vérifié (v0.1) |
 | Kokoro TTS local + lecture audio | ✅ implémenté et vérifié (v0.1) |
 | Saisie clavier : collage multi-lignes = un seul message | ✅ implémenté et vérifié (v0.1) |
+| **Interruption à chaud** (`Ctrl+C` coupe tout, `Échap` coupe la voix) | ✅ implémenté et vérifié (v0.2) |
+| **Tokens et débit réels** (usage + timings du serveur) | ✅ implémenté et vérifié (v0.2) |
+| **Conversations** (`/save`, `/load`, `--continue`) | ✅ implémenté et vérifié (v0.2) |
+| Nom de modèle court à l'affichage | ✅ implémenté et vérifié (v0.2) |
 | Sélection GPU `auto/cuda/cpu` | ✅ **GPU opérationnel** — RTF 0,09 (cf. §8 pour l'obligation de build cu126 sur Pascal) |
 | Serveur LLM `100.91.114.49:8080` (niko-1650-super) | ✅ **joignable** — Ornith-1.5-35B-A3B Q4_K_M |
-| Suite de tests hors ligne | ✅ 38 tests passent |
+| Suite de tests hors ligne | ✅ 72 tests passent |
 
 > **Cible réelle du serveur LLM** — `100.91.114.49` = `niko-1650-super` dans le tailnet,
 > llama.cpp exposant une API OpenAI-compatible :
@@ -142,6 +146,7 @@ de commande (l'option gagne). Aucune clé n'est obligatoire : llama.cpp ignore `
 | `VOICECHAT_DEVICE` | `auto` | `auto` / `cuda` / `cpu` |
 | `VOICECHAT_SYSTEM` | *(court prompt FR)* | prompt système |
 | `VOICECHAT_TTS` | `1` | `0` pour désactiver la voix |
+| `VOICECHAT_DATA` | `~/.local/share/voicechat` | dossier des conversations sauvegardées |
 
 ---
 
@@ -159,6 +164,9 @@ de commande (l'option gagne). Aucune clé n'est obligatoire : llama.cpp ignore `
 
 # Lister les voix Kokoro disponibles
 .venv/bin/python -m voicechat --list-voices
+
+# Reprendre la dernière conversation sauvegardée
+.venv/bin/python -m voicechat --continue
 
 # Changer de cible (utile pour tester contre un autre llama-server)
 .venv/bin/python -m voicechat --base-url http://192.168.1.32:8080/v1
@@ -183,10 +191,53 @@ de commande (l'option gagne). Aucune clé n'est obligatoire : llama.cpp ignore `
 | `/tts on\|off` | active/coupe la voix |
 | `/model <nom>` | change de modèle pour les tours suivants |
 | `/system <texte>` | remplace le prompt système |
+| `/save [nom]` | enregistre la conversation (défaut : `derniere`) |
+| `/load <nom>` | recharge une conversation sauvegardée |
+| `/conversations` | liste les conversations sauvegardées |
+| `/forget <nom>` | supprime une conversation sauvegardée |
 | `/voices` | liste les voix Kokoro |
 | `/device` | liste les sorties audio détectées |
-| `/stats` | latences (TTFT, débit, RTF TTS) |
+| `/stats` | latences (TTFT, débit en tokens, RTF TTS) |
 | `/debug` | bascule l'affichage des stats à chaque tour |
+
+### Interrompre une réponse
+
+| Touche | Effet |
+|---|---|
+| `Échap` | coupe **la voix seulement** : la réponse continue d'arriver à l'écran |
+| `Ctrl+C` | coupe **tout** : génération, synthèse et lecture |
+
+`Ctrl+C` ferme la connexion HTTP, invalide ce qui est en cours de synthèse et vide la file
+de lecture. La session survit : on retombe sur le prompt, et la réponse partielle reçue est
+conservée dans l'historique (c'est ce que l'utilisateur a lu).
+
+Les touches frappées pendant une réponse ne sont pas perdues : elles réapparaissent
+pré-remplies au prompt suivant.
+
+### Conversations
+
+```bash
+vous › /save projet                # → ~/.local/share/voicechat/conversations/projet.json
+vous › /conversations
+conversations dans /home/niko/.local/share/voicechat/conversations :
+  projet                         7 messages  02/10 12:10  Ornith-1.5-35B-A3B-APEX-i-mini
+vous › /load projet
+```
+
+Un fichier JSON par conversation, écrit de façon atomique (jamais de fichier à moitié
+écrit). Le nom est assaini : `/save ../../etc/passwd` ne peut pas sortir du dossier de
+données. Au lancement, `--continue` reprend la plus récente.
+
+### Stats de la dernière réponse
+
+```
+ia › Bonjour !
+   · 1er token 0.74 s | 3 tok (+54 prompt) | 30.6 tok/s
+```
+
+Les compteurs viennent du serveur (`usage` + `timings.predicted_per_second` de llama.cpp) :
+c'est la seule mesure qui permette de comparer deux modèles. Si le serveur ne les fournit
+pas, l'affichage retombe sur les caractères — sans jamais mentir avec un « 0 tok ».
 
 ### Saisie clavier et collage
 
@@ -224,9 +275,12 @@ Un texte collé est résumé à l'écran plutôt que redessiné frappe par frapp
 vous › [12 lignes, 842 car.] Voici un long texte que je te copie-colle…  ⏎ envoyer · Ctrl+C annuler
 ```
 
-**Repli** : si le terminal n'implémente pas le bracketed paste, un saut de ligne reçu
-moins de 30 ms après le caractère précédent est considéré comme faisant partie d'un
-collage — un humain n'enchaîne pas aussi vite.
+**Repli** : si le terminal n'implémente pas le bracketed paste, un paquet de plusieurs
+octets (ou deux lectures à moins de 30 ms) est considéré comme un collage — un humain écrit
+un octet à la fois, il n'en envoie pas quinze d'un coup. **Conséquence à connaître** : une
+ligne entière livrée d'un seul bloc (ce que fait un script, pas un clavier) est vu comme un
+collage, donc son saut de ligne est conservé et il faut refaire `Entrée`. C'est bénin — aucune
+donnée n'est perdue — mais ça explique pourquoi un collage et une frappe ne se ressemblent pas.
 
 **Limites assumées** : pas de `Ctrl+R` (recherche dans l'historique) ; au-delà d'une
 ligne écran le message est résumé au lieu d'être redessiné — l'édition (retour arrière,
@@ -249,6 +303,7 @@ voicechat/
 ├── tts.py          # KokoroTTS (synthèse) + SpeechPipeline (file de phrases → voix → son)
 ├── audio.py        # Speaker : file de tampons audio + thread de lecture PortAudio
 ├── editor.py       # lecture clavier en mode brut : frappe / collage / Entrée
+├── store.py        # conversations sauvegardées (JSON, écriture atomique)
 └── cli.py          # boucle console, routage des commandes, orchestration
 tests/              # pytest hors ligne + fake_llm_server.py (faux serveur OpenAI)
 ```
@@ -289,27 +344,32 @@ python3 tests/fake_llm_server.py 8099          # terminal 1
 - [x] Saisie clavier maison : un collage multi-lignes reste **un seul message**, Entrée seule déclenche l'envoi
 - [x] Tests unitaires hors ligne + faux serveur OpenAI-compatible
 
-### v0.2 — confort d'usage
-- [ ] Interruption à chaud : `Ctrl+C` coupe la lecture **et** la génération en cours
-- [ ] Afficher un **nom de modèle court** au lieu du chemin complet renvoyé par llama.cpp
-- [ ] `/save` et `/load` : persistance des conversations en JSON
+### v0.2 — confort d'usage ✅ (ce commit)
+- [x] Interruption à chaud : `Ctrl+C` coupe la génération **et** la voix, `Échap` coupe la voix seule
+- [x] Afficher un **nom de modèle court** au lieu du chemin complet renvoyé par llama.cpp
+- [x] Comptage **réel** des tokens (`usage` + `timings`) avec repli sur les caractères
+- [x] `/save`, `/load`, `/conversations`, `/forget` et reprise au lancement (`--continue`)
+- [x] Les frappes faites pendant une réponse sont conservées et rendues au prompt suivant
+
+### v0.3 — confort restant
 - [ ] Historique de saisie : recherche `Ctrl+R` et complétion des `/commandes` (Tab)
 - [ ] Streaming audio par morceaux (moins de trou entre deux phrases)
-- [ ] Comptage des tokens et affichage coût/latence en continu
+- [ ] Profils de prompt système (`--profil brain-wash`) pour ne pas les retaper
+- [ ] Export d'une conversation en markdown
 
-### v0.3 — entrée vocale (mode mains libres)
+### v0.4 — entrée vocale (mode mains libres)
 - [ ] Capture micro (`sounddevice`) + VAD (détection d'activité vocale)
 - [ ] `faster-whisper` en local pour la reconnaissance (GPU, `small`/`medium`)
 - [ ] Boucle full-duplex : on parle → transcription → LLM → voix
 
-### v0.4 — voix de meilleure qualité
+### v0.5 — voix de meilleure qualité
 - [ ] Mélange de voix Kokoro (mix de styles, cf. `kokoro.StyleTTS`)
 - [ ] Sélection de voix par persona dans le prompt système
 - [ ] Césures/abreviations FR affinées (nombres, sigles, unités)
 - [ ] Normalisation des réponses markdown avant synthèse (listes, code, liens)
 
-### v0.5 — robustesse réseau
-- [ ] Reconnexion automatique + retry exponentiel si `niko-tv` redémarre
+### v0.6 — robustesse réseau
+- [ ] Reconnexion automatique + retry exponentiel si le serveur redémarre
 - [ ] Bascule automatique vers un serveur de secours (ex. `niko-tv`, aujourd'hui éteint)
 - [ ] Mode dégradé : réponses texte, voix mise en file puis rejouée au retour du GPU
 
@@ -622,15 +682,49 @@ prompt:   -> tour 1 : 'Ligne un'
   -> tour 3 : 'Ligne trois'
 ```
 
-`tests/test_editor.py` verrouille tout ça (18 tests) via de vrais pseudo-terminaux :
+`tests/test_editor.py` verrouille tout ça (25 tests) via de vrais pseudo-terminaux :
 collage balisé, collage non balisé détecté par rafale, frappe lente qui ne doit **pas**
-ressembler à un collage, retours arrière, `Ctrl+U`, historique, et entrée non interactive.
+ressembler à un collage, retours arrière, `Ctrl+U`, historique, Échap pendant une
+génération, et entrée non interactive.
 
 ```
 $ .venv/bin/python -m pytest tests/ -q
-......................................                                   [100%]
-38 passed in 5.09s
+........................................................................ [100%]
+72 passed in 7.84s
 ```
+
+### Interruption à chaud : vérifiée sur le vrai CLI
+
+`tests/verif_interruption.py` pilote le CLI dans un pseudo-terminal et envoie un vrai
+`SIGINT` (ce que fait la touche `Ctrl+C`) en pleine génération, puis une touche `Échap` :
+
+```
+=== 1. Ctrl+C en pleine génération ===
+ia › Bonjour ! Voici une réponse de test, découpée en plusieurs phrases. Elle sert à vérifier que le
+[Ctrl+C] génération, synthèse et lecture coupées
+   · 1er token 0.00 s | 96 car. en 0.50 s (192.0 car/s) | réponse tronquée | voix coupée
+
+vous ›
+   -> coupé, et la session survit
+
+=== 2. Une réponse qui finit normalement ===
+ia › Bonjour ! ... Fin du message.
+   · 1er token 0.00 s | 39 tok (+42 prompt) | 33.0 tok/s
+
+=== 3. Échap en pleine génération (voix coupée, réponse gardée) ===
+ia › Bonjour ! ... Fin du message.
+[Échap] voix coupée — la réponse reste à l'écran
+   · 1er token 0.00 s | 39 tok (+42 prompt) | 33.0 tok/s | voix coupée
+
+>>> OK : Ctrl+C coupe tout, Échap ne coupe que la voix
+```
+
+Deux détails volontaires dans ces sorties :
+
+- au cas 1, l'affichage retombe sur les **caractères** (`96 car.`) : la connexion a été
+  fermée avant que le serveur n'envoie son bloc `usage`. Le repli fonctionne, il ne ment pas
+  en affichant « 0 tok » ;
+- au cas 3, `Fin du message.` est bien présent : `Échap` n'a **pas** entamé la génération.
 
 ### Voix disponibles
 

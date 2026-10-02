@@ -232,6 +232,10 @@ class SpeechPipeline:
         self._q: queue.Queue = queue.Queue()
         self._thread: threading.Thread | None = None
         self._stop = threading.Event()
+        # Incrémenté à chaque vidage : une synthèse commencée avant le vidage et
+        # terminée après ne doit pas être jouée (sinon une phrase « fantôme »
+        # sort après un Ctrl+C).
+        self._epoque = 0
         self.enabled = True
         self.synth_errors = 0
 
@@ -254,6 +258,8 @@ class SpeechPipeline:
         self.speaker.wait()
 
     def flush(self) -> None:
+        """Coupe la voix : vide la file, arrête le son, et invalide la synthèse en cours."""
+        self._epoque += 1
         try:
             while True:
                 self._q.get_nowait()
@@ -279,6 +285,7 @@ class SpeechPipeline:
             try:
                 if item is None:
                     return
+                epoque = self._epoque
                 phrase = self.cleaner(item)
                 if not phrase:
                     continue
@@ -286,6 +293,10 @@ class SpeechPipeline:
                     audio = self.tts.synth(phrase)
                 except Exception:
                     self.synth_errors += 1
+                    continue
+                if epoque != self._epoque:
+                    # Un vidage (Ctrl+C) est passé pendant la synthèse : on jette,
+                    # sinon la phrase sortirait après l'interruption.
                     continue
                 self.speaker.play(audio)
             finally:

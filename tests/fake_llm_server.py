@@ -50,6 +50,8 @@ class Handler(BaseHTTPRequestHandler):
         demande = json.loads(self.rfile.read(taille) or b"{}")
         modele = demande.get("model", MODELES[0])
         stream = bool(demande.get("stream"))
+        options = demande.get("stream_options") or {}
+        avec_usage = bool(options.get("include_usage"))
 
         if not stream:
             corps = json.dumps(
@@ -68,17 +70,33 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Connection", "close")
         self.end_headers()
 
+        def envoyer(charge: dict) -> None:
+            self.wfile.write(f"data: {json.dumps(charge)}\n\n".encode())
+            self.wfile.flush()
+
+        base = {"id": "chatcmpl-fake", "object": "chat.completion.chunk", "model": modele}
+        morceaux = REPONSE.split(" ")
         try:
-            for mot in REPONSE.split(" "):
-                charge = {
-                    "id": "chatcmpl-fake",
-                    "object": "chat.completion.chunk",
-                    "model": modele,
-                    "choices": [{"index": 0, "delta": {"content": mot + " "}}],
-                }
-                self.wfile.write(f"data: {json.dumps(charge)}\n\n".encode())
-                self.wfile.flush()
-                time.sleep(0.03)  # simule un modèle lent
+            for mot in morceaux:
+                envoyer({**base, "choices": [{"index": 0, "delta": {"content": mot + " "}}]})
+                time.sleep(0.03)
+            envoyer({**base, "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]})
+
+            if avec_usage:
+                # Comme llama.cpp : un dernier morceau sans choix, avec les compteurs
+                # et les timings. Les valeurs sont fixes, donc vérifiables en test.
+                envoyer(
+                    {
+                        **base,
+                        "choices": [],
+                        "usage": {
+                            "completion_tokens": len(morceaux),
+                            "prompt_tokens": 42,
+                            "total_tokens": 42 + len(morceaux),
+                        },
+                        "timings": {"predicted_per_second": 22.5},
+                    }
+                )
             self.wfile.write(b"data: [DONE]\n\n")
             self.wfile.flush()
         except (BrokenPipeError, ConnectionResetError):

@@ -89,8 +89,12 @@ class LineEditor:
         self._balise_paste = False
 
     # ------------------------------------------------------------------ API
-    def read(self) -> str | None:
-        """Lit un message complet. ``None`` signifie fin d'entrée (Ctrl+D)."""
+    def read(self, initial: str = "") -> str | None:
+        """Lit un message complet. ``None`` signifie fin d'entrée (Ctrl+D).
+
+        ``initial`` pré-remplit le brouillon : sert à rendre à l'utilisateur les
+        frappes faites pendant que le modèle répondait.
+        """
         if not sys.stdin.isatty():
             return self._read_non_interactif()
         fd = sys.stdin.fileno()
@@ -99,8 +103,8 @@ class LineEditor:
         except termios.error:
             return self._read_non_interactif()
 
-        buf: list[str] = []
-        curseur = 0
+        buf: list[str] = list(initial)
+        curseur = len(buf)
         histo = len(self.history)
         brouillon = ""
         collage = False
@@ -284,3 +288,101 @@ class LineEditor:
         if ligne == "":
             return None  # fin de fichier
         return ligne.strip()
+
+
+class ClavierGeneration:
+    """Écoute discrète du clavier pendant qu'une réponse se génère puis se joue.
+
+    Pendant ce temps la boucle n'appelle pas ``read()`` : on met donc nous-mêmes le
+    terminal en mode non canonique pour que les touches arrivent sans attendre Entrée.
+    ``ISIG`` reste actif — Ctrl+C doit continuer à lever ``KeyboardInterrupt``.
+
+    Échap est signalé par ``sonder()`` (il faut alors couper la voix). Les autres
+    frappes ne sont **pas** perdues : elles sont conservées dans ``tampon`` et
+    réinjectées comme brouillon du prochain message.
+
+    Distinguer un Échap seul d'une flèche (``\\x1b[A``) demande un délai : sans octet
+    supplémentaire au bout de ``ESC_TIMEOUT``, l'octet ``\\x1b`` est considéré comme
+    la touche Échap.
+    """
+
+    ESC = "\x1b"
+
+    def __init__(self) -> None:
+        self._fd: int | None = None
+        self._ancien = None
+        self._decodeur = codecs.getincrementaldecoder("utf-8")("replace")
+        self._en_attente = ""
+        self._derniere_lecture = 0.0
+        self._echap = False
+        self.tampon = ""  # frappes conservées pour le prochain message
+
+    # ------------------------------------------------------------ cycle de vie
+    def __enter__(self) -> "ClavierGeneration":
+        if not sys.stdin.isatty():
+            return self
+        try:
+            fd = sys.stdin.fileno()
+            self._ancien = termios.tcgetattr(fd)
+            attrs = termios.tcgetattr(fd)
+            attrs[3] &= ~(termios.ICANON | termios.ECHO)  # ISIG conservé : Ctrl+C reste un signal
+            attrs[6][termios.VMIN] = 1
+            attrs[6][termios.VTIME] = 0
+            termios.tcsetattr(fd, termios.TCSANOW, attrs)
+            self._fd = fd
+        except (termios.error, ValueError, OSError):
+            self._ancien = None
+        return self
+
+    def __exit__(self, *exc) -> bool:
+        if self._ancien is not None and self._fd is not None:
+            try:
+                termios.tcsetattr(self._fd, termios.TCSADRAIN, self._ancien)
+            except termios.error:
+                pass
+        return False
+
+    # ------------------------------------------------------------------ écoute
+    def sonder(self) -> bool:
+        """Lit ce qui est disponible sans bloquer. ``True`` = Échap vient d'être frappé.
+
+        Le signal est « à front » : il n'est signalé qu'une fois.
+        """
+        if self._fd is None:
+            return False
+        try:
+            pret, _, _ = select.select([self._fd], [], [], 0)
+            if pret:
+                data = os.read(self._fd, 256)
+                if data:
+                    self._en_attente += self._decodeur.decode(data)
+                    self._derniere_lecture = time.monotonic()
+        except (OSError, ValueError):
+            return False
+
+        self._decouper()
+        if self._echap:
+            self._echap = False
+            return True
+        return False
+
+    def _decouper(self) -> None:
+        """Transforme les octets en attente en jetons : Échap, touche connue, ou texte."""
+        while self._en_attente:
+            jeton, reste = _jeton(self._en_attente)
+            if jeton is None:
+                # Séquence peut-être incomplète. Sans suite au bout du délai, c'est
+                # un Échap seul (une flèche arriverait d'un bloc).
+                if time.monotonic() - self._derniere_lecture < ESC_TIMEOUT:
+                    return
+                jeton, reste = self._en_attente[0], self._en_attente[1:]
+            self._en_attente = reste
+
+            if jeton == self.ESC:
+                self._echap = True
+            elif jeton in _KEYS:
+                pass  # flèche, début/fin, suppr : sans objet pendant une réponse
+            elif jeton.isprintable():
+                self.tampon += jeton
+            elif jeton in ("\n", "\t"):
+                self.tampon += " "

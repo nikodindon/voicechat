@@ -4,12 +4,13 @@ from __future__ import annotations
 
 import argparse
 import sys
+import threading
 import time
 
-from . import __version__, text as txt
+from . import __version__, store, text as txt
 from .audio import Speaker
-from .config import Config
-from .editor import LineEditor
+from .config import Config, nom_court
+from .editor import ClavierGeneration, LineEditor
 from .llm import LLMError, list_models, stream_with_usage
 from .tts import KokoroTTS, SpeechPipeline, list_voices, resolve_device
 
@@ -31,10 +32,19 @@ HELP = """Commandes disponibles :
   /tts on|off        active ou coupe la voix
   /model <nom>       change de modèle pour les tours suivants
   /system <texte>    remplace le prompt système
+  /save [nom]        enregistre la conversation (défaut : derniere)
+  /load <nom>        recharge une conversation sauvegardée
+  /conversations     liste les conversations sauvegardées
+  /forget <nom>      supprime une conversation sauvegardée
   /voices            liste les voix Kokoro (nécessite Hugging Face)
   /device            liste les sorties audio détectées
   /stats             dernières mesures (latence, débit, RTF du TTS)
   /debug             bascule l'affichage des stats à chaque tour
+
+Pendant une réponse :
+  Échap              couper la voix, mais garder la réponse à l'écran
+  Ctrl+C             tout couper : génération, synthèse et lecture
+  (vos frappes pendant la réponse sont conservées pour le message suivant)
 
 Clavier :
   Coller un texte multi-lignes : il est conservé tel quel, rien n'est envoyé
@@ -67,6 +77,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--timeout", type=float, help="délai max en secondes par requête")
     p.add_argument("--probe", action="store_true", help="tester la joignabilité du serveur et sortir")
     p.add_argument("--list-voices", action="store_true", help="lister les voix Kokoro et sortir")
+    p.add_argument("--continue", dest="reprendre", action="store_true",
+                   help="reprendre la dernière conversation sauvegardée")
     p.add_argument("--debug", action="store_true", help="afficher les statistiques à chaque tour")
     p.add_argument("--version", action="version", version=f"voicechat {__version__}")
     return p
@@ -138,6 +150,9 @@ class ChatSession:
         self.speech: SpeechPipeline | None = None
         self.editor = LineEditor()
         self.last_stats = ""
+        self.conversation = ""  # nom de la conversation courante, pour /save
+        self.debut = time.time()
+        self.frappes = ""  # frappes faites pendant la réponse, rendues au prochain prompt
 
     # ------------------------------------------------------------------ démarrage
     def setup_voice(self) -> None:
@@ -179,7 +194,8 @@ class ChatSession:
             print("[ERREUR] /v1/models ne liste aucun modèle. Passer --model <nom>.")
             return False
         self.cfg.model = modeles[0]
-        print(f"Modèle : {self.cfg.model} (détecté, {len(modeles)} disponible(s))")
+        extra = f" ({len(modeles)} disponibles)" if len(modeles) > 1 else ""
+        print(f"Modèle : {nom_court(self.cfg.model)}{extra}")
         return True
 
     # ------------------------------------------------------------------- un tour
@@ -201,48 +217,96 @@ class ChatSession:
         tampon = ""
         reponse = ""
         interrompu = False
-        t0 = time.monotonic()
-        try:
-            for morceau in flux:
-                print(morceau, end="", flush=True)
-                reponse += morceau
-                tampon += morceau
-                phrases, tampon = txt.split_sentences(tampon)
-                for phrase in phrases:
-                    self._speak(phrase)
-        except KeyboardInterrupt:
-            interrompu = True
-            if self.speech:
-                self.speech.flush()
-            print("\n[interrompu par Ctrl+C]")
-        except LLMError as exc:
-            print(f"\n[ERREUR] {exc}")
-            self.messages.pop()  # on retire la question pour garder un contexte propre
-            if self.speech:
-                self.speech.flush()
-            return
-        finally:
-            print()
+        erreur = False
+        coupee = False
 
-        if tampon.strip():
-            self._speak(tampon.strip())
-        if reponse.strip():
-            self.messages.append({"role": "assistant", "content": reponse})
+        # Le clavier reste écouté pendant tout l'échange : Échap coupe la voix sans
+        # perdre la réponse, et les frappes faites entre-temps ne sont pas jetées.
+        with ClavierGeneration() as clavier:
+            try:
+                for morceau in flux:
+                    print(morceau, end="", flush=True)
+                    reponse += morceau
+                    tampon += morceau
+                    phrases, tampon = txt.split_sentences(tampon)
+                    for phrase in phrases:
+                        self._speak(phrase)
+                    if clavier.sonder():
+                        coupee = True
+                        self._couper_voix()
+            except KeyboardInterrupt:
+                interrompu = True
+            except LLMError as exc:
+                erreur = True
+                print(f"\n[ERREUR] {exc}")
+                self.messages.pop()  # on retire la question pour garder un contexte propre
+            finally:
+                flux.close()  # ferme la connexion HTTP, même si on a interrompu
 
-        if self.speech:
-            self.speech.wait()  # on laisse finir la voix avant de reprendre la main
+            print()  # fin de la ligne de réponse
 
-        self.last_stats = (
-            f"1er token {usage.first_token_s:.2f} s | {usage.chars} car. en "
-            f"{usage.total_s or (time.monotonic() - t0):.2f} s "
-            f"({usage.chars_per_s:.1f} car/s)"
-        )
+            if erreur:
+                self._couper_voix()
+            elif interrompu:
+                self._couper_voix()
+                coupee = True
+                print("[Ctrl+C] génération, synthèse et lecture coupées")
+            else:
+                if coupee:
+                    print("[Échap] voix coupée — la réponse reste à l'écran")
+                # Le texte resté sans ponctuation finale part quand même à la voix —
+                # sauf si elle vient d'être coupée.
+                if tampon.strip() and not coupee:
+                    self._speak(tampon.strip())
+                if self.speech and not coupee:
+                    coupee = self._attendre_voix(clavier)
+
+            # On conserve une réponse partielle : c'est ce que l'utilisateur a lu.
+            if reponse.strip() and not erreur:
+                self.messages.append({"role": "assistant", "content": reponse})
+
+        self.frappes = clavier.tampon
+        self._maj_stats(usage, interrompu, coupee)
+
+    def _maj_stats(self, usage, interrompu: bool, coupee: bool) -> None:
+        self.last_stats = usage.resume()
         if self.tts and self.tts.audio_s > 0:
             self.last_stats += f" | TTS RTF {self.tts.rtf:.2f}"
         if interrompu:
             self.last_stats += " | réponse tronquée"
+        if coupee:
+            self.last_stats += " | voix coupée"
         if self.cfg.show_stats:
             print(f"   · {self.last_stats}")
+
+    def _couper_voix(self) -> None:
+        """Vide la file de synthèse, arrête le son, invalide ce qui est en cours."""
+        if self.speech:
+            self.speech.flush()
+
+    def _attendre_voix(self, clavier: ClavierGeneration) -> bool:
+        """Attend la fin de la voix en restant à l'écoute d'Échap.
+
+        L'attente réelle se fait dans un thread : ``wait()`` est la seule source de
+        vérité sur « tout est joué » (regarder la file d'attente suffirait à croire
+        que c'est fini pendant qu'une phrase est encore en cours de synthèse).
+        Retourne True si la voix a été coupée.
+        """
+        fini = threading.Event()
+
+        def attendre() -> None:
+            try:
+                self.speech.wait()  # type: ignore[union-attr]
+            finally:
+                fini.set()
+
+        threading.Thread(target=attendre, name="attente-voix", daemon=True).start()
+        while not fini.wait(0.02):
+            if clavier.sonder():
+                self._couper_voix()
+                print("[Échap] voix coupée — la réponse reste à l'écran")
+                return True
+        return False
 
     def _speak(self, phrase: str) -> None:
         if self.speech and self.cfg.tts:
@@ -253,6 +317,26 @@ class ChatSession:
         limite = max(2, self.cfg.history_limit)
         if len(self.messages) > limite + 1:
             self.messages = [self.messages[0]] + self.messages[-limite:]
+
+    # ------------------------------------------------------------ conversations
+    def _appliquer(self, conv: store.Conversation) -> None:
+        """Remplace l'état de la session par celui d'une conversation chargée."""
+        systeme = conv.systeme or self.cfg.system
+        sans_systeme = [m for m in conv.messages if m["role"] != "system"]
+        self.messages = [{"role": "system", "content": systeme}] + sans_systeme
+        self.cfg.system = systeme
+        self.conversation = conv.nom
+        self.debut = conv.cree
+
+    def reprendre(self) -> None:
+        """Recharge la dernière conversation sauvegardée (option --continue)."""
+        conv = store.derniere()
+        if conv is None:
+            print(f"Aucune conversation à reprendre dans {store.dossier()}")
+            return
+        self._appliquer(conv)
+        quand = time.strftime("%d/%m %H:%M", time.localtime(conv.maj))
+        print(f"Reprise de « {conv.nom} » — {conv.echanges} messages (dernière fois {quand})")
 
     # ------------------------------------------------------------------ commandes
     def handle_command(self, ligne: str) -> bool:
@@ -322,6 +406,58 @@ class ChatSession:
             self.messages[0] = {"role": "system", "content": arg}
             print("prompt système remplacé")
 
+        elif cmd == "/save":
+            nom = arg or self.conversation or store.NOM_DEFAUT
+            try:
+                chemin = store.enregistrer(
+                    nom,
+                    self.messages,
+                    modele=self.cfg.model,
+                    systeme=self.cfg.system,
+                    cree=self.debut,
+                )
+            except (ValueError, OSError) as exc:
+                print(f"échec de l'enregistrement : {exc}")
+            else:
+                self.conversation = chemin.stem
+                print(f"enregistré « {chemin.stem} » ({len(self.messages) - 1} messages)")
+                print(f"  {chemin}")
+
+        elif cmd == "/load":
+            if not arg:
+                print("usage : /load <nom>   (voir /conversations)")
+            else:
+                try:
+                    conv = store.charger(arg)
+                except FileNotFoundError as exc:
+                    print(f"échec : {exc}")
+                except ValueError as exc:
+                    print(f"échec : {exc}")
+                else:
+                    self._appliquer(conv)
+                    if conv.modele:
+                        print(f"(conversation enregistrée avec {nom_court(conv.modele)})")
+                    print(f"chargé « {conv.nom} » : {conv.echanges} messages")
+
+        elif cmd == "/conversations":
+            sauvegardes = store.lister()
+            if not sauvegardes:
+                print(f"aucune conversation dans {store.dossier()}")
+            else:
+                print(f"conversations dans {store.dossier()} :")
+                for c in sauvegardes:
+                    quand = time.strftime("%d/%m %H:%M", time.localtime(c["maj"]))
+                    modele = f"  {nom_court(c['modele'])}" if c["modele"] else ""
+                    print(f"  {c['nom']:<28} {c['echanges']:>3} messages  {quand}{modele}")
+
+        elif cmd == "/forget":
+            if not arg:
+                print("usage : /forget <nom>")
+            elif store.supprimer(arg):
+                print(f"supprimé « {store.nom_fichier(arg)} »")
+            else:
+                print(f"aucune conversation nommée « {arg} »")
+
         elif cmd == "/stats":
             print(self.last_stats or "aucune mesure pour l'instant")
 
@@ -335,7 +471,7 @@ class ChatSession:
         return True
 
     # --------------------------------------------------------------------- boucle
-    def run(self) -> int:
+    def run(self, reprendre: bool = False) -> int:
         cfg = self.cfg
         print(BANNER)
         print(f"voicechat {__version__}  ·  serveur {cfg.base_url}")
@@ -343,16 +479,22 @@ class ChatSession:
         if not self.resolve_model():
             return 2
 
+        if reprendre:
+            self.reprendre()
+
         self.setup_voice()
 
         print()
         print("Tapez votre message, ou collez un texte — Entrée pour l'envoyer.")
         print("/help pour l'aide, /quit pour sortir.")
+        if self.conversation:
+            print(f"conversation : « {self.conversation} »  (/save pour l'enregistrer)")
         print("─" * 60)
 
         while True:
             try:
-                ligne = self.editor.read()
+                initial, self.frappes = self.frappes, ""
+                ligne = self.editor.read(initial=initial)
             except KeyboardInterrupt:
                 print()
                 break
@@ -390,7 +532,7 @@ def main(argv: list[str] | None = None) -> int:
     _, description = resolve_device(cfg.device)
     print(f"[matériel] {description}")
 
-    return ChatSession(cfg).run()
+    return ChatSession(cfg).run(reprendre=args.reprendre)
 
 
 if __name__ == "__main__":  # pragma: no cover

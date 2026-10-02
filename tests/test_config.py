@@ -2,7 +2,7 @@
 
 import os
 
-from voicechat.config import DEFAULT_BASE_URL, Config
+from voicechat.config import DEFAULT_BASE_URL, Config, nom_court
 
 
 def test_defauts():
@@ -40,3 +40,29 @@ def test_url_sans_slash_final(monkeypatch):
     monkeypatch.setenv("VOICECHAT_BASE_URL", "http://hote:8080/v1/")
     cfg = Config.from_env()
     assert cfg.chat_url == "http://hote:8080/v1/chat/completions"
+
+
+# ------------------------------------------------------- nom d'affichage
+def test_nom_court_retire_le_chemin_et_l_extension():
+    """llama.cpp renvoie un chemin complet : on n'affiche que le nom du fichier."""
+    assert (
+        nom_court("/mnt/data/sdc2/models/Ornith-1.5-35B-A3B-APEX-i-mini.gguf")
+        == "Ornith-1.5-35B-A3B-APEX-i-mini"
+    )
+
+
+def test_nom_court_laisse_un_nom_simple_intact():
+    assert nom_court("Ornith-1.5-35B-A3B-APEX-i-mini.gguf") == "Ornith-1.5-35B-A3B-APEX-i-mini"
+    assert nom_court("mistral") == "mistral"
+
+
+def test_nom_court_sans_modele():
+    assert nom_court("") == "?"
+
+
+def test_le_modele_envoye_reste_le_chemin_complet():
+    """Le raccourci est purement cosmétique : l'identifiant transmis ne change pas."""
+    cfg = Config(model="/mnt/data/sdc2/models/machin.gguf")
+    assert cfg.model == "/mnt/data/sdc2/models/machin.gguf"
+    assert nom_court(cfg.model) == "machin"
+    assert cfg.chat_url.endswith("/chat/completions")

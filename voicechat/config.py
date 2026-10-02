@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass, replace
+from pathlib import Path
 
 DEFAULT_BASE_URL = "http://100.91.114.49:8080/v1"
 DEFAULT_VOICE = "ff_siwis"  # français féminin
@@ -16,6 +17,19 @@ DEFAULT_SYSTEM = (
 
 def _env(name: str, default: str = "") -> str:
     return os.environ.get(name, default).strip()
+
+
+def nom_court(modele: str) -> str:
+    """Nom lisible d'un modèle, pour l'affichage seulement.
+
+    llama.cpp renvoie comme identifiant un chemin complet
+    (« /mnt/data/sdc2/models/Ornith-1.5-35B-A3B-APEX-i-mini.gguf »). On n'en garde que
+    le nom de fichier sans extension. Ce nom n'est **pas** envoyé au serveur : le vrai
+    identifiant reste ``cfg.model``.
+    """
+    if not modele:
+        return "?"
+    return Path(modele).name.removesuffix(".gguf") or modele
 
 
 def _env_bool(name: str, default: bool = True) -> bool:

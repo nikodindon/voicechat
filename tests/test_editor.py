@@ -22,7 +22,14 @@ import tty
 
 import pytest
 
-from voicechat.editor import PASTE_END, PASTE_START, LineEditor, _est_prefixe, _jeton
+from voicechat.editor import (
+    PASTE_END,
+    PASTE_START,
+    ClavierGeneration,
+    LineEditor,
+    _est_prefixe,
+    _jeton,
+)
 
 DELAI = 0.06  # s entre deux « évènements clavier »
 
@@ -50,7 +57,7 @@ def pty_env(monkeypatch):
     os.close(esclave)
 
 
-def jouer(maitre, editeur, ecritures, sortie=None):
+def jouer(maitre, editeur, ecritures, sortie=None, initial=""):
     """Lance read() en tâche de fond et envoie les octets un par un.
 
     Chaque entrée de ``ecritures`` est un évènement distinct (une frappe, un collage,
@@ -62,7 +69,7 @@ def jouer(maitre, editeur, ecritures, sortie=None):
     resultat: dict[str, str | None] = {}
 
     def cible():
-        resultat["valeur"] = editeur.read()
+        resultat["valeur"] = editeur.read(initial=initial)
 
     ancien_stdout = sys.stdout
     sys.stdout = sortie  # posé ici, donc pendant la phase « call » : il tient
@@ -241,3 +248,71 @@ def test_entree_pipee_garde_les_lignes_vides(monkeypatch):
     assert editeur.read() == ""
     assert editeur.read() == ""
     assert editeur.read() is None
+
+
+def test_brouillon_prerempli(pty_env):
+    """Les frappes faites pendant une réponse doivent revenir au prompt suivant."""
+    maitre, _ = pty_env
+    resultat = jouer(maitre, LineEditor(), [b" ajoute", b"\r"], initial="deja la")
+    assert resultat == "deja la ajoute"
+
+
+# ------------------------------------- clavier pendant une génération (Échap)
+def test_clavier_generation_detecte_echap(pty_env):
+    maitre, _ = pty_env
+    with ClavierGeneration() as clavier:
+        os.write(maitre, b"\x1b")     # Échap seul
+        time.sleep(0.02)
+        assert clavier.sonder() is False, "trop tôt : la séquence peut encore s'allonger"
+        time.sleep(0.08)              # au-delà de ESC_TIMEOUT
+        assert clavier.sonder() is True
+
+
+def test_echap_est_signale_une_seule_fois(pty_env):
+    maitre, _ = pty_env
+    with ClavierGeneration() as clavier:
+        os.write(maitre, b"\x1b")
+        time.sleep(0.02)
+        clavier.sonder()
+        time.sleep(0.08)
+        assert clavier.sonder() is True
+        assert clavier.sonder() is False, "le signal doit être à front, pas à niveau"
+
+
+def test_fleche_nest_pas_prise_pour_echap(pty_env):
+    """Une flèche commence aussi par \\x1b : elle ne doit pas couper la voix."""
+    maitre, _ = pty_env
+    with ClavierGeneration() as clavier:
+        os.write(maitre, b"\x1b[A")
+        time.sleep(0.08)
+        assert clavier.sonder() is False
+
+
+def test_frappes_conservees_pendant_la_generation(pty_env):
+    maitre, _ = pty_env
+    with ClavierGeneration() as clavier:
+        os.write(maitre, b"salut")
+        time.sleep(0.05)
+        clavier.sonder()
+    assert clavier.tampon == "salut"
+
+
+def test_echap_et_frappes_melanges(pty_env):
+    """Échap n'efface pas le texte déjà tapé, et le texte n'empêche pas Échap."""
+    maitre, _ = pty_env
+    with ClavierGeneration() as clavier:
+        os.write(maitre, b"abc")
+        time.sleep(0.05)
+        clavier.sonder()
+        os.write(maitre, b"\x1b")
+        time.sleep(0.02)
+        clavier.sonder()
+        time.sleep(0.08)
+        assert clavier.sonder() is True
+    assert clavier.tampon == "abc"
+
+
+def test_clavier_generation_sans_tty_ne_plante_pas(monkeypatch):
+    monkeypatch.setattr(sys, "stdin", io.StringIO(""))
+    with ClavierGeneration() as clavier:
+        assert clavier.sonder() is False
