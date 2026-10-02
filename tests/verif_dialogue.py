@@ -177,6 +177,40 @@ def main() -> int:
     controles.append(("les deux personas alternent", noms == ["alice", "bob", "alice", "bob"]))
     controles.append(("aucune réplique vide", all(t.strip() for _, t in repliques)))
 
+    # Les trois dérives de texte observées à l'usage, et qu'aucun contrôle de voix ne
+    # pouvait voir. Le modèle les produit tout seul si on ne l'en empêche pas.
+    import re
+
+    textes = [t for _, t in repliques]
+    prefixes = [
+        (nom, t[:30])
+        for nom, t in repliques
+        if re.match(r"^\s*[*_#]{0,3}\s*(alice|bob)\s*:", t, re.I)
+    ]
+    if prefixes:
+        print("\n  !! répliques qui s'ouvrent par un nom :")
+        for nom, debut in prefixes[:4]:
+            print(f"     {nom} › {debut}…")
+    controles.append(("aucune réplique ne s'ouvre par un nom", not prefixes))
+
+    recopies = []
+    for i in range(1, len(textes)):
+        debut = textes[i - 1][:40].strip().lower()
+        if len(debut) > 20 and textes[i].strip().lower().startswith(debut):
+            recopies.append(noms[i])
+    if recopies:
+        print(f"\n  !! répliques qui recopient le message reçu : {recopies}")
+    controles.append(("aucune réplique ne recopie le message reçu", not recopies))
+
+    plus_longue = max((len(t.split()) for t in textes), default=0)
+    print(f"  réplique la plus longue : {plus_longue} mots (limite {dialogue.mots_max})")
+    controles.append(
+        (
+            f"aucune réplique ne part en pavé (max {dialogue.mots_max} mots)",
+            plus_longue <= dialogue.mots_max,
+        )
+    )
+
     # C'est le contrôle central : aucune phrase ne doit être synthétisée avec la voix
     # d'un autre persona que celui dont c'était le tour.
     if desynchro:

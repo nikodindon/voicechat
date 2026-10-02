@@ -2907,6 +2907,20 @@ Troisième version, la bonne : le nom va dans le **prompt système** (« Tu disc
 alice. Réponds-lui directement. »), et le texte des messages reste du texte. Un prompt ne
 donne pas de format à copier.
 
+**Et ce n'était toujours pas fini.** Avec des personas travaillés (de l'opposition, un vrai
+sujet de débat), le préfixe est revenu — `bob › Bob: Non, je ne suis pas convaincu` — et
+Alice s'est mise à **recopier** le message de Bob avant d'y répondre. Puis, la recopie
+réglée, les réponses sont devenues des pavés markdown de 200 mots, avec titres et listes
+numérotées : à l'oral, deux minutes de rapport.
+
+Trois dérives, donc, que le prompt doit nommer explicitement — interdiction d'écrire son
+nom, interdiction de recopier, et un maximum de longueur. C'est ce que fait `EN_FACE`, et
+c'est aussi pourquoi le dialogue **signale** les répliques trop longues (`_avertir_si_bavard`) :
+le modèle ne peut pas savoir qu'un dialogue s'écoute.
+
+Ces trois dérives sont maintenant des contrôles de la vérification (§18.6). Elles avaient
+toutes échappé à la version qui ne regardait que les voix.
+
 ### 18.4 Le piège qui n'en était pas un
 
 `SpeechPipeline` synthétise dans un thread et lit `tts.voice` au **dépilement**, pas à
@@ -2971,16 +2985,20 @@ alice › Exact. Moins de mots, plus de sens…
 bob › C'est vrai, parfois ne rien dire est plus parlant qu'une phrase ratée…
 
   voix qui ont réellement synthétisé : ['ef_dora', 'ff_siwis']
-  phrases synthétisées : 10
+  phrases synthétisées : 11
   même phrase, deux voix : corrélation -0.016 (1.000 = identiques)
+  réplique la plus longue : 25 mots (limite 90)
 
-  audio produit : 30.5 s en 46.3 s (10 tampons)
-  RTF de synthèse : 0.14
+  audio produit : 27.1 s en 41.8 s (11 tampons)
+  RTF de synthèse : 0.13
 
 === contrôles ===
   OK  le dialogue a produit ses 4 répliques
   OK  les deux personas alternent
   OK  aucune réplique vide
+  OK  aucune réplique ne s'ouvre par un nom
+  OK  aucune réplique ne recopie le message reçu
+  OK  aucune réplique ne part en pavé (max 90 mots)
   OK  chaque phrase est dite par la voix du persona dont c'était le tour
   OK  les deux voix ont réellement parlé
   OK  la session a retrouvé sa voix
@@ -2993,6 +3011,80 @@ qu'elles sont réellement distinctes : deux voix identiques donneraient 1,000.
 Deux choses non mesurées, et dites comme telles : **l'écoute** (la vérification juge la
 voix utilisée, pas si le résultat est agréable — ça, seule une oreille le dit), et le
 **nombre de répliques idéal**, qui dépend entièrement des personas.
+
+### 18.7 Écrire deux personas, et choisir les deux voix
+
+**Il faut de l'opposition.** Deux instances du même modèle, avec des prompts vagues, sont
+d'accord sur tout : le premier essai donnait « Exactement… », « C'est vrai… », « Tout à fait… ».
+Un dialogue n'est intéressant que si les prompts poussent dans deux directions contraires.
+
+Les deux profils qui servent d'exemple (écrits par `store.enregistrer_profil`, donc
+exactement le format de `/profil save`) :
+
+```
+# ~/.config/voicechat/profils/alice.md
+voix: ff_siwis
+vitesse: 1.05
+
+Tu es Alice et tu discutes à voix haute avec Bob. Tu défends une position tranchée et tu
+contestes ce qu'on te dit, toujours par un argument.
+RÈGLES DE FORME, à respecter avant tout : ta réponse fait AU MAXIMUM 35 mots, en deux
+phrases. Aucun titre, aucune liste, aucun astérisque, aucune énumération : c'est de
+l'oral, pas un document. Tu ne remercies pas, tu n'approuves pas, tu ne répètes pas ce
+qu'on t'a dit.
+```
+
+```
+# ~/.config/voicechat/profils/bob.md
+voix: ff_siwis:1+ef_dora:1
+vitesse: 0.95
+
+Tu es Bob et tu discutes à voix haute avec Alice. Tu es sceptique : tu demandes une preuve
+ou un exemple concret avant de concéder quoi que ce soit.
+RÈGLES DE FORME, à respecter avant tout : ta réponse fait AU MAXIMUM 35 mots, en deux
+phrases. Aucun titre, aucune liste, aucun astérisque, aucune énumération : c'est de
+l'oral, pas un document. Tu ne félicites pas ton interlocuteur.
+```
+
+Les « règles de forme » ne sont pas décoratives : sans elles, le modèle écrit des pavés
+markdown avec titres et listes — à l'oral, c'est un rapport de deux minutes. Le dialogue
+signale les répliques qui dépassent 90 mots.
+
+**Et la voix, alors ?** Kokoro 82M n'a **qu'une seule voix française** sur 54 (`ff_siwis`).
+Deux personas en français sont donc condamnés à se ressembler — sauf à mélanger, ou à
+accepter un accent. Mesuré sur la même phrase, timbre contre `ff_siwis` (la mesure du
+banc v0.5, §11 ; 1,000 = même timbre) :
+
+| voix | timbre | ce que c'est | justesse FR (v0.5) |
+|---|---|---|---|
+| `ff_siwis` | 1,000 | la seule voix française de Kokoro | 90,5 % |
+| `ff_siwis:3+ef_dora:1` | 0,969 | mélange 75/25 — différence très fine | 100 % |
+| `ff_siwis:1+ef_dora:1` | 0,893 | mélange 50/50 — deux voix qu'on distingue | 90,5 % |
+| `if_sara` | 0,916 | voix italienne lisant le français (accent) | — |
+| `ef_dora` | 0,769 | voix anglaise (accent marqué, le plus distinct) | — |
+
+C'est un compromis sans bonne réponse : **plus les voix se distinguent, plus l'accent
+français se perd**. Le mélange 50/50 (0,893) est le point d'équilibre retenu pour les
+exemples — on entend deux personnes, et ça reste du français compréhensible. Pour écouter
+les cinq avant de choisir :
+
+```bash
+.venv/bin/python -c "
+import soundfile as sf; from voicechat.tts import KokoroTTS
+t = KokoroTTS(voice='ff_siwis'); t.load()
+for nom, voix in [('a', 'ff_siwis'), ('b', 'ff_siwis:3+ef_dora:1'),
+                  ('c', 'ff_siwis:1+ef_dora:1'), ('d', 'ef_dora'), ('e', 'if_sara')]:
+    t.set_voice(voix)
+    sf.write(f'/tmp/voix-{nom}.wav', t.synth('Tu penses vraiment que la réponse courte vaut mieux ?'), 24000)
+"
+```
+
+Pour changer la voix d'un persona, une seule ligne à éditer : la première du fichier
+(`voix:`). Le profil accepte aussi `vitesse:`, `langue:` et `modele:` — deux personas
+peuvent donc tourner sur deux modèles différents.
+
+Enfin, la commande lance **6 répliques** (trois chacun). Le nombre n'est pas encore
+réglable depuis la commande.
 
 ---
 

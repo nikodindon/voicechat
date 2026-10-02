@@ -281,3 +281,40 @@ def test_le_nombre_de_repliques_est_respecte(tmp_path):
     a, b = _deux_personas(tmp_path)
     session = FausseSession()
     assert len(Dialogue(session, a, b, "sujet", tours=3).derouler()) == 3
+
+
+# ------------------------------------------------- les dérives de texte (à l'usage)
+def test_une_replique_trop_longue_est_signalee(tmp_path, capsys):
+    """Un dialogue s'écoute : 200 mots avec des titres, ça fait un rapport, pas une réplique."""
+    a, b = _deux_personas(tmp_path)
+    pave = "argument " * 120
+    session = FausseSession(reponses=[pave, "court"])
+    Dialogue(session, a, b, "sujet", tours=2).derouler()
+    sortie = capsys.readouterr().out
+    assert "longue à écouter" in sortie
+    assert "120 mots" in sortie
+
+
+def test_une_replique_courte_ne_declenche_rien(tmp_path, capsys):
+    a, b = _deux_personas(tmp_path)
+    session = FausseSession(reponses=["Une réponse brève et nette.", "Une autre, tout aussi brève."])
+    Dialogue(session, a, b, "sujet", tours=2).derouler()
+    assert "longue à écouter" not in capsys.readouterr().out
+
+
+def test_le_prompt_interdit_de_signier_son_nom(tmp_path):
+    """La règle est dans le prompt système, pas dans le texte des messages.
+
+    Deux versions précédentes ont échoué autrement : sans nom, le modèle s'appelait
+    lui-même ; avec le nom en préfixe du message, il imitait le format et préfixait ses
+    réponses par « bob : » — préfixe qui partait ensuite à la voix.
+    """
+    a, b = _deux_personas(tmp_path)
+    session = FausseSession(reponses=["A1", "B1"])
+    Dialogue(session, a, b, "sujet", tours=2).derouler()
+    prompt_a = a.messages[0]["content"]
+    assert "Tu discutes avec bob" in prompt_a
+    assert "sans écrire « alice »" in prompt_a
+    assert "sans recopier" in prompt_a
+    # Et le texte des messages, lui, reste du texte : aucun préfixe de locuteur.
+    assert session.tours[1]["messages"][-1]["content"] == "A1"

@@ -23,6 +23,9 @@ if TYPE_CHECKING:  # évite un cycle : cli.py importe ce module
     from .cli import Tour
 
 TOURS_DEFAUT = 6
+# Au-delà, une réplique n'est plus une réplique mais un laïus : on le signale. 35 mots
+# tiennent en une quinzaine de secondes de voix, ce qui est déjà long dans un échange.
+MOTS_MAX = 90
 
 
 class SessionDialogue(Protocol):
@@ -55,7 +58,14 @@ class SessionDialogue(Protocol):
 #
 # Le nom appartient donc aux prompts, et le texte reste du texte.
 CONSIGNE = "Sujet : {sujet}\n\nOuvre la discussion en deux ou trois phrases."
-EN_FACE = "\n\nTu discutes avec {autre}. Réponds-lui directement."
+# La règle qui empêche les deux dérives observées à l'usage : le modèle écrit « bob : » en
+# début de réponse (le nom part alors à la voix : « bob, deux points, … »), et il recopie
+# le message reçu avant d'y répondre. Interdire explicitement est plus sûr que nettoyer
+# après coup — quand la phrase fautive arrive, elle est déjà partie à la synthèse.
+EN_FACE = (
+    "\n\nTu discutes avec {autre}. Tu lui réponds directement, sans écrire « {nom} » ni "
+    "« {autre} » en début de réponse, et sans recopier ce qu'il vient de te dire."
+)
 
 
 @dataclass
@@ -115,6 +125,7 @@ class Dialogue:
         self.personas = (a, b)
         self.sujet = sujet.strip()
         self.tours = max(2, tours)
+        self.mots_max = MOTS_MAX
         # Les répliques produites : (nom du persona, texte). Rendu par `derouler`, ce qui
         # permet aux tests et à la vérification de lire le dialogue sans dépiauger la
         # sortie de la console.
@@ -181,7 +192,8 @@ class Dialogue:
         for personne, autre in ((a, b), (b, a)):
             personne.messages[0] = {
                 "role": "system",
-                "content": personne.profil.prompt + EN_FACE.format(autre=autre.nom),
+                "content": personne.profil.prompt
+                + EN_FACE.format(autre=autre.nom, nom=personne.nom),
             }
 
     def derouler(self) -> list[tuple[str, str]]:
@@ -210,11 +222,27 @@ class Dialogue:
         """Une réplique : sa voix, puis un tour de modèle ordinaire."""
         self.preparer_voix(persona)
         persona.messages.append({"role": "user", "content": entrant})
-        return self.session.tour_modele(
+        tour = self.session.tour_modele(
             persona.messages,
             f"{persona.nom} › ",
             persona.profil.modele,
         )
+        self._avertir_si_bavard(persona, tour.reponse)
+        return tour
+
+    def _avertir_si_bavard(self, persona: Persona, texte: str) -> None:
+        """Prévient quand une réplique part en pavé.
+
+        Un dialogue s'écoute : une réponse de 200 mots avec des titres et des listes dure
+        deux minutes et se lit comme un rapport. Le modèle ne peut pas le savoir — c'est au
+        persona de le dire (voir les exemples du README), et à nous de le signaler.
+        """
+        mots = len(texte.split())
+        if mots > self.mots_max:
+            print(
+                f"  [dialogue] {persona.nom} : réponse de {mots} mots — longue à écouter. "
+                f"Ajouter « au maximum {self.mots_max} mots, pas de listes » à son profil."
+            )
 
     # -------------------------------------------------------------- la voix après
     def _etat_voix(self) -> tuple[str, float, str]:
