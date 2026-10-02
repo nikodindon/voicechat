@@ -1354,4 +1354,4 @@ VOICECHAT_TRACE_TTS=1 .venv/bin/python -m voicechat
 
 ## 12. Licence
 
-MIT — faire ce qu'on veut, sans garantie.
+MIT — voir le fichier `LICENSE`. Faire ce qu'on veut, sans garantie.
