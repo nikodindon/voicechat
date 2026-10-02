@@ -13,6 +13,8 @@ from .audio import Speaker
 from .config import Config, nom_court
 from .editor import ClavierGeneration, LineEditor
 from .llm import LLMError, list_models, stream_with_usage
+from .micro import DetecteurParole, Ecouteur, Microphone
+from .stt import Transcriber
 from .tts import KokoroTTS, SpeechPipeline, list_voices, resolve_device
 
 BANNER = r"""
@@ -43,6 +45,8 @@ COMMANDES: list[tuple[str, str]] = [
     ("/export [fichier]", "écrit la conversation en markdown"),
     ("/voices", "liste les voix Kokoro (nécessite Hugging Face)"),
     ("/device", "liste les sorties audio détectées"),
+    ("/ecoute", "écouter le micro et envoyer ce qui est dit"),
+    ("/micro on|off", "mode mains libres : écoute après chaque réponse"),
     ("/stats", "dernières mesures (latence, débit, RTF du TTS)"),
     ("/debug", "bascule l'affichage des stats à chaque tour"),
 ]
@@ -50,6 +54,13 @@ COMMANDES: list[tuple[str, str]] = [
 NOMS_COMMANDES: list[str] = sorted({nom.split()[0] for nom, _ in COMMANDES})
 
 _AIDE_CLAVIER = """
+Entrée vocale :
+  voicechat --micro          mode mains libres : le micro remplace le clavier
+  /ecoute                    dicter un seul message, puis revenir au clavier
+  /micro on|off              activer ou couper le mode mains libres
+  (Ctrl+C pendant l'écoute rend la main au clavier)
+  voicechat --transcrire f.wav   transcrire un fichier, sans conversation
+
 Pendant une réponse :
   Échap              couper la voix, mais garder la réponse à l'écran
   Ctrl+C             tout couper : génération, synthèse et lecture
@@ -99,6 +110,16 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--continue", dest="reprendre", action="store_true",
                    help="reprendre la dernière conversation sauvegardée")
     p.add_argument("--profil", help="profil de prompt système à charger au démarrage")
+    p.add_argument("--micro", action="store_true",
+                   help="mains libres : écoute le micro après chaque réponse")
+    p.add_argument("--stt-modele", help="modèle Whisper (tiny, base, small, medium, large-v3)")
+    p.add_argument("--stt-device", choices=["auto", "cuda", "cpu"], help="périphérique de transcription")
+    p.add_argument("--stt-langue", help="langue parlée (fr, en…), vide = détection automatique")
+    p.add_argument("--micro-device", help="index ou nom du périphérique d'entrée audio")
+    p.add_argument("--transcrire", metavar="FICHIER",
+                   help="transcrire un fichier audio et sortir (pas de conversation)")
+    p.add_argument("--diag-micro", action="store_true",
+                   help="contrôler le micro (niveau, saturation, réaction du VAD) et sortir")
     p.add_argument("--debug", action="store_true", help="afficher les statistiques à chaque tour")
     p.add_argument("--version", action="version", version=f"voicechat {__version__}")
     return p
@@ -126,6 +147,11 @@ def config_from_args(args: argparse.Namespace) -> Config:
         temperature=args.temperature,
         timeout=args.timeout,
         profil=args.profil,
+        micro=True if args.micro else None,
+        stt_modele=args.stt_modele,
+        stt_device=args.stt_device,
+        stt_langue=args.stt_langue,
+        micro_device=args.micro_device,
         show_stats=True if args.debug else None,
     )
 
@@ -143,6 +169,102 @@ def do_probe(cfg: Config) -> int:
     print(f"OK en {time.monotonic() - t0:.2f} s — {len(modeles)} modèle(s)")
     for nom in modeles:
         print(f"  • {nom}")
+    return 0
+
+
+def do_transcrire(cfg: Config, chemin: str) -> int:
+    """Mode one-shot : transcrire un fichier audio, sans conversation ni voix."""
+    import os
+
+    if not os.path.isfile(chemin):
+        print(f"fichier introuvable : {chemin}")
+        return 2
+
+    print(f"Micro  : chargement de whisper « {cfg.stt_modele} »…")
+    transcriber = Transcriber(
+        modele=cfg.stt_modele, device=cfg.stt_device, langue=cfg.stt_langue
+    )
+    if not transcriber.charger():
+        print(f"[ERREUR] {transcriber.erreur}")
+        return 2
+    print(f"Micro  : whisper « {cfg.stt_modele} » sur {transcriber.device} ({transcriber.compute_reel})")
+
+    try:
+        resultat = transcriber.transcrire_fichier(chemin)
+    except Exception as exc:
+        print(f"[ERREUR] {type(exc).__name__} : {exc}")
+        return 2
+
+    print(f"Fichier: {chemin}")
+    print(f"Résumé : {resultat.resume()}")
+    print()
+    print(resultat.texte or "(rien transcrit)")
+    return 0
+
+
+def do_diag_micro(cfg: Config) -> int:
+    """Contrôle de santé du micro : niveau, saturation, et réaction du VAD."""
+    import numpy as np
+
+    vad = DetecteurParole()
+    if not vad.pret:
+        print(f"[ERREUR] {vad.erreur}")
+        return 2
+
+    micro = Microphone(device=cfg.micro_device)
+    if not micro.available:
+        print(f"[ERREUR] {micro.erreur or 'entrée audio indisponible'}")
+        return 2
+
+    print("Micro  : mesure du bruit de fond pendant 3 s (ne parle pas)…")
+    blocs: list = []
+    probas: list[float] = []
+    with micro:
+        if not micro.pret:
+            print(f"[ERREUR] {micro.erreur}")
+            return 2
+        for _ in range(int(3 * 16000 / DetecteurParole.TAILLE_BLOC)):
+            bloc = micro.lire(1.0)
+            if bloc is None:
+                break
+            blocs.append(bloc)
+            probas.append(vad.probabilite(bloc))
+
+    if not blocs:
+        print("[ERREUR] aucun échantillon reçu du micro")
+        return 2
+
+    x = np.concatenate(blocs)
+    rms = float(np.sqrt((x**2).mean()))
+    db = 20 * np.log10(rms + 1e-12)
+    sature = float((np.abs(x) > 0.99).mean()) * 100
+    parole = sum(1 for p in probas if p >= vad.seuil)
+
+    print(f"  échantillons : {x.size} ({x.size / 16000:.1f} s)")
+    print(f"  niveau       : RMS {rms:.4f} ({db:.1f} dBFS)")
+    print(f"  écrêtage     : {sature:.2f} % des échantillons")
+    print(
+        f"  VAD (seuil {vad.seuil}) : max {max(probas):.3f}, moyen {sum(probas) / len(probas):.3f}"
+        f" — {parole}/{len(probas)} blocs jugés parole"
+    )
+    print()
+
+    if sature > 1.0:
+        print("  ⚠ micro SATURÉ : la reconnaissance sera mauvaise. Baisse le gain :")
+        print("      amixer -c 0 sget Capture      # voir la valeur actuelle")
+        print("      amixer -c 0 sset Capture 25   # ~40 % : bon compromis mesuré")
+        print("    (gain à 100 % = 30 dB : le micro écrête, le signal devient du bruit)")
+    elif db < -50:
+        print("  ⚠ signal très faible : monte un peu le gain de capture.")
+    else:
+        print("  ✓ niveau correct")
+
+    if parole == 0:
+        print("  ℹ aucune parole pendant la mesure : c'est normal si tu t'es tu.")
+        print("    Relance en parlant pour vérifier que le VAD réagit.")
+    print()
+    print("  dicter un message : /ecoute      (dans une session)")
+    print("  mains libres      : voicechat --micro")
     return 0
 
 
@@ -183,6 +305,10 @@ class ChatSession:
         self.frappes = ""  # frappes faites pendant la réponse, rendues au prochain prompt
         self.modeles: list[str] = []  # noms connus du serveur, pour Tab
         self._voix: list[str] | None = None  # voix Kokoro, récupérées une seule fois
+        self.transcripteur: Transcriber | None = None  # chargé au premier besoin
+        self.ecouteur: Ecouteur | None = None
+        self._stt_indisponible = False
+        self.mains_libres = cfg.micro
 
     # ------------------------------------------------------------------ démarrage
     def setup_voice(self) -> None:
@@ -214,6 +340,81 @@ class ChatSession:
         print(f"GPU    : {self.tts.device_reason} → device={self.tts.device}")
         self.speech = SpeechPipeline(self.tts, self.speaker, cleaner=txt.clean_for_speech)
         self.speech.start()
+
+    # ------------------------------------------------------------ entrée vocale
+    def _assurer_stt(self) -> bool:
+        """Charge Whisper au premier besoin, pas au démarrage.
+
+        Une session au clavier ne doit payer ni la seconde de chargement ni les
+        ~330 Mo de VRAM du modèle.
+        """
+        if self.transcripteur is not None and self.transcripteur.pret:
+            return True
+        if self._stt_indisponible:
+            return False
+
+        print(f"Micro  : chargement de whisper « {self.cfg.stt_modele} »…")
+        transcriber = Transcriber(
+            modele=self.cfg.stt_modele,
+            device=self.cfg.stt_device,
+            langue=self.cfg.stt_langue,
+        )
+        if not transcriber.charger():
+            print(f"Micro  : INDISPONIBLE — {transcriber.erreur}")
+            self._stt_indisponible = True
+            return False
+        print(
+            f"Micro  : whisper « {self.cfg.stt_modele} » sur "
+            f"{transcriber.device} ({transcriber.compute_reel})"
+        )
+        self.transcripteur = transcriber
+        return True
+
+    def _assurer_ecouteur(self) -> bool:
+        if self.ecouteur is not None:
+            return True
+        micro = Microphone(device=self.cfg.micro_device)
+        if not micro.available:
+            print(f"Micro  : {micro.erreur or 'entrée audio indisponible'}")
+            self._stt_indisponible = True
+            return False
+        ecouteur = Ecouteur(micro=micro, on_parole=self._debut_de_parole)
+        if not ecouteur.vad.pret:
+            print(f"Micro  : {ecouteur.vad.erreur}")
+            self._stt_indisponible = True
+            return False
+        self.ecouteur = ecouteur
+        return True
+
+    @staticmethod
+    def _debut_de_parole() -> None:
+        """Marqueur visuel : le VAD vient de détecter le début de la parole."""
+        print("  ●", end="", flush=True)
+
+    def dicter(self) -> str | None:
+        """Écoute une phrase au micro et la transcrit. ``None`` si rien d'exploitable.
+
+        Lève KeyboardInterrupt si l'utilisateur fait Ctrl+C pendant l'écoute.
+        """
+        if not self._assurer_stt() or not self._assurer_ecouteur():
+            return None
+
+        assert self.ecouteur is not None and self.transcripteur is not None
+        print("micro  : parlez… (Ctrl+C pour revenir au clavier)")
+        audio = self.ecouteur.ecouter()
+        print()  # termine la ligne des « ● »
+        if audio is None:
+            print("   (rien entendu)")
+            return None
+
+        print(f"   {len(audio) / 16000:.1f} s captées — transcription…")
+        resultat = self.transcripteur.transcrire(audio)
+        if not resultat.texte:
+            print(f"   (transcription vide — {resultat.resume()})")
+            return None
+        print(f"   {resultat.resume()}")
+        print(f"vous (voix) › {resultat.texte}")
+        return resultat.texte
 
     def resolve_model(self) -> bool:
         if self.cfg.model:
@@ -433,6 +634,17 @@ class ChatSession:
         elif cmd == "/device":
             print(self.speaker.describe_devices() if self.speaker else "audio désactivé")
 
+        elif cmd == "/micro":
+            if arg.lower() in ("on", "1", "true", "oui"):
+                self.mains_libres = True
+            elif arg.lower() in ("off", "0", "false", "non"):
+                self.mains_libres = False
+            else:
+                etat = "activé" if self.mains_libres else "désactivé"
+                print(f"mode mains libres : {etat}   (usage : /micro on|off)")
+                return True
+            print(f"mode mains libres {'activé' if self.mains_libres else 'désactivé'}")
+
         elif cmd == "/tts" and arg:
             self.cfg.tts = arg.lower() in ("on", "1", "true", "oui")
             print(f"voix {'activée' if self.cfg.tts else 'coupée'}")
@@ -615,6 +827,9 @@ class ChatSession:
         self.setup_voice()
 
         print()
+        if self.mains_libres:
+            print("Micro  : mode mains libres — parlez après chaque réponse.")
+            print("         Ctrl+C pendant l'écoute rend la main au clavier.")
         print("Tapez votre message, ou collez un texte — Entrée pour l'envoyer.")
         print("/help pour l'aide, /quit pour sortir.")
         if self.conversation:
@@ -622,17 +837,40 @@ class ChatSession:
         print("─" * 60)
 
         while True:
-            try:
-                initial, self.frappes = self.frappes, ""
-                ligne = self.editor.read(initial=initial)
-            except KeyboardInterrupt:
-                print()
-                break
-            if ligne is None:  # Ctrl+D ou fin d'entrée
-                print()
-                break
-            if not ligne:
+            ligne: str | None
+            if self.mains_libres:
+                # Mains libres : c'est le micro qui fournit le message.
+                try:
+                    ligne = self.dicter()
+                except KeyboardInterrupt:
+                    self.mains_libres = False
+                    print("\n[micro] mains libres désactivé — retour au clavier")
+                    continue
+                if not ligne:
+                    continue  # rien entendu : on réécoute
+            else:
+                try:
+                    initial, self.frappes = self.frappes, ""
+                    ligne = self.editor.read(initial=initial)
+                except KeyboardInterrupt:
+                    print()
+                    break
+                if ligne is None:  # Ctrl+D ou fin d'entrée
+                    print()
+                    break
+                if not ligne:
+                    continue
+
+            if ligne.startswith("/ecoute"):
+                try:
+                    dicte = self.dicter()
+                except KeyboardInterrupt:
+                    print("\n[écoute] interrompue")
+                    continue
+                if dicte:
+                    self.ask(dicte)
                 continue
+
             if ligne.startswith("/"):
                 if not self.handle_command(ligne):
                     break
@@ -641,6 +879,8 @@ class ChatSession:
             self.ask(ligne)
 
         print("à bientôt ★")
+        if self.ecouteur:
+            self.ecouteur.micro.fermer()
         if self.speech:
             self.speech.close()
         if self.speaker:
@@ -655,6 +895,10 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.list_voices:
         return do_list_voices()
+    if args.transcrire:
+        return do_transcrire(cfg, args.transcrire)
+    if args.diag_micro:
+        return do_diag_micro(cfg)
     if args.probe:
         return do_probe(cfg)
 

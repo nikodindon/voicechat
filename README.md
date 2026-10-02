@@ -33,9 +33,11 @@ sur la machine avec laquelle on parle. On ne dépend donc jamais d'un service TT
 | **Lecture audio continue** (flux persistant) | ✅ implémenté et vérifié (v0.3) — ~32 ms gagnées par phrase |
 | **Profils de prompt système** (`--profil`, `/profil`) | ✅ implémenté et vérifié (v0.3) |
 | **Export markdown** (`/export`) | ✅ implémenté et vérifié (v0.3) |
+| **Entrée vocale** : micro + VAD Silero v6 + `faster-whisper` (`--micro`, `/ecoute`) | ⚠️ **expérimental** — transcription parfaite depuis un fichier (RTF 0,11 sur GPU), mais la capture micro est hachée par PortAudio sur cette machine : cause racine non identifiée, `parec` est propre (cf. §10) |
+| Transcription d'un fichier, diagnostic micro (`--transcrire`, `--diag-micro`) | ✅ implémenté et vérifié (v0.4) |
 | Sélection GPU `auto/cuda/cpu` | ✅ **GPU opérationnel** — RTF 0,09 (cf. §8 pour l'obligation de build cu126 sur Pascal) |
 | Serveur LLM `100.91.114.49:8080` (niko-1650-super) | ✅ **joignable** — Ornith-1.5-35B-A3B Q4_K_M |
-| Suite de tests hors ligne | ✅ 110 tests passent |
+| Suite de tests hors ligne | ✅ 140 tests passent |
 
 > **Cible réelle du serveur LLM** — `100.91.114.49` = `niko-1650-super` dans le tailnet,
 > llama.cpp exposant une API OpenAI-compatible :
@@ -99,10 +101,18 @@ python3 -m venv .venv
 `requirements.txt` :
 
 ```
-kokoro        # TTS (tire torch automatiquement)
-sounddevice   # lecture audio (PortAudio)
+kokoro         # TTS (tire torch automatiquement)
+sounddevice    # lecture audio (PortAudio)
 numpy
+faster-whisper # reconnaissance vocale locale (v0.4) — tire ctranslate2 et onnxruntime
+av==18.1.0     # épinglé : voir « Pièges d'installation » en §10
+soundfile      # écriture de WAV (tests)
+pytest
 ```
+
+⚠️ La borne sur `av` n'est pas cosmétique : `faster-whisper` déclare `av` sans version,
+donc `pip` installe **PyAV 19**, avec qui il plante à la première transcription
+(`metadata_errors`). Détail et trace en **§10**.
 
 ### ⚠️ Étape obligatoire sur GTX 1050 / Pascal (sm_61)
 
@@ -153,6 +163,11 @@ de commande (l'option gagne). Aucune clé n'est obligatoire : llama.cpp ignore `
 | `VOICECHAT_DATA` | `~/.local/share/voicechat` | dossier des conversations sauvegardées |
 | `VOICECHAT_PROFILS` | `~/.config/voicechat/profils` | dossier des profils de prompt système |
 | `VOICECHAT_PROFIL` | *(vide)* | profil à charger au démarrage |
+| `VOICECHAT_MICRO` | `0` | `1` = démarrer en mains libres |
+| `VOICECHAT_STT_MODELE` | `small` | modèle faster-whisper (`base`, `small`, `medium`, `large-v3`) |
+| `VOICECHAT_STT_DEVICE` | `auto` | appareil de transcription : `auto` / `cuda` / `cpu` |
+| `VOICECHAT_STT_LANGUE` | `fr` | langue forcée ; vide = détection automatique |
+| `VOICECHAT_MICRO_DEVICE` | *(défaut)* | périphérique d'entrée (nom ou index) |
 
 ---
 
@@ -209,8 +224,58 @@ de commande (l'option gagne). Aucune clé n'est obligatoire : llama.cpp ignore `
 | `/export [fichier]` | écrit la conversation en markdown |
 | `/voices` | liste les voix Kokoro |
 | `/device` | liste les sorties audio détectées |
+| `/ecoute` | écoute le micro et envoie ce qui est dit (puis retour clavier) |
+| `/micro on\|off` | bascule le mode mains libres |
 | `/stats` | latences (TTFT, débit en tokens, RTF TTS) |
 | `/debug` | bascule l'affichage des stats à chaque tour |
+
+### Entrée vocale (v0.4 — ⚠️ expérimental)
+
+```bash
+# mode mains libres dès le lancement
+.venv/bin/python -m voicechat --micro
+
+# en session : /ecoute dicte un seul message, puis rend la main au clavier
+vous › /ecoute
+```
+
+Pendant l'écoute, chaque bloc de 32 ms jugé « parole » par le VAD affiche un `●` : on voit
+que le micro est entendu **avant** de connaître la transcription.
+
+La chaîne complète (écoute → découpage → transcription) est mesurée par
+`tests/verif_ecoute.py`, lancé pour de vrai :
+
+```bash
+$ .venv/bin/python tests/verif_ecoute.py
+VAD     : silero v6 chargé (0,02 sur silence, 0,74 sur parole — cf. README)
+VRAM    : 363 MiB
+
+[1/3] phrase à reconnaître : « Allume la lumière du salon et vérifie que la porte est fermée. »
+      audio de 4.05 s préparé (/tmp/verif_ecoute.wav)
+
+[2/3] écoute en parallèle de la lecture (boucle monitor)
+      ● parole détectée
+      énoncé capturé : 3.94 s (source 4.05 s)
+
+[3/3] transcription
+      3.94 s d'audio transcrites en 0.60 s (RTF 0.15) — langue fr (100%)
+      attendu : Allume la lumière du salon et vérifie que la porte est fermée.
+      obtenu  : Aligne l'alignement du salin et vérifie que la porte est fermée.
+```
+
+La fin est juste, le début est haché : c'est le défaut de capture décrit en **§10**. Le
+script ne masque pas l'écart, il le montre — c'est tout son intérêt.
+
+Diagnostic et transcription de fichier, sans conversation :
+
+```bash
+.venv/bin/python -m voicechat --diag-micro          # ton micro est-il exploitable ?
+.venv/bin/python -m voicechat --transcrire a.wav    # transcrire un fichier
+```
+
+**À lire avant d'essayer** : sur cette machine la capture micro est hachée (PortAudio) et le
+micro écrête au gain par défaut. Les deux problèmes, leurs mesures et les contournements
+sont en **§10** — c'est la section à lire en premier si la reconnaissance vous déçoit.
 
 ### Interrompre une réponse
 
@@ -351,6 +416,8 @@ voicechat/
 ├── tts.py          # KokoroTTS (synthèse) + SpeechPipeline (file de phrases → voix → son)
 ├── audio.py        # Speaker : file de tampons audio + thread de lecture PortAudio
 ├── editor.py       # lecture clavier en mode brut : frappe / collage / Entrée
+├── micro.py        # capture micro + VAD Silero v6 + découpage en énoncés (v0.4)
+├── stt.py          # transcription faster-whisper + choix du type de calcul (v0.4)
 ├── store.py        # conversations sauvegardées (JSON, écriture atomique)
 └── cli.py          # boucle console, routage des commandes, orchestration
 tests/              # pytest hors ligne, faux serveur OpenAI, vérifications en pseudo-terminal
@@ -393,6 +460,8 @@ Trois scripts de vérification bout en bout pilotent le vrai CLI dans un pseudo-
 .venv/bin/python tests/verif_interruption.py  # Ctrl+C / Échap
 .venv/bin/python tests/verif_completion.py    # Tab / Ctrl+R
 .venv/bin/python tests/bench_audio.py         # surcoût de lecture par phrase
+.venv/bin/python tests/verif_ecoute.py        # micro → VAD → transcription (boucle monitor)
+.venv/bin/python tests/bench_capture.py       # notre capture vs parec, par corrélation
 ```
 
 ---
@@ -424,10 +493,12 @@ Trois scripts de vérification bout en bout pilotent le vrai CLI dans un pseudo-
 - [x] Profils de prompt système (`--profil`, `/profil`, `/profil save`)
 - [x] Export d'une conversation en markdown (`/export`)
 
-### v0.4 — entrée vocale (mode mains libres)
-- [ ] Capture micro (`sounddevice`) + VAD (détection d'activité vocale)
-- [ ] `faster-whisper` en local pour la reconnaissance (GPU, `small`/`medium`)
-- [ ] Boucle full-duplex : on parle → transcription → LLM → voix
+### v0.4 — entrée vocale (mode mains libres) ⚠️ expérimental
+- [x] Capture micro (`sounddevice`) + VAD (détection d'activité vocale)
+- [x] `faster-whisper` en local pour la reconnaissance (GPU, `small`)
+- [x] Boucle « on parle → transcription → LLM → voix » (`--micro`)
+- [ ] **Qualité de capture** : PortAudio hache la parole sur cette machine (`parec` est
+      propre sur la même source). Cause racine non identifiée — voir §10.
 
 ### v0.5 — voix de meilleure qualité
 - [ ] Mélange de voix Kokoro (mix de styles, cf. `kokoro.StyleTTS`)
@@ -539,6 +610,35 @@ Forcer une sortie : `--output-device 0` (index donné par `query_devices()`).
 
 **La voix prononce mal un mot** → installer `espeak-ng` (`sudo apt install espeak-ng`)
 améliore les mots hors dictionnaire ; c'est optionnel.
+
+**`TypeError: open() got an unexpected keyword argument 'metadata_errors'`** (v0.4)
+`pip` a installé PyAV 19, que `faster-whisper` 1.2.1 ne supporte pas (il ne borne pas `av`).
+```bash
+.venv/bin/pip install "av==18.1.0"
+```
+C'est déjà épinglé dans `requirements.txt` — le problème n'apparaît que sur une install
+où `av` a été mis à jour. Détail en §10.
+
+**Le micro n'entend rien, ou entend la sortie des haut-parleurs** (v0.4)
+La source PulseAudio par défaut est souvent le « monitor » du puits de sortie, pas le micro.
+```bash
+pactl get-default-source                       # est-ce un .monitor ?
+pactl list short sources                       # la vraie liste des micros
+PULSE_SOURCE=alsa_input.pci-0000_00_1f.3.analog-stereo \
+    .venv/bin/python -m voicechat --diag-micro
+```
+`--diag-micro` affiche le niveau, le taux d'écrêtage et la réaction du VAD. Si l'écrêtage est
+élevé, baisser le gain de capture (`amixer -c 0 sset Capture 25`). **Sur cette machine la
+capture est de toute façon hachée** : voir §10 pour l'état exact et les mesures.
+
+**La reconnaissance vocale ne marche pas** — checklist dans l'ordre :
+```bash
+.venv/bin/python -m voicechat --transcrire un_fichier.wav   # 1. whisper seul ? (si OK :)
+.venv/bin/python -m voicechat --diag-micro                  # 2. micro exploitable ?
+.venv/bin/python tests/verif_ecoute.py                      # 3. la chaîne complète ?
+```
+Séparer les trois moitiés (modèle / micro / chaîne) évite de chercher au mauvais endroit,
+exactement comme `--probe` sépare le réseau du GPU.
 
 ---
 
@@ -862,11 +962,274 @@ i = italien, p = portugais, j = japonais, z = chinois, h = hindi
 ```
 
 ⚠️ Kokoro-82M ne propose **qu'une seule voix française : `ff_siwis`** (féminine). Pour varier
-la voix en français sans changer de langue, voir la piste « mélange de styles » en v0.4 de la
+la voix en français sans changer de langue, voir la piste « mélange de styles » en v0.5 de la
 roadmap. Les 53 autres voix servent aux langues ci-dessus.
+
+### Entrée vocale : ce qui a été mesuré (v0.4)
+
+**Premier réflexe, et il a payé** : avant d'écrire une ligne de code vocal, vérifier le micro.
+La source PulseAudio par défaut s'est révélée être le **monitor des haut-parleurs**, pas le
+micro. Le micro réel donne, lui, un signal saturé :
+
+```
+gain 63/63 (100 %) : RMS  -4.9 dBFS  sature=6.8 %   <- réglage d'usine, inutilisable
+gain 40/63 ( 63 %) : RMS -17.2 dBFS  sature=0.2 %
+gain 25/63 ( 40 %) : RMS -30.3 dBFS  sature=0.0 %   <- bon compromis
+gain 15/63 ( 24 %) : RMS -39.0 dBFS  sature=0.0 %
+```
+
+**Le VAD a été choisi par mesure, pas par goût.** Silero est livré dans `faster-whisper` :
+aucune dépendance de plus. Encore fallait-il la bonne interface — v6, pas v5 :
+
+```
+$ .venv/bin/python -c "…/silero_vad_v6.onnx …"
+entrées : input ['seq_len', 576], h [1, 1, 128], c [1, 1, 128]
+sorties : speech_probs, hn, cn
+
+silence          : max 0.024
+bruit faible     : max 0.065
+bruit fort       : max 0.057
+sinusoïde 200 Hz : max 0.419
+parole (Kokoro)  : moyenne 0.741, 196/258 blocs > 0.5
+```
+
+**Le piège d'installation, découvert en le heurtant** :
+
+```
+$ .venv/bin/python -c "from faster_whisper import WhisperModel; …"
+TypeError: open() got an unexpected keyword argument 'metadata_errors'
+```
+
+`faster-whisper` 1.2.1 attend PyAV ≤ 18 ; `pip` installe av 19.0.0 (non borné en amont).
+`av==18.1.0` règle le problème — c'est épinglé dans `requirements.txt`.
+
+**Le type de calcul, mesuré sur la GTX 1050** :
+
+```
+cuda / float16      : Requested float16 compute type, but the target device
+                      or backend do not support efficient float16 computation.
+cuda / float32      : 5.53 s transcrites en 1.08 s (RTF 0.194)
+cuda / int8_float32 : 5.53 s transcrites en 0.59 s (RTF 0.107)   <- retenu
+cpu  / int8         : 5.53 s transcrites en 2.07 s (RTF 0.375)
+```
+
+**Puis le test qui a mal tourné.** En jouant une phrase et en la recapturant, la
+transcription du début était fausse. Un témoin a tranché :
+
+```
+fichier source direct  : Allume la lumière du salon et vérifie que la porte est fermée.   OK
+capté avec parec       : Allume la lumière du salon et vérifie que la porte est fermée.   OK
+capté avec notre code  : Arrime l'alignement du soleil et vérifie la porte aussi.         KO
+```
+
+**Et une conclusion que j'ai dû retirer.** Une comparaison de nombres d'échantillons avait
+laissé croire à « 128 ms perdues sur 8 s ». C'était faux : `parec` et notre capture ne
+couvraient pas la même fenêtre temporelle, et PortAudio signalait bien 0 débordement. La
+piste « perte d'échantillons » est donc écartée — ce qui *n'est pas* la même chose que
+« problème résolu ». La cause reste inconnue ; c'est écrit comme tel en §10.
+
+**Enfin, deux bugs trouvés par les tests, dans notre code** : le pré-roll perdait toujours
+un bloc (le bloc déclencheur était empilé avant le test, donc il évinçait le plus ancien),
+et `int()` au lieu de `round()` sur une division flottante. Les deux sont corrigés, avec les
+tests de régression correspondants.
+
+```
+$ .venv/bin/python -m pytest tests/ -q
+........................................................................ [ 51%]
+....................................................................     [100%]
+140 passed in 12.16s
+```
 
 ---
 
-## 10. Licence
+## 10. Entrée vocale (v0.4) — ⚠️ expérimental
+
+### Ce qu'on peut faire
+
+```bash
+voicechat --micro                  # mains libres : après chaque réponse, il écoute
+voicechat                          # puis /ecoute  : dicter un seul message
+voicechat --transcrire phrase.wav  # transcrire un fichier (ni conversation, ni voix)
+voicechat --diag-micro             # santé du micro : niveau, saturation, réaction du VAD
+```
+
+En session : `/ecoute` dicte un message puis rend la main au clavier, `/micro on|off`
+bascule les mains libres. Pendant une écoute, `Ctrl+C` rend la main au clavier.
+
+La boucle est **séquentielle, pas full-duplex** : on écoute, on transcrit, on génère, on
+parle — le micro n'est **pas** ouvert pendant la lecture de la réponse. C'est délibéré :
+ça supprime d'emblée toute boucle audio (le micro qui se réentend parler).
+
+### Choix techniques
+
+| Point | Choix | Pourquoi |
+|---|---|---|
+| Détection de parole | **Silero v6** via `onnxruntime` | Le modèle est **déjà livré** dans `faster_whisper/assets/silero_vad_v6.onnx` : aucune dépendance de plus. Attention, l'interface v6 n'est pas celle de v5 : entrée de 576 échantillons (64 de contexte + 512 neufs) et états LSTM `h`/`c` séparés. |
+| Découpage | blocs de 512 échantillons (32 ms) | Contrainte du modèle. Pré-roll de 250 ms (pour ne pas couper la première syllabe), fin d'énoncé après 600 ms de silence, énoncés de moins de 350 ms ignorés. |
+| Transcription | `faster-whisper` `small`, `int8_float32`, GPU | Mesures ci-dessous. |
+| Chargement | **à la première utilisation** | Une session au clavier ne doit payer ni 1 s de chargement ni 330 Mo de VRAM. |
+
+### Performances mesurées
+
+Même phrase de 5,53 s, transcrite avec chaque type de calcul :
+
+```
+cuda / float16      : ECHEC (voir « Pièges » plus bas)
+cuda / float32      : 5.53 s transcrites en 1.08 s (RTF 0.194)
+cuda / int8_float32 : 5.53 s transcrites en 0.59 s (RTF 0.107)   <- retenu
+cpu  / int8         : 5.53 s transcrites en 2.07 s (RTF 0.375)
+```
+
+VRAM occupée sur les 4 Go de la GTX 1050 :
+
+```
+au repos                        :  365 MiB
++ whisper small (int8_float32)  :  695 MiB
++ whisper small + Kokoro        : 1335 MiB
+```
+
+Kokoro et Whisper cohabitent donc largement dans les 4 Go.
+
+VAD Silero, probabilité de parole par bloc de 32 ms :
+
+```
+silence          : max 0.024
+bruit faible     : max 0.065
+bruit fort       : max 0.057
+sinusoïde 200 Hz : max 0.419
+parole (Kokoro)  : moyenne 0.741 — 196/258 blocs au-dessus du seuil
+```
+
+### Transcription réelle
+
+```bash
+$ .venv/bin/python -m voicechat --transcrire /tmp/stt1.wav
+Micro  : chargement de whisper « small »…
+Micro  : whisper « small » sur cuda (int8_float32)
+Fichier: /tmp/stt1.wav
+Résumé : 5.53 s d'audio transcrites en 0.73 s (RTF 0.13) — langue fr (100%)
+
+Bonjour, ceci est un test de reconnaissance vocale avec le modèle WISP SMALL.
+```
+
+Le mot attendu était « whisper » : Kokoro le prononce à l'anglaise et Whisper entend
+« WISP ». **C'est une faute de synthèse, pas de reconnaissance.** Sur les autres phrases,
+la transcription est exacte — y compris avec des nombres, où « trente-deux » ressort en
+« 32 », ce qui est même préférable à donner au LLM.
+
+### ⚠️ Limite connue : la capture micro est hachée
+
+**État : cause racine non identifiée.** Ce paragraphe existe pour que personne ne croie
+que le micro est fiable aujourd'hui.
+
+Le protocole : on joue une phrase dans les haut-parleurs et on la recapture via la sortie
+« monitor » de PulseAudio (boucle numérique). Deux clients qui captent le même signal
+doivent produire le *même* audio.
+
+```
+phrase attendue        : Allume la lumière du salon et vérifie que la porte est fermée.
+fichier source direct  : Allume la lumière du salon et vérifie que la porte est fermée.   OK
+capté avec parec       : Allume la lumière du salon et vérifie que la porte est fermée.   OK
+capté avec notre code  : Arrime l'alignement du soleil et vérifie la porte aussi.         KO
+```
+
+`parec` (paquet `pulseaudio-utils`) capture donc proprement la **même source, au même
+moment, à la même fréquence** (16 kHz mono). Notre capture via PortAudio/sounddevice hache
+la parole.
+
+Essayé, sans effet :
+
+- blocs de rappel ×8 et `latency="high"` (contre un éventuel débordement de tampon) ;
+- `onnxruntime` limité à un seul fil (il disputait le GIL au rappel audio de PortAudio) ;
+- capture à la fréquence native 48 kHz puis rééchantillonnage FIR maison (fenêtre de
+  Blackman, décimation 3:1) ;
+- vérification que PortAudio signale bien **0 débordement d'entrée**.
+
+**Piste écartée** : la perte d'échantillons. Une comparaison de longueurs avait laissé
+croire à 128 ms perdues sur 8 s ; c'était faux — les deux captures ne couvraient pas la
+même fenêtre temporelle. Conclusion retirée.
+
+**Mise en garde sur le protocole** : tout ceci est mesuré à travers la boucle « monitor »,
+qui est un chemin particulier. Sur un vrai micro acoustique, le problème n'existe peut-être
+pas du tout. Les trois commandes qui tranchent :
+
+```bash
+.venv/bin/python tests/bench_capture.py   # corrélation entre notre capture et parec
+voicechat --diag-micro                    # niveau, saturation, réaction du VAD
+voicechat --micro                         # et on parle
+```
+
+`tests/bench_capture.py` compare plusieurs méthodes de capture à `parec` par corrélation :
+sur une boucle numérique, elle doit valoir ~1.
+
+### Le micro écrête à 100 % de gain
+
+Indépendamment de ce qui précède, le micro interne de cette machine sature au gain par
+défaut. Mesures (`alsa_input.pci-0000_00_1f.3.analog-stereo`, gain de capture) :
+
+```
+gain 63/63 (100 % = 30 dB) : RMS  -4.9 dBFS   écrêtage 6.8 %   <- inutilisable
+gain 40/63 ( 63 %)         : RMS -17.2 dBFS   écrêtage 0.2 %
+gain 25/63 ( 40 %)         : RMS -30.3 dBFS   écrêtage 0.0 %   <- bon compromis
+gain 15/63 ( 24 %)         : RMS -39.0 dBFS   écrêtage 0.0 %   <- trop bas
+```
+
+`--diag-micro` détecte la saturation et propose la commande :
+
+```bash
+$ .venv/bin/python -m voicechat --diag-micro
+Micro  : mesure du bruit de fond pendant 3 s (ne parle pas)…
+  échantillons : 47616 (3.0 s)
+  niveau       : RMS 0.5387 (-5.4 dBFS)
+  écrêtage     : 4.35 % des échantillons
+  VAD (seuil 0.5) : max 0.244, moyen 0.017 — 0/93 blocs jugés parole
+
+  ⚠ micro SATURÉ : la reconnaissance sera mauvaise. Baisse le gain :
+      amixer -c 0 sget Capture      # voir la valeur actuelle
+      amixer -c 0 sset Capture 25   # ~40 % : bon compromis mesuré
+```
+
+Le taux d'écrêtage varie d'une mesure à l'autre (4 à 26 % selon le bruit du moment) —
+il dépend du ventilateur et de l'activité de la machine.
+
+Bonne nouvelle au passage : même sur ce signal saturé, le VAD ne s'est **pas** laissé
+berner (0 bloc sur 93 déclaré parole). Le détecteur tient ; c'est le signal qui ne vaut rien.
+
+Autre piège système à connaître : la **source PulseAudio par défaut** peut être le
+« monitor » des haut-parleurs et non le micro. Pour forcer le micro :
+`PULSE_SOURCE=alsa_input.pci-0000_00_1f.3.analog-stereo`, ou `--micro-device`.
+
+### Pièges d'installation
+
+**`av` doit être épinglé.** `faster-whisper` 1.2.1 appelle `av.open(..., metadata_errors=…)`,
+paramètre que **PyAV 19 a retiré** — et `faster-whisper` ne borne pas `av` :
+
+```
+TypeError: open() got an unexpected keyword argument 'metadata_errors'
+```
+
+Le log d'installation montre le défaut (c'est `pip` qui prend la dernière version) :
+
+```
+Downloading av-19.0.0-cp312-abi3-manylinux_2_28_x86_64.whl (35.0 MB)
+Successfully installed av-19.0.0 ctranslate2-4.8.2 faster-whisper-1.2.1
+```
+
+`requirements.txt` épingle donc `av==18.1.0`.
+
+**`float16` est à éviter.** C'est le choix « évident »… et le seul qui échoue ici :
+
+```
+Requested float16 compute type, but the target device or backend do not
+support efficient float16 computation.
+```
+
+CTranslate2 le refuse sur Pascal (GTX 1050, sm_61). `voicechat/stt.py` n'essaie jamais
+`float16` et teste dans l'ordre `int8_float32` → `float32` → repli CPU ; deux tests
+verrouillent cette liste pour qu'on ne la « simplifie » pas par erreur.
+
+---
+
+## 11. Licence
 
 MIT — faire ce qu'on veut, sans garantie.

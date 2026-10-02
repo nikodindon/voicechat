@@ -4,6 +4,13 @@ kokoro>=0.9.4
 sounddevice>=0.5
 # Tableaux audio
 numpy>=1.26
+# Reconnaissance vocale locale (v0.4) — tire ctranslate2, onnxruntime et av
+faster-whisper>=1.2
+# av est épinglé : faster-whisper 1.2.1 appelle av.open(..., metadata_errors=...),
+# paramètre que PyAV 19 a retiré. Sans cette borne, pip installe av 19.0.0 et
+# toute transcription lève « TypeError: open() got an unexpected keyword
+# argument 'metadata_errors' ». av 18.1.0 fonctionne (cf. README §10).
+av==18.1.0
 # Tests
 pytest>=8.0
 # Écriture de WAV pour vérifier la synthèse sans haut-parleur

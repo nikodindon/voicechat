@@ -65,6 +65,13 @@ class Config:
     timeout: float = 300.0  # un modèle local peut être lent au 1er token
     profil: str = ""  # profil de prompt système à charger au démarrage
 
+    # entrée vocale
+    micro: bool = False  # --micro : mains libres (écoute après chaque réponse)
+    stt_modele: str = "small"
+    stt_device: str = "auto"  # auto | cuda | cpu
+    stt_langue: str = "fr"  # "" = détection automatique
+    micro_device: int | str | None = None
+
     show_stats: bool = False
     history_limit: int = 24  # nb de messages (hors système) gardés en contexte
 
@@ -81,6 +88,11 @@ class Config:
             device=_env("VOICECHAT_DEVICE", "auto").lower(),
             tts=_env_bool("VOICECHAT_TTS", True),
             profil=_env("VOICECHAT_PROFIL"),
+            micro=_env_bool("VOICECHAT_MICRO", False),
+            stt_modele=_env("VOICECHAT_STT_MODELE", "small"),
+            stt_device=_env("VOICECHAT_STT_DEVICE", "auto").lower(),
+            stt_langue=_env("VOICECHAT_STT_LANGUE", "fr"),
+            micro_device=_env("VOICECHAT_MICRO_DEVICE") or None,
         )
 
     def with_overrides(self, **kwargs) -> "Config":
