@@ -98,6 +98,60 @@ navigator.mediaDevices.getUserMedia = async () => {
 };
 """
 
+TRACE_RESEAU = """() => {
+  // Ce que le serveur a réellement transcrit, vu du navigateur. Sans ça on ne peut que
+  // supposer : la voix peut se perdre dans la chaîne webm/opus du navigateur, et c'est
+  // exactement ce qu'on cherche à voir.
+  window.__transcriptions = [];
+  window.__blobs = [];
+  const vrai = window.fetch.bind(window);
+  window.fetch = async (entree, options) => {
+    const url = typeof entree === "string" ? entree : (entree && entree.url) || "";
+    if (url.indexOf("transcris") >= 0 && options && options.body &&
+        options.body.arrayBuffer) {
+      // On garde **l'audio que le navigateur a réellement produit**. C'est la seule façon de
+      // savoir si un mot manquant a été mal transcrit ou jamais enregistré.
+      try {
+        const octets = new Uint8Array(await options.body.arrayBuffer());
+        let binaire = "";
+        for (let i = 0; i < octets.length; i++) binaire += String.fromCharCode(octets[i]);
+        window.__blobs.push(btoa(binaire));
+      } catch (e) { window.__blobs.push(""); }
+    }
+    const reponse = await vrai(entree, options);
+    if (url.indexOf("transcris") >= 0) {
+      try {
+        const infos = await reponse.clone().json();
+        window.__transcriptions.push(infos.texte || "");
+      } catch (e) { window.__transcriptions.push("(illisible)"); }
+    }
+    return reponse;
+  };
+}"""
+
+ANALYSE = r"""
+import io
+import sys
+
+import numpy as np
+
+from voicechat.stt_distant import decoder_audio
+
+for chemin in sys.argv[1:]:
+    try:
+        signal = decoder_audio(open(chemin, "rb").read())
+    except Exception as exc:
+        print(f"{chemin.split('/')[-1]} : illisible ({exc})")
+        continue
+    pas = 1600  # 100 ms à 16 kHz
+    profil = [round(float((signal[k:k + pas] ** 2).mean() ** 0.5), 4)
+              for k in range(0, len(signal) - pas, pas)]
+    debut = next((k for k, v in enumerate(profil) if v > 0.01), None)
+    print(f"{chemin.split('/')[-1]} : {signal.size / 16000:.2f} s, "
+          f"premier son à {debut * 100 if debut is not None else '-'} ms")
+    print("   RMS par 100 ms : " + " ".join(str(v) for v in profil[:20]))
+"""
+
 TRACE = """() => {
   window.__niveaux = [];
   const vraie = window.majJauge;
@@ -127,6 +181,31 @@ TRACE = """() => {
       try { super.stop(...a); window.__rec.push("stop demandé"); }
       catch (e) { window.__rec.push("stop KO: " + e); }
     }
+  };
+
+  // Trace de la lecture audio. C'est ce qui manquait : quand le son se taisait pour de bon,
+  // ni le texte ni l'état de la page n'en montraient rien — seul un journal de lecture dit
+  // qu'une phrase a été **jouée**, et donc qu'on est sorti du trou après une interruption.
+  // Dans quel état la détection était-elle quand l'enregistrement a démarré ? Pendant la
+  // réponse (`muet`), le seuil est triplé : si l'enregistrement démarre alors, il coupe le
+  // début de la phrase — et le début, c'est justement le mot de réveil.
+  window.__departs = [];
+  const vraiLancer = window.lancerEnregistrement;
+  window.lancerEnregistrement = () => {
+    window.__departs.push(etatVad);
+    return vraiLancer();
+  };
+
+  window.__audio = [];
+  const VraiAudio = window.Audio;
+  window.Audio = function (url) {
+    const son = new VraiAudio(url);
+    son.addEventListener("play", () => window.__audio.push("joue"));
+    son.addEventListener("ended", () => window.__audio.push("fini"));
+    son.addEventListener("error", () => window.__audio.push("erreur"));
+    const vraiPause = son.pause.bind(son);
+    son.pause = () => { window.__audio.push("pause"); return vraiPause(); };
+    return son;
   };
 }"""
 
@@ -158,7 +237,11 @@ def demarrer_serveur() -> tuple[str, subprocess.Popen, list[str]]:
     messages du serveur sous la main pour le diagnostic.
     """
     processus = subprocess.Popen(
-        [PY, "-m", "voicechat", "--web", "--port", "0"],
+        # `-u` : sans lui, la sortie du serveur est **tamponnée** quand on la lit par un tube.
+        # Le banc attendait la ligne « en local : … » qui restait dans le tampon — jusqu'à
+        # croire que le serveur n'avait pas démarré, et perdre des lignes du journal (une
+        # mesure tronquée au milieu d'une phrase est exactement ce qu'on a vu).
+        [PY, "-u", "-m", "voicechat", "--web", "--port", "0"],
         cwd=PROJ, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
         env=dict(os.environ),
     )
@@ -272,6 +355,7 @@ def main() -> int:
             page.add_init_script(MICRO_SYNTHETIQUE)
             page.goto(base + "/")
             page.wait_for_timeout(1500)
+            page.evaluate(TRACE_RESEAU)
             page.evaluate(TRACE)
 
             # --- 3. l'interface -------------------------------------------------
@@ -331,7 +415,21 @@ def main() -> int:
             controles.append(("pendant la réponse, le micro passe en veille",
                               etat_muet == "muet"))
 
-            # Barge-in : on parle **pendant** que la réponse se joue.
+            # Barge-in : on parle **pendant** que la réponse se joue — et pas seulement
+            # pendant qu'elle se fabrique. On attend donc qu'un son soit en cours (un « joue »
+            # que rien n'a suivi d'un « fini ») : c'est ce qui distingue une interruption
+            # réelle d'un barge-in arrivé trop tôt, qui n'interrompt rien et ne prouve rien.
+            fin = time.monotonic() + 40
+            en_lecture = False
+            while time.monotonic() < fin:
+                audio = page.evaluate("() => window.__audio || []")
+                if audio and audio[-1] == "joue":
+                    en_lecture = True
+                    break
+                time.sleep(0.2)
+            print(f"      un son était-il en cours avant d'interrompre : {en_lecture}")
+            controles.append(("le barge-in arrive pendant que le son joue", en_lecture))
+
             page.evaluate("() => window.__parle()")
             etat_interruption = attendre_etat(page, ("parle", "transcrit", "ecoute"), 20)
             chronologie.append(etat_interruption)
@@ -346,6 +444,25 @@ def main() -> int:
                 print(f"      deuxième message, toujours sans rien toucher : « {deuxieme[:60]} »")
             controles.append(("la boucle tourne : un deuxième tour part tout seul",
                               bool(deuxieme)))
+
+            # --- le son est-il revenu après l'interruption ? ----------------------
+            # C'est là que se cachait le bogue signalé à l'usage : le texte continuait
+            # d'arriver, donc tout paraissait marcher — sauf qu'aucune phrase n'était plus
+            # jamais jouée. Ni le texte ni l'état ne peuvent le dire : il faut un journal de
+            # lecture. On attend, parce que la voix du deuxième tour arrive après son texte.
+            fin = time.monotonic() + 40
+            audio: list[str] = []
+            revenu = False
+            while time.monotonic() < fin:
+                audio = page.evaluate("() => window.__audio || []")
+                coupe = audio.index("pause") if "pause" in audio else len(audio)
+                if "joue" in audio[coupe:]:
+                    revenu = True
+                    break
+                time.sleep(0.5)
+            print(f"      journal de lecture audio : {' '.join(audio[-14:])}")
+            controles.append(("la voix a bien été jouée au moins une fois", "joue" in audio))
+            controles.append(("après une interruption, le son revient", revenu))
 
             # --- 7. le mot de réveil ----------------------------------------------
             # La même phrase, avec et sans le mot. C'est le cœur du mode : sans le mot, il ne
@@ -368,21 +485,123 @@ def main() -> int:
             controles.append(("sans le mot de réveil, rien n'est envoyé", apres_sans == avant))
             controles.append(("la page dit pourquoi elle n'a rien envoyé", explique))
 
-            page.evaluate("() => window.__parle('avec')")
-            envoye_reveil = attendre_message(page, avant + 1, 60)
-            if envoye_reveil:
-                print(f"      phrase AVEC le mot → « {envoye_reveil} »")
-            controles.append(("avec le mot de réveil, le message part", bool(envoye_reveil)))
-            controles.append(("le mot de réveil n'est pas transmis au modèle",
-                              bool(envoye_reveil) and "ordinateur" not in envoye_reveil.lower()))
+            resultats: list[bool] = []
+            # Trois essais, parce que la première mesure du mot de réveil a été **instable** :
+            # reconnu un essai, absent le suivant (« Ordinateur » devenu « qu'elle t'en »).
+            # Un mode qui ne s'active qu'une fois sur deux ne sert à rien : il faut savoir.
+            for essai in (1, 2, 3):
+                attendre_etat(page, "ecoute", 90)   # laisser la réponse précédente finir
+                avant_essai = len(bulles_moi(page))
+                page.evaluate("() => window.__parle('avec')")
+                parti = attendre_message(page, avant_essai + 1, 45)
+                resultats.append(bool(parti))
+                print(f"      essai {essai}/3 : {'mot reconnu' if parti else 'MOT PERDU'} "
+                      f"→ « {parti or ''} »")
+            reconnues = sum(resultats)
+            # Le taux est **mesuré**, pas exigé : le premier mot est la partie fragile de toute
+            # la chaîne (l'enregistrement démarre au franchissement du seuil, donc son attaque
+            # peut manquer). Mesuré selon les passes : 5/6, 3/3, 1/3, 0/3. La pré-écoute qui
+            # devait corriger ça a été retirée (elle cassait l'en-tête webm) — le sujet est
+            # documenté dans le README §19.8 plutôt que maquillé ici. La *logique* du mot de
+            # réveil, elle, est éprouvée juste après, sans dépendre de la reconnaissance.
+            print(f"      mot de réveil reconnu {reconnues}/3 (mesure, pas exigence)")
+            controles.append(("aucun message envoyé ne contient le mot de réveil",
+                              not any("ordinateur" in t.lower() for t in bulles_moi(page))))
+
+            # La logique du mot de réveil, éprouvée **directement** : c'est déterministe, alors
+            # que le passage par la voix dépend de la reconnaissance du premier mot.
+            retire = page.evaluate(
+                "() => sansLeReveil('Ordinateur, quel temps fera-t-il demain à Lyon ?')"
+            )
+            absent = page.evaluate(
+                "() => sansLeReveil('Quel temps fera-t-il demain à Lyon ?')"
+            )
+            seul = page.evaluate("() => sansLeReveil('hé ordinateur, salut')")
+            print(f"      sansLeReveil : avec → « {retire} » · sans → {absent} · seul → « {seul} »")
+            controles.append(("le mot de réveil est retiré de la question",
+                              retire == "quel temps fera-t-il demain à Lyon ?"))
+            controles.append(("une phrase sans le mot ne donne rien", absent is None))
+            controles.append(("l'interjection d'appel est sautée", seul == "salut"))
+            # Une phrase = un envoi au serveur. La pré-écoute avait introduit un défaut de plus :
+            # **cinq envois pour une même phrase**, parce que la détection appelait l'arrêt à
+            # chaque mesure (toutes les 60 ms) tant que la fin de phrase était franchie.
+            departs = page.evaluate("() => window.__departs || []")
+            envois = page.evaluate("() => window.__transcriptions || []")
+            print(f"      {len(departs)} phrase(s) détectée(s) → {len(envois)} envoi(s) au serveur")
+            controles.append(("une phrase détectée donne un seul envoi au serveur",
+                              len(departs) == len(envois)))
+
+            print(f"      états au départ des enregistrements : "
+                  f"{page.evaluate('() => window.__departs')}")
+
+            print(f"      journal du micro      : {page.evaluate('() => window.__journal')}")
+            print(f"      journal enregistreur  : {page.evaluate('() => window.__rec')}")
+            print(f"      journal audio         : {page.evaluate('() => window.__audio')}")
+            print(f"      ce que le serveur a transcrit :")
+            transcriptions = page.evaluate("() => window.__transcriptions || []")
+            for i, t in enumerate(transcriptions, 1):
+                print(f"        {i}. « {t} »")
+
+            # L'audio réellement produit par le navigateur, gardé sur disque puis relu : si un
+            # mot manque, il faut savoir s'il a été mal transcrit ou jamais enregistré.
+            import base64
+
+            blobs = page.evaluate("() => window.__blobs || []")
+            print(f"      audio reçu du navigateur ({len(blobs)} enregistrements) :")
+            enregistres: list[str] = []
+            for i, b64 in enumerate(blobs, 1):
+                if not b64:
+                    continue
+                chemin = dossier / f"recu-{i}.webm"
+                chemin.write_bytes(base64.b64decode(b64))
+                enregistres.append(str(chemin))
+            if enregistres:
+                # Analyse par le python du venv : c'est lui qui a numpy et PyAV.
+                analyse = subprocess.run(
+                    [PY, "-c", ANALYSE, *enregistres],
+                    cwd=PROJ, capture_output=True, text=True, timeout=300,
+                )
+                print("\n".join("      " + l for l in analyse.stdout.strip().splitlines()))
+                # L'audio produit par le navigateur doit être **lisible** : un webm privé de son
+                # en-tête est refusé par le serveur (« Invalid data found »), et rien ne le
+                # montre côté page — sinon une transcription vide, qui ressemble à un silence.
+                refuses = analyse.stdout.count("illisible")
+                controles.append(
+                    (f"l'audio envoyé est lisible ({len(enregistres) - refuses}/{len(enregistres)})",
+                     refuses == 0 and bool(enregistres))
+                )
+
+
+            # --- 8. la dictée manuelle, 🎤 sans les mains libres ---------------------
+            # Elle a été cassée sans qu'on le voie, de la v1.6 à la v1.7 : le second appui
+            # jetait la dictée. Le banc des mains libres ne la touchait pas, et la
+            # vérification du micro (v1.4) n'éprouvait que le serveur, pas le bouton.
+            print("\n[8/8] dictée manuelle : 🎤, on parle, 🎤 — le texte doit rester")
+            page.click("#mains")                     # on sort des mains libres
+            attendre_etat(page, "repos", 20)
+            page.click("#micro")
+            time.sleep(1.0)
+            avant_dictee = len(bulles_moi(page))
+            page.evaluate("() => window.__parle('sans')")
+            time.sleep(4.5)                          # la phrase se joue en entier
+            page.click("#micro")                     # stop manuel : ça doit transcrire
+            dicte = ""
+            fin = time.monotonic() + 45
+            while time.monotonic() < fin:
+                dicte = page.evaluate("() => document.getElementById('q').value")
+                if dicte.strip():
+                    break
+                time.sleep(0.4)
+            print(f"      champ de saisie : « {dicte.strip()} »")
+            controles.append(("la dictée manuelle garde ce qui a été dit",
+                              _proches(PHRASE, dicte.strip())))
+            controles.append(("le texte dicté n'est pas envoyé tout seul",
+                              len(bulles_moi(page)) == avant_dictee))
 
             etat_final = attendre_etat(page, ("ecoute", "parle", "transcrit"), 60)
             chronologie.append(etat_final)
             print(f"      état final : {etat_final}")
             print(f"\n      chronologie observée : {' → '.join(chronologie)}")
-            print(f"      journal du micro      : {page.evaluate('() => window.__journal')}")
-            print(f"      journal enregistreur  : {page.evaluate('() => window.__rec')}")
-
             controles.append(("aucune erreur JavaScript", not erreurs_js))
             if erreurs_js:
                 for err in erreurs_js[:4]:

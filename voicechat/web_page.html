@@ -122,6 +122,7 @@ let source = null;        // le flux SSE en cours
 let fileAudio = [];       // phrases à dire, dans l'ordre
 let joue = false;         // une lecture est en cours
 let arretDemande = false;
+let finAudio = null;      // de quoi débloquer l'attente du son en cours (voir `taire`)
 
 // ---------------------------------------------------------------- affichage
 function tour(qui) {
@@ -155,40 +156,56 @@ async function viderFile() {
   if (joue) return;
   joue = true;
   boutonStop.disabled = false;
-  while (fileAudio.length && !arretDemande) {
-    const phrase = fileAudio.shift();
-    try {
-      const reponse = await fetch("parle", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ texte: phrase }),
-      });
-      if (!reponse.ok) {
-        const detail = await reponse.text();
-        panne("voix : HTTP " + reponse.status + " " + detail.slice(0, 120));
-        continue;
+  try {
+    while (fileAudio.length && !arretDemande) {
+      const phrase = fileAudio.shift();
+      try {
+        const reponse = await fetch("parle", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ texte: phrase }),
+        });
+        if (!reponse.ok) {
+          const detail = await reponse.text();
+          panne("voix : HTTP " + reponse.status + " " + detail.slice(0, 120));
+          continue;
+        }
+        const url = URL.createObjectURL(await reponse.blob());
+        await new Promise((fini) => {
+          const son = new Audio(url);
+          // On garde de quoi **débloquer** cette attente depuis l'extérieur : `pause()` ne
+          // déclenche pas `ended`, donc une interruption la laisserait suspendue pour
+          // toujours (voir `taire`).
+          finAudio = fini;
+          const achever = () => { finAudio = null; fini(); };
+          son.onended = achever;
+          son.onerror = achever;   // un format refusé ne doit pas bloquer la file
+          son.play().catch(achever);
+          window.__son = son;   // pour pouvoir l'arrêter depuis le bouton
+        });
+        URL.revokeObjectURL(url);
+      } catch (err) {
+        panne("voix injoignable : " + err);
       }
-      const url = URL.createObjectURL(await reponse.blob());
-      await new Promise((fini) => {
-        const son = new Audio(url);
-        son.onended = fini;
-        son.onerror = fini;   // un format refusé ne doit pas bloquer la file
-        son.play().catch(fini);
-        window.__son = son;   // pour pouvoir l'arrêter depuis le bouton
-      });
-      URL.revokeObjectURL(url);
-    } catch (err) {
-      panne("voix injoignable : " + err);
     }
+  } finally {
+    // Quoi qu'il arrive — fin normale, panne, interruption — la file **doit** rendre la main.
+    // Sans ce `finally`, une seule phrase problématique condamnait le son pour de bon.
+    joue = false;
+    finAudio = null;
+    boutonStop.disabled = true;
   }
-  joue = false;
-  boutonStop.disabled = true;
 }
 
 function taire() {
   arretDemande = true;
   fileAudio = [];
   if (window.__son) { try { window.__son.pause(); } catch (e) {} window.__son = null; }
+  // Indispensable : `pause()` ne déclenche **pas** `ended`, donc sans ce déblocage la file
+  // restait suspendue à jamais et `joue` ne redescendait plus — plus un seul son ne sortait
+  // ensuite, même après avoir coupé le mode mains libres. C'est le bogue que l'usage du
+  // barge-in a révélé, et le bouton Stop avait le même défaut depuis la v1.2.
+  if (finAudio) { const fini = finAudio; finAudio = null; fini(); }
   if (source) { source.close(); source = null; }
   boutonStop.disabled = true;
 }
@@ -715,6 +732,10 @@ function toutArreter() {
 }
 
 boutonMicro.onclick = async () => {
+  // En **dictée manuelle**, un appui pendant l'enregistrement doit **transcrire** ce qui vient
+  // d'être dit. Il passait par `toutArreter()`, qui arrête en jetant : la dictée était perdue
+  // depuis la v1.6 (la v1.4 faisait `enregistreur.stop()`, qui assemble et transcrit).
+  if (enregistreur && !mainsLibres) { enregistreur.stop(); return; }
   if (etatVad !== "repos") { toutArreter(); return; }   // un appui pendant qu'on écoute = stop
   const m = await ouvrirMicro();
   if (!m) return;

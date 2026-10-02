@@ -555,6 +555,14 @@ def test_la_page_offre_les_mains_libres():
     assert 'const REVEIL_DEFAUT = "ordinateur"' in page
     assert "sansLeReveil" in page
     assert "function normaliser(" in page
+    # La file audio doit rendre la main quoi qu'il arrive : `pause()` ne déclenche pas
+    # `ended`, donc une interruption laissait la file suspendue et le son ne revenait plus
+    # jamais (bogue signalé à l'usage, après un barge-in).
+    assert "let finAudio = null;" in page
+    assert "if (finAudio) { const fini = finAudio; finAudio = null; fini(); }" in page
+    # La dictée manuelle garde ce qui vient d'être dit : le second appui passait par
+    # `toutArreter()`, qui arrête en jetant — la dictée était perdue depuis la v1.6.
+    assert "if (enregistreur && !mainsLibres) { enregistreur.stop(); return; }" in page
 
 
 def test_port_zero_du_serveur_web_va_jusqu_a_l_os(monkeypatch):

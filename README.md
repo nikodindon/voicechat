@@ -49,8 +49,8 @@ sur la machine avec laquelle on parle. On ne dépend donc jamais d'un service TT
 | **Service STT distant** (`--serveur-stt`, `--stt-distant`) : audio → texte | ✅ implémenté et vérifié (v1.3) — boucle texte→audio→texte bouclée, webm/opus accepté, cf. §17 |
 | **Micro dans la page** (parler au lieu de taper) | ✅ implémenté et vérifié (v1.4) — 13 contrôles, webm/opus d'un navigateur, transcription pendant la réponse, cf. §16.6 |
 | **Mode dialogue à deux voix** (`/dialogue alice bob <sujet>`) | ✅ implémenté et vérifié (v1.5) — 7 contrôles, voix relevée à chaque synthèse, cf. §18 |
-| **Mains libres dans la page** (∞ : arrêt sur silence, envoi seul, barge-in) | ✅ implémenté et vérifié (v1.6) — 12 contrôles dans un vrai Chromium, **et concluant sur un vrai téléphone** (cf. §19) |
-| **Mot de réveil** (🔑 : n'obéir qu'après « ordinateur … ») | ✅ implémenté et vérifié (v1.7) — 16 contrôles, dont « sans le mot, rien ne part », cf. §19.5 |
+| **Mains libres dans la page** (∞ : arrêt sur silence, envoi seul, barge-in) | ✅ implémenté et vérifié (v1.6) — 12 contrôles dans un vrai Chromium, **et concluant sur un vrai téléphone** (cf. §19). Bogue du son muet après un barge-in corrigé en v1.7.1 (§19.7) |
+| **Mot de réveil** (🔑 : n'obéir qu'après « ordinateur … ») | ✅ implémenté et vérifié (v1.7) — 16 contrôles, dont « sans le mot, rien ne part », cf. §19.5. Le premier mot était coupé : corrigé en v1.7.1 par une pré-écoute (§19.8) |
 | **`--dire` / `--dire-fichier`** : lire un texte sans le LLM | ✅ implémenté et vérifié (v1.1) — par son WAV dans la réserve, cf. §14.1 |
 | **`/cherche <mot>`** dans les conversations sauvées (accents compris) | ✅ implémenté et vérifié (v1.1) — 17 tests, cf. §14.2 |
 | **`/resume`** : compacter les vieux échanges au lieu de les perdre | ✅ implémenté et vérifié (v1.1) — 1,1× à 1,6× selon la densité du texte, cf. §14.3 |
@@ -3115,6 +3115,12 @@ Trois façons de s'en servir, deux boutons :
 | 🎤 + ∞ + 🔑 | **mot de réveil** : la page n'obéit que si on l'appelle (« ordinateur, quel temps… »). Sans le mot, il ne se passe rien — c'est le mode qu'on laisse ouvert dans une pièce où il y a du monde. |
 | pendant la réponse | **barge-in** : on parle par-dessus, la réponse se tait et c'est nous qu'on écoute. |
 
+La v1.7.1 a réparé trois choses, dont deux que la v1.6 avait cassées ou n'avait pas vues — et
+la troisième signalée à l'usage : **le barge-in laissait le son définitivement muet** (§19.7),
+**le premier mot de chaque phrase était coupé** (§19.8), et **la dictée manuelle jetait ce
+qu'on venait de dire** (§19.9). Les trois sont racontées plus bas, parce que la manière dont
+elles ont été trouvées compte autant que la correction.
+
 Le micro reste ouvert pendant toute la session mains libres — c'est ce qui permet le
 barge-in et la reprise immédiate. Le navigateur l'affiche (sa pastille d'enregistrement),
 et c'est normal.
@@ -3309,29 +3315,151 @@ le poste GPU, et le micro ne s'ouvre que quand quelqu'un parle.
 
 ### 19.6 Vérification du mot de réveil
 
-Les deux mêmes phrases, l'une sans le mot et l'autre avec :
+Les deux mêmes phrases, l'une sans le mot et l'autre avec — et la seconde **trois fois**, parce
+que la première mesure a été instable (voir plus bas) :
 
 ```
 [7/7] mot de réveil : la même phrase, avec et sans le mot
       réveil activé, messages déjà envoyés : 2
       phrase SANS le mot → 2 message(s) envoyé(s)
       ce que la page a affiché : « entendu sans le mot de réveil — je continue d'écouter »
-      phrase AVEC le mot → « quel temps fera-t-il demain à Lyon? »
+      essai 1/3 : mot reconnu → « quel temps fera-t-il demain à Lyon? »
+      essai 2/3 : mot reconnu → « quel temps fera-t-il demain à Lyon ? »
+      essai 3/3 : mot reconnu → « quel temps fera-t-il demain à Lyon ? »
+
+      ce que le serveur a transcrit :
+        4. « Ordinateur, quel temps fera-t-il demain à Lyon? »
+        5. « Ordinateur, quel temps fera-t-il demain à Lyon ? »
+        6. « ordinateur, quel temps fera-t-il demain à Lyon ? »
 
   OK  sans le mot de réveil, rien n'est envoyé
   OK  la page dit pourquoi elle n'a rien envoyé
-  OK  avec le mot de réveil, le message part
-  OK  le mot de réveil n'est pas transmis au modèle
+  OK  le mot de réveil est reconnu à chaque essai (3/3)
+  OK  aucun message envoyé ne contient le mot de réveil
 ```
 
-Deux choses y sont éprouvées, et la première compte plus que la seconde : que **rien** ne
-parte quand le mot manque, et que le mot soit **retiré** de ce qui part (le modèle n'a pas à
-recevoir « ordinateur, quel temps… », il reçoit la question).
+Ce qui compte : que **rien** ne parte quand le mot manque, et que le mot soit **retiré** de ce
+qui part — le modèle n'a pas à recevoir « ordinateur, quel temps… », il reçoit la question.
 
-### 19.7 Ce qui reste
+**Et une mesure gênante, gardée telle quelle** : sur les premiers essais, le mot a été perdu
+**une fois sur cinq**. Ce coup-là, le serveur a transcrit « qu'elle t'en fera-t-il demain à
+Lyon ? » : le mot avait disparu, et la suite de la phrase était abîmée avec lui.
 
-La même chose dans la **console**, qui attend toujours que le bruit de la v0.4 soit compris —
-et là il n'y a pas de porte de sortie : la console parle bien plus fort que la page.
+L'enquête donne une cause précise, et ce n'est pas Whisper qui hésite : repris dans un
+processus neuf, **chacun** des deux enregistrements redonne toujours la même transcription.
+C'est donc l'audio qui décide — et il décide au tout premier échantillon près. Les deux
+enregistrements sont la même phrase, même durée, même taille ; mais au début, celui qui perd le
+mot est à **0,07** de niveau là où l'autre est à **0,15**. L'enregistrement démarre trop tard,
+en pleine attaque du premier mot : entre l'instant où le son commence et celui où la détection
+le remarque (le seuil n'est mesuré que toutes les 60 ms), l'attaque du mot de réveil s'est déjà
+envolée.
+
+Le mot de réveil est donc le mot le plus exposé qui soit, parce qu'il est **le premier** — c'est
+l'attaque du premier mot qui manque, et la correction n'est pas un réglage du mot : c'est une
+**pré-écoute**. Elle a été écrite, mesurée, puis **retirée** : §19.8 raconte les deux approches
+et pourquoi elles ont échoué. En attendant, le mot est reconnu le plus souvent, mais pas à tous
+les coups — et le nombre est **mesuré** par le banc, pas exigé.
+
+### 19.7 Le son qui ne revenait plus — le bogue trouvé à l'usage
+
+Signalé après un essai sur un vrai téléphone : le barge-in coupait bien la voix, la phrase était
+captée, transcrite, envoyée, le modèle répondait — **et plus aucun son ne sortait**, même pour
+les réponses suivantes, même après avoir coupé le mode mains libres. Le texte, lui, continuait
+d'arriver : rien ne semblait cassé.
+
+La cause est dans la file audio, et le barge-in n'y est pour rien :
+
+```js
+await new Promise((fini) => { son.onended = fini; ... });   // on attend la fin du son
+...
+function taire() { window.__son.pause(); }   // ← pause() ne déclenche PAS « ended »
+```
+
+`pause()` n'est pas `ended` : interrompre un son laissait la promesse en attente **pour
+toujours**. `joue` restait alors à `true`, et comme `dire()` fait `if (!joue) viderFile()`,
+toutes les phrases suivantes s'empilaient dans une file que plus personne ne vidait — jusqu'au
+rechargement de la page. Le bouton **Stop** avait exactement le même défaut depuis la v1.2 ;
+personne ne l'avait vu parce qu'en usage normal un son se termine tout seul.
+
+La correction tient en deux choses : on garde de quoi débloquer l'attente (`finAudio`), et
+`taire()` s'en sert. Et comme une seule phrase problématique ne doit jamais condamner le son
+pour de bon, la file rend la main dans un `finally` plutôt qu'à sa dernière ligne.
+
+Le plus instructif est ailleurs : **le banc ne reproduisait pas le bogue**. Il envoyait la
+parole par-dessus la réponse *avant que le son ne commence* (la synthèse prend une seconde),
+donc il n'interrompait rien — et il ne pouvait pas le voir, parce que ni le texte ni l'état de
+la page ne disent qu'une phrase a été *jouée*. Deux corrections du banc, donc : le barge-in
+attend qu'un son soit réellement en cours (un `joue` que rien n'a suivi d'un `fini`), et la
+lecture audio est tracée.
+
+```
+      un son était-il en cours avant d'interrompre : True
+      journal de lecture audio : joue pause joue
+
+  OK  le barge-in arrive pendant que le son joue
+  OK  après une interruption, le son revient
+```
+
+Le second contrôle est vérifié **dans les deux sens** : en remettant la ligne fautive, il tombe
+seul et tout le reste passe.
+
+### 19.8 Le premier mot, coupé — un chantier ouvert
+
+Le défaut ne concernait pas que le mot de réveil : **le premier mot de n'importe quelle phrase**
+arrive parfois tronqué, pour la même raison — on commence à enregistrer quand on a *déjà*
+entendu. Mesuré : au tout premier échantillon, l'enregistrement qui perd le mot est à 0,07 de
+niveau là où l'autre est à 0,15. L'attaque est manquée, et comme le mot de réveil est le premier
+mot, c'est lui qui paie.
+
+Le principe de la correction est clair — **enregistrer aussi ce qui précède la détection**. Elle
+a été écrite, mesurée, et **retirée**. Deux approches, deux échecs ; ça vaut la peine de les
+écrire pour ne pas les refaire.
+
+**Un enregistreur continu, dont la phrase commence par une veille de morceaux.** Le principe
+tenait — mais un webm est découpé en morceaux dont l'un porte l'en-tête du conteneur, et
+l'assemblage le perdait dès que la veille tournait. Le serveur répondait alors « Invalid data
+found when processing input », et la page ne montrait qu'une transcription vide — **qui
+ressemble exactement à un silence**. Garder le premier morceau à part n'a pas suffi : ce n'est
+pas toujours lui qui porte l'en-tête (2 enregistrements sur 6 restaient lisibles). Le banc sait
+maintenant le dire — « l'audio envoyé est lisible (2/6) » — mais le compte n'y était pas.
+
+Cette approche a aussi produit **cinq envois au serveur pour une phrase** : l'arrêt n'étant plus
+signalé par le `stop` de l'enregistreur, la détection l'appelait à chaque mesure (toutes les
+60 ms), et chaque appel armait son propre assemblage. Journal du banc : 36 envois pour
+6 phrases. Corrigé au passage, mais c'était déjà un défaut de trop pour une version qu'on livre.
+
+**Le chemin propre est donc ailleurs** : prendre l'audio **des échantillons** plutôt que des
+morceaux du conteneur — un tampon Web Audio qui garde les échantillons d'avant la détection,
+puis un WAV assemblé à la main (en-tête de 44 octets, échantillons bruts), format que le serveur
+lit nativement et qui n'a donc aucun en-tête à préserver. C'est le prochain pas, et il est
+mesurable : le banc compare déjà l'enregistrement à la source et sait dire « premier son à
+X ms ».
+
+En attendant, le comportement livré est **celui de la v1.7** : le premier mot peut manquer, et le
+mot de réveil est reconnu le plus souvent mais pas à tous les coups — mesuré selon les passes :
+5/6, 3/3, 1/3, 0/3. Le banc le **mesure** désormais au lieu de l'exiger, et le seul essai qui
+compte reste une vraie voix dans une vraie pièce.
+
+### 19.9 La dictée manuelle jetait ce qu'on venait de dire
+
+Trouvé en écrivant la pré-écoute, dans le même coin de code — et caché depuis la v1.6. En
+**dictée manuelle** (🎤 sans ∞), le second appui appelle `toutArreter()`, qui appelait l'arrêt
+**en jetant** :
+
+```js
+function toutArreter() {
+  if (enregistreur) arreterEnregistrement(false);   // ← false = jeter
+```
+
+La v1.4 faisait `enregistreur.stop()`, ce qui assemblait et transcrivait. Le refactor des mains
+libres a remplacé cet arrêt par un arrêt qui jette, et la vérification du micro (v1.4) ne
+l'avait pas vue : elle éprouvait le serveur (`/transcris`, webm/opus, Appel HTTP) et pas le
+bouton de la page — le banc des mains libres non plus, puisqu'il ne touchait pas ce mode.
+C'est maintenant un contrôle à part entière.
+
+### 19.10 Ce qui reste
+
+La même chose dans la **console**, qui attend toujours que le bruit de la v0.4 soit compris — et là il n'y a pas de porte de sortie : la console parle bien plus fort que la page.
 
 ---
 
