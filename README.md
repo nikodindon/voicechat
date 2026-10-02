@@ -49,7 +49,7 @@ sur la machine avec laquelle on parle. On ne dépend donc jamais d'un service TT
 | **Service STT distant** (`--serveur-stt`, `--stt-distant`) : audio → texte | ✅ implémenté et vérifié (v1.3) — boucle texte→audio→texte bouclée, webm/opus accepté, cf. §17 |
 | **Micro dans la page** (parler au lieu de taper) | ✅ implémenté et vérifié (v1.4) — 13 contrôles, webm/opus d'un navigateur, transcription pendant la réponse, cf. §16.6 |
 | **Mode dialogue à deux voix** (`/dialogue alice bob <sujet>`) | ✅ implémenté et vérifié (v1.5) — 7 contrôles, voix relevée à chaque synthèse, cf. §18 |
-| **Mains libres dans la page** (∞ : arrêt sur silence, envoi seul, barge-in) | ✅ implémenté et vérifié (v1.6) — 12 contrôles dans un vrai Chromium, cf. §19 |
+| **Mains libres dans la page** (∞ : arrêt sur silence, envoi seul, barge-in) | ✅ implémenté et vérifié (v1.6) — 12 contrôles dans un vrai Chromium, **et concluant sur un vrai téléphone** (cf. §19) |
 | **`--dire` / `--dire-fichier`** : lire un texte sans le LLM | ✅ implémenté et vérifié (v1.1) — par son WAV dans la réserve, cf. §14.1 |
 | **`/cherche <mot>`** dans les conversations sauvées (accents compris) | ✅ implémenté et vérifié (v1.1) — 17 tests, cf. §14.2 |
 | **`/resume`** : compacter les vieux échanges au lieu de les perdre | ✅ implémenté et vérifié (v1.1) — 1,1× à 1,6× selon la densité du texte, cf. §14.3 |
@@ -616,9 +616,13 @@ meilleur endroit pour les montrer.
 - [x] **Service STT distant** (`--serveur-stt`), symétrique du serveur TTS : le client
       envoie l'**audio**, le service rend le **texte**. Vérifié de bout en bout, webm/opus
       d'un navigateur compris (cf. §17).
-- [x] **Micro dans la page** : enregistrer, envoyer le webm/opus, recevoir le texte. Le
+- [x] **Mains libres dans la page** : enregistrer, envoyer le webm/opus, recevoir le texte. Le
       téléphone n'a ni GPU ni Whisper — c'est le poste GPU qui transcrit. Vérifié, y
       compris une transcription **pendant** que le modèle répond (cf. §16.6).
+- [x] **Dictée continue, arrêt sur silence et barge-in** (v1.6) : le chantier ouvert depuis la
+      v0.4, traité dans la page — le micro du navigateur ne passe pas par PortAudio, donc le
+      bruit de §10 ne le concerne pas. Vérifié dans un vrai Chromium, **et sur un vrai
+      téléphone** (cf. §19).
 
 ### Deux voix — le mode dialogue ✅ (livré en v1.5)
 
@@ -3229,12 +3233,23 @@ $ python3 tests/verif_mains_libres.py
   OK  aucune erreur JavaScript
 ```
 
-**Ce que ce banc ne peut pas juger, et qu'il faut essayer à la main sur un téléphone** :
-l'acoustique. Ici le haut-parleur ne sort aucun son, donc l'anti-écho n'a rien à annuler.
-Le jour où la réponse sort par le vrai haut-parleur et rentre dans le vrai micro, c'est le
-navigateur qui doit la soustraire — et c'est là qu'on saura si le barge-in est utilisable ou
-s'il s'interrompt tout seul. Le facteur `margeBargeIn` (seuil × 3 pendant la réponse) est là
-pour ça, mais il ne remplace pas un essai réel.
+**Ce que ce banc ne peut pas juger — et l'essai réel.** Ici le haut-parleur ne sort aucun
+son, donc l'anti-écho n'a rien à annuler : le banc ne pouvait éprouver que la **mécanique**
+du barge-in (est-ce que parler pendant la réponse la coupe et ouvre l'écoute ?), pas son
+acoustique.
+
+Essai réel sur un téléphone, par-dessus HTTPS (`tailscale serve`) : **concluant**. Le mode
+mains libres fonctionne de bout en bout — on parle, ça s'arrête tout seul, le texte part
+sans rien toucher, la réponse se joue, l'écoute reprend.
+
+Ce point-là est le plus important du projet : c'est celui que la roadmap donnait pour bloqué
+depuis la v0.4 (§10). Il ne l'est plus — non pas parce que le bruit de PortAudio a été
+compris, mais parce que le micro du navigateur ne passe pas par PortAudio du tout.
+
+Reste à préciser par l'usage, et ce n'est **pas** mesuré : le barge-in en acoustique réelle.
+Le banc n'en a montré que la mécanique, et un « ça marche bien » ne dit pas si l'anti-écho
+suffit quand la réponse sort fort du haut-parleur. Si l'assistant s'interrompt tout seul, le
+premier bouton à tourner est `margeBargeIn` (seuil × 3 pendant la réponse).
 
 ### 19.5 Ce qui reste
 
