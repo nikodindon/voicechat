@@ -1,0 +1,57 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "voicechat"
+# La version vit dans voicechat/__init__.py : une seule source de vérité, lue
+# statiquement par setuptools (pas d'import au moment de la construction).
+dynamic = ["version"]
+description = "Chat en console avec un LLM local (API OpenAI-compatible) qui répond aussi à voix haute, via Kokoro TTS et faster-whisper."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { file = "LICENSE" }
+authors = [{ name = "nikodindon" }]
+keywords = ["llm", "tts", "kokoro", "whisper", "console", "llama.cpp", "local"]
+classifiers = [
+    "Environment :: Console",
+    "Intended Audience :: End Users/Desktop",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Topic :: Multimedia :: Sound/Audio :: Speech",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+dependencies = [
+    # Synthèse vocale (tire torch).
+    "kokoro>=0.9.4",
+    # Lecture audio (PortAudio) et fichiers WAV.
+    "sounddevice>=0.5",
+    "soundfile>=0.13",
+    "numpy>=1.26",
+    # Reconnaissance vocale locale (tire ctranslate2, onnxruntime et av).
+    "faster-whisper>=1.2",
+    # av est épinglé : faster-whisper 1.2.1 appelle av.open(..., metadata_errors=...),
+    # paramètre que PyAV 19 a retiré. Sans cette borne, toute transcription lève
+    # « TypeError: open() got an unexpected keyword argument 'metadata_errors' ».
+    "av==18.1.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+
+[project.scripts]
+voicechat = "voicechat.cli:main"
+
+[project.urls]
+Repository = "https://github.com/nikodindon/voicechat"
+
+[tool.setuptools.dynamic]
+version = { attr = "voicechat.__version__" }
+
+[tool.setuptools.packages.find]
+# `tests/` n'est pas un paquet à installer : on ne prend que le code du produit.
+include = ["voicechat*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

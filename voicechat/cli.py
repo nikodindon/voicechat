@@ -11,7 +11,16 @@ from pathlib import Path
 
 from . import __version__, store, text as txt
 from .audio import Speaker
-from .config import DEFAULT_LANG, DEFAULT_SPEED, DEFAULT_VOICE, Config, nom_court
+from .cache import CacheAudio
+from .config import (
+    DEFAULT_LANG,
+    DEFAULT_SPEED,
+    DEFAULT_VOICE,
+    Config,
+    lire_config,
+    nom_court,
+)
+from .distant import PORT_DEFAUT, TTSDistant
 from .editor import ClavierGeneration, LineEditor
 from .llm import Connexion, LLMError, list_models, premier_serveur, stream_with_usage
 from .micro import DetecteurParole, Ecouteur, Microphone
@@ -19,6 +28,7 @@ from .stt import Transcriber
 from .tts import (
     KokoroTTS,
     SpeechPipeline,
+    Synthetiseur,
     analyser_voix,
     decrire_voix,
     est_melange,
@@ -57,6 +67,7 @@ COMMANDES: list[tuple[str, str]] = [
     ("/ecoute", "écouter le micro et envoyer ce qui est dit"),
     ("/micro on|off", "mode mains libres : écoute après chaque réponse"),
     ("/rejoue", "réentendre les phrases non synthétisées (GPU revenu)"),
+    ("/cache", "état de la réserve d'audio déjà synthétisé (`/cache vider`)"),
     ("/stats", "dernières mesures (latence, débit, RTF du TTS)"),
     ("/debug", "bascule l'affichage des stats à chaque tour"),
 ]
@@ -114,6 +125,14 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--device", choices=["auto", "cuda", "cpu"], help="périphérique de synthèse")
     p.add_argument("--output-device", help="index ou nom du périphérique de sortie audio")
     p.add_argument("--no-tts", action="store_true", help="désactiver complètement la voix")
+    p.add_argument("--no-cache", action="store_true",
+                   help="ne pas réutiliser l'audio des phrases déjà synthétisées")
+    p.add_argument("--tts-distant", metavar="URL",
+                   help="synthétiser sur un autre poste (ex. http://niko-tv:8090)")
+    p.add_argument("--serveur-tts", action="store_true",
+                   help="tenir le service TTS pour d'autres postes, puis sortir")
+    p.add_argument("--port", type=int, default=PORT_DEFAUT,
+                   help=f"port du service TTS (défaut : {PORT_DEFAUT})")
     p.add_argument("--temperature", type=float, help="température d'échantillonnage")
     p.add_argument("--timeout", type=float, help="délai max en secondes par requête")
     p.add_argument("--probe", action="store_true", help="tester la joignabilité du serveur et sortir")
@@ -137,7 +156,12 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def config_from_args(args: argparse.Namespace) -> Config:
-    cfg = Config.from_env()
+    # Le fichier TOML est lu ici, une seule fois : ses réglages servent de valeurs par
+    # défaut, que les variables d'environnement puis les arguments surclassent.
+    base, avertissement = lire_config()
+    if avertissement:
+        print(f"[config] {avertissement}")
+    cfg = Config.from_env(base)
     out_dev = args.output_device
     if out_dev is not None:
         try:
@@ -160,6 +184,8 @@ def config_from_args(args: argparse.Namespace) -> Config:
         device=args.device,
         output_device=out_dev,
         tts=False if args.no_tts else None,
+        cache=False if args.no_cache else None,
+        tts_url=args.tts_distant.rstrip("/") if args.tts_distant else None,
         temperature=args.temperature,
         timeout=args.timeout,
         profil=args.profil,
@@ -331,9 +357,10 @@ class ChatSession:
         # Déclarés avant tout le reste : l'application du profil (juste en dessous)
         # passe par `_reglages_profil`, qui regarde `self.tts` pour savoir si le TTS
         # est déjà chargé. Sans ça, --profil plantait sur un AttributeError.
-        self.tts: KokoroTTS | None = None
+        self.tts: Synthetiseur | None = None
         self.speaker: Speaker | None = None
         self.speech: SpeechPipeline | None = None
+        self.cache: CacheAudio | None = None
         self.profil = ""
         if cfg.profil:  # --profil : le prompt système vient d'un fichier
             try:
@@ -378,8 +405,35 @@ class ChatSession:
             self.cfg.tts = False
             return
 
+        if cfg.tts_url:
+            # Poste léger : aucune synthèse locale, donc ni torch ni GPU ici.
+            print(f"Voix   : synthèse déportée vers {cfg.tts_url}")
+            self.tts = TTSDistant(
+                url=cfg.tts_url,
+                voice=cfg.voice,
+                lang_code=cfg.lang,
+                speed=cfg.speed,
+                timeout=max(30.0, cfg.timeout),
+            )
+            if not self.tts.load():
+                print(f"Voix   : {self.tts.load_error}")
+                print("         (le chat continue en texte)")
+                self.cfg.tts = False
+                self.tts = None
+                return
+            print(f"Distant: {self.tts.device_reason}")
+            self._brancher_pipeline()
+            return
+
         print(f"Voix   : chargement de Kokoro « {decrire_voix(cfg.voice)} »…")
-        self.tts = KokoroTTS(voice=cfg.voice, lang_code=cfg.lang, speed=cfg.speed, device=cfg.device)
+        self.cache = CacheAudio(actif=cfg.cache)
+        self.tts = KokoroTTS(
+            voice=cfg.voice,
+            lang_code=cfg.lang,
+            speed=cfg.speed,
+            device=cfg.device,
+            cache=self.cache,
+        )
         if not self.tts.load():
             print(f"Voix   : INDISPONIBLE — {self.tts.load_error}")
             print("         (le chat continue en texte ; voir README §8)")
@@ -388,6 +442,15 @@ class ChatSession:
             return
 
         print(f"GPU    : {self.tts.device_reason} → device={self.tts.device}")
+        if self.cache is not None:
+            etat = "active" if cfg.cache else "désactivée (--no-cache)"
+            print(f"Réserve: {etat} — {self.cache.dossier}")
+        self._brancher_pipeline()
+
+    def _brancher_pipeline(self) -> None:
+        """Met en route la file de synthèse, que le TTS soit local ou distant."""
+        if self.tts is None or self.speaker is None:
+            return
         self.speech = SpeechPipeline(self.tts, self.speaker, cleaner=txt.clean_for_speech)
         self.speech.start()
 
@@ -688,6 +751,8 @@ class ChatSession:
         self.last_stats = usage.resume()
         if self.tts and self.tts.audio_s > 0:
             self.last_stats += f" | TTS RTF {self.tts.rtf:.2f}"
+        if self.cache is not None and self.cache.hits:
+            self.last_stats += f" | réserve {self.cache.hits} reprise(s)"
         if interrompu:
             self.last_stats += " | réponse tronquée"
         if coupee:
@@ -792,6 +857,21 @@ class ChatSession:
         elif cmd == "/tts" and arg:
             self.cfg.tts = arg.lower() in ("on", "1", "true", "oui")
             print(f"voix {'activée' if self.cfg.tts else 'coupée'}")
+
+        elif cmd == "/cache":
+            if self.cache is None:
+                print("réserve inactive (voix désactivée dans cette session)")
+            elif arg.lower() in ("vider", "vide", "clear", "reset"):
+                combien = self.cache.vider()
+                print(f"réserve vidée : {combien} fichier(s) retiré(s)")
+                print("  (les phrases seront resynthétisées au prochain passage)")
+            else:
+                print(f"réserve : {self.cache.dossier}")
+                print(f"  {self.cache.resume()}")
+                if self.tts:
+                    print(f"  ~{self.tts.temps_economise_s:.2f} s de synthèse évitées "
+                          f"(estimation d'après le RTF de la session)")
+                print("  vider : /cache vider")
 
         elif cmd == "/rejoue":
             if not self.speech:
@@ -991,6 +1071,16 @@ class ChatSession:
         if not self.resolve_model():
             return 2
 
+        # Réglages propres à ce modèle, s'ils existent dans le fichier de configuration.
+        # On le fait ici : le modèle vient d'être résolu, et la voix n'est pas encore
+        # chargée — le TTS démarrera donc directement avec la bonne.
+        self.cfg, ajustes = self.cfg.pour_modele(self.cfg.model)
+        if ajustes:
+            details = ", ".join(f"{c}={v}" for c, v in sorted(ajustes.items()))
+            print(f"Modèle : réglages du fichier de configuration — {details}")
+            if "system" in ajustes:
+                self.messages[0] = {"role": "system", "content": self.cfg.system}
+
         if self.profil:
             print(f"Profil : {self.profil}")
 
@@ -1062,6 +1152,52 @@ class ChatSession:
 
 
 # ------------------------------------------------------------------------ entrée
+def do_serveur_tts(cfg: Config, port: int) -> int:
+    """Tient le service TTS pour d'autres postes, jusqu'à Ctrl+C.
+
+    Le poste léger n'a alors besoin que de ``--tts-distant`` : ni torch, ni Kokoro,
+    ni GPU chez lui. La réserve d'audio vit ici, donc une phrase déjà dite est
+    resservie à n'importe quel client sans repasser par le GPU.
+    """
+    from .distant import ServeurTTS
+
+    print(f"Serveur TTS : chargement de Kokoro « {decrire_voix(cfg.voice)} »…")
+    cache = CacheAudio(actif=cfg.cache)
+    tts = KokoroTTS(
+        voice=cfg.voice, lang_code=cfg.lang, speed=cfg.speed,
+        device=cfg.device, cache=cache,
+    )
+    if not tts.load():
+        print(f"[ERREUR] {tts.load_error}")
+        return 2
+    print(f"GPU         : {tts.device_reason} → device={tts.device}")
+    print(f"Réserve     : {cache.dossier}")
+
+    try:
+        serveur = ServeurTTS(tts, port)
+        url = serveur.demarrer()
+    except OSError as exc:
+        print(f"[ERREUR] port {port} indisponible : {exc}")
+        return 2
+
+    print(f"Écoute      : {url}")
+    print(f"                GET  {url}/sante   (état)")
+    print(f"                POST {url}/parle   (texte → WAV)")
+    print()
+    print("Depuis un autre poste :")
+    print(f"  voicechat --tts-distant {url}")
+    print()
+    print("Ctrl+C pour arrêter le service.")
+    try:
+        while True:
+            time.sleep(0.5)
+    except KeyboardInterrupt:
+        print("\nservice arrêté.")
+    finally:
+        serveur.arreter()
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     cfg = config_from_args(args)
@@ -1072,6 +1208,8 @@ def main(argv: list[str] | None = None) -> int:
         return do_transcrire(cfg, args.transcrire)
     if args.diag_micro:
         return do_diag_micro(cfg)
+    if args.serveur_tts:
+        return do_serveur_tts(cfg, args.port)
     if args.probe:
         return do_probe(cfg)
 

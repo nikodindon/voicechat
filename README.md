@@ -42,9 +42,13 @@ sur la machine avec laquelle on parle. On ne dépend donc jamais d'un service TT
 | **Réessais avec délai croissant** (connexion refusée, 5xx, 429) | ✅ implémenté et vérifié (v0.6) — 3 essais, 0,5 s → 1 s → 2 s |
 | **Serveurs de secours** (`--secours`, `VOICECHAT_SECOURS`) | ✅ implémenté et vérifié (v0.6) — bascule annoncée à l'écran, jamais silencieuse |
 | **Mode dégradé** : phrases non synthétisées gardées et rejouables (`/rejoue`) | ✅ implémenté et vérifié (v0.6) |
+| **Réserve d'audio** : une phrase déjà dite n'est pas resynthétisée | ✅ implémenté et mesuré (v1.0) — 282 ms → ~0 ms par phrase répétée, cf. §13.1 |
+| **Paquet installable** (`pip install ./voicechat`, commande `voicechat`) | ✅ vérifié (v1.0) — installation et point d'entrée réellement exécutés, cf. §13.2 |
+| **Fichier de configuration TOML** + réglages par modèle et par voix | ✅ implémenté et vérifié (v1.0) — précédence testée, cf. §13.3 |
+| **Serveur TTS partagé** (`--serveur-tts` / `--tts-distant`) | ⚠️ fonctionnel et vérifié (v1.0), audio retranscrit à 100 % — mais testé en boucle locale seulement, pas entre deux machines, cf. §13.4 |
 | Sélection GPU `auto/cuda/cpu` | ✅ **GPU opérationnel** — RTF 0,09 (cf. §8 pour l'obligation de build cu126 sur Pascal) |
 | Serveur LLM `100.91.114.49:8080` (niko-1650-super) | ✅ **joignable** — Ornith-1.5-35B-A3B Q4_K_M |
-| Suite de tests hors ligne | ✅ 212 tests passent |
+| Suite de tests hors ligne | ✅ 258 tests passent |
 
 > **Cible réelle du serveur LLM** — `100.91.114.49` = `niko-1650-super` dans le tailnet,
 > llama.cpp exposant une API OpenAI-compatible :
@@ -168,6 +172,13 @@ de commande (l'option gagne). Aucune clé n'est obligatoire : llama.cpp ignore `
 | `VOICECHAT_DEVICE` | `auto` | `auto` / `cuda` / `cpu` |
 | `VOICECHAT_SYSTEM` | *(court prompt FR)* | prompt système |
 | `VOICECHAT_TTS` | `1` | `0` pour désactiver la voix |
+| `VOICECHAT_CACHE` | `1` | `0` = resynthétiser chaque phrase (cf. §13.1) |
+| `VOICECHAT_CACHE_DIR` | `~/.cache/voicechat/tts` | où ranger l'audio déjà synthétisé |
+| `VOICECHAT_TTS_URL` | *(vide)* | synthèse déportée sur un autre poste (cf. §13.4) |
+| `VOICECHAT_CONFIG` | `~/.config/voicechat/config.toml` | fichier de configuration TOML (cf. §13.3) |
+| `VOICECHAT_TEMPERATURE` | `0.7` | température d'échantillonnage |
+| `VOICECHAT_MAX_TOKENS` | `0` | `0` = laisser le serveur décider |
+| `VOICECHAT_TIMEOUT` | `300` | délai de lecture du flux LLM, en secondes |
 | `VOICECHAT_DATA` | `~/.local/share/voicechat` | dossier des conversations sauvegardées |
 | `VOICECHAT_PROFILS` | `~/.config/voicechat/profils` | dossier des profils de prompt système |
 | `VOICECHAT_PROFIL` | *(vide)* | profil à charger au démarrage |
@@ -526,10 +537,13 @@ Trois scripts de vérification bout en bout pilotent le vrai CLI dans un pseudo-
       avec `/rejoue` — le texte reste à l'écran dans tous les cas
 
 ### v1.0 — distribué
-- [ ] Serveur TTS partagé (le poste léger envoie le texte, un poste GPU synthétise)
-- [ ] Paquet `pip install ./voicechat` + point d'entrée `voicechat`
-- [ ] Fichier de config TOML + profils (par modèle, par voix)
-- [ ] Cache disque des phrases déjà synthétisées (le LLM se répète souvent)
+- [x] Cache disque des phrases déjà synthétisées (le LLM se répète souvent)
+- [x] Paquet `pip install ./voicechat` + point d'entrée `voicechat`
+- [x] Fichier de config TOML + réglages par modèle et par voix
+- [x] Serveur TTS partagé (le poste léger envoie le texte, un poste GPU synthétise)
+
+**Reste ouvert, d'avant la v1.0** : la capture micro hachée (§10). C'est le seul point
+du projet qui ne soit pas résolu.
 
 ---
 
@@ -1674,6 +1688,293 @@ fois » et « le délai double à chaque essai ». Le mode dégradé est couvert
 
 ---
 
-## 13. Licence
+## 13. Version distribuée (v1.0)
+
+Quatre chantiers, menés dans l'ordre du rapport bénéfice/risque : la réserve d'audio
+d'abord (elle ne dépend de rien et se mesure), le paquet ensuite (il conditionne le
+reste), le fichier de configuration, et pour finir le serveur TTS partagé.
+
+### 13.1 La réserve d'audio : 282 ms → 0 ms
+
+Un LLM se répète énormément. « Bien sûr ! », « Voici les points qui comptent : »,
+« N'hésite pas si tu as d'autres questions. » — la synthèse étant l'étape la plus
+lente d'un tour, resservir le son de ces phrases est le gain le moins coûteux du
+projet. Mesure réelle, Kokoro sur la GTX 1050, 7 phrases dont 2 répétitions :
+
+```
+$ .venv/bin/python tests/bench_cache.py
+Kokoro sur cuda (auto → GPU. torch 2.14.1+cu126 — NVIDIA GeForce GTX 1050 (4031 Mo))
+réserve : /tmp/vc-bench-cache-vqefcleu
+7 phrases, dont 2 répétitions volontaires
+
+[1/2] réserve vide — tout est synthétisé
+     1.62 s d'audio en    584 ms — Bien sûr !
+     2.12 s d'audio en    257 ms — Voici les points qui comptent :
+     2.52 s d'audio en    282 ms — N'hésite pas si tu as d'autres questions.
+     2.83 s d'audio en    299 ms — En résumé, il y a deux choses à retenir.
+     3.67 s d'audio en    375 ms — Le mode économie limite la puissance du proc
+     2.83 s d'audio en      0 ms — En résumé, il y a deux choses à retenir.
+     1.62 s d'audio en      0 ms — Bien sûr !
+
+[2/2] réserve pleine — relecture depuis le disque
+     1.62 s d'audio en      0 ms — Bien sûr !
+     ...
+
+total à froid :    1797 ms   (médiane 282 ms/phrase)
+total à chaud :       1 ms   (médiane 0 ms/phrase)
+facteur       : 1556× plus rapide
+réserve       : 10 reprise(s) / 15 phrase(s) (67%), 23.3 s d'audio resservies
+~3.09 s de synthèse évitées (estimation)
+
+Écart max entre le premier passage et le rejeu : 9.72e-02
+(0 veut dire que l'audio resservi est identique au bit près)
+```
+
+Trois choses à lire dans cette sortie.
+
+**Les deux répétitions sont déjà à 0 ms dans le premier passage** : la réserve sert dès
+la deuxième occurrence, pas seulement au tour suivant.
+
+**Le facteur 1556× ne veut pas dire « 1556 fois mieux »** : il compare 282 ms de calcul
+à 0,1 ms de lecture disque. Le chiffre honnête est « ~280 ms par phrase répétée ».
+
+**L'écart max n'est pas nul, et ce n'est pas un bug.** Deux synthèses du même texte
+avec Kokoro ne donnent pas le même tableau : l'écart mesuré a été 5.99e-02 puis
+9.72e-02 sur deux exécutions (donc ni une constante, ni un décalage fixe). Le GPU est
+simplement non déterministe. Conséquence à connaître : la réserve ressert *un* audio
+valide, pas une copie bit-à-bit de ce qu'une nouvelle synthèse aurait produit.
+
+Ce qui rend le cache sûr, c'est la **clé** : elle inclut la voix, la vitesse, la langue
+et le texte.
+
+```python
+def cle(texte, voix, vitesse, langue) -> str:
+    return hashlib.sha1(f"{langue}|{voix}|{vitesse:.4f}|{texte}".encode()).hexdigest()
+```
+
+Changer de voix ne peut donc pas resservir l'audio de l'ancienne — c'est le piège
+classique d'un cache audio, et un test le vérifie explicitement.
+
+Le reste des précautions, chacune pour un échec réel :
+
+| Situation | Traitement | Raison |
+|---|---|---|
+| Processus tué en pleine écriture | écriture dans `.tmp` puis `os.replace` | un WAV tronqué serait relu comme du son valide |
+| Fichier corrompu ou d'une vieille version | `lire()` le supprime et renvoie `None` | une réserve abîmée ne doit pas casser la voix |
+| Réserve qui grossit sans fin | plafond (2000 fichiers), éviction du plus ancien **par date d'accès** | relire une phrase rafraîchit sa date : elle survit |
+| Voix changée, réserve gardée | clé différente | aucune chance de servir la mauvaise voix |
+
+### 13.2 Le paquet installable
+
+`pyproject.toml` avec la version lue dynamiquement depuis `voicechat/__init__.py` — une
+seule source de vérité, sinon les deux divergent à la première montée de version.
+
+```
+$ .venv/bin/pip install -e . --no-deps
+$ .venv/bin/voicechat --version
+voicechat 1.0.0
+$ .venv/bin/pip show voicechat | grep -E "^(Name|Version|Requires)"
+Name: voicechat
+Version: 1.0.0
+Requires: av, faster-whisper, kokoro, numpy, sounddevice, soundfile
+```
+
+`--no-deps` est **volontaire** : laisser pip réinstaller les dépendances ramènerait
+`av` en 19 (casserait Whisper, cf. §10) et `torch` en cu130 (sans sm_61, donc sans GPU
+sur cette machine). Sur une installation neuve, faire `pip install ./voicechat`, **puis**
+épingler à la main les deux paquets fragiles :
+
+```bash
+pip install ./voicechat
+pip install "av==18.1.0" "torch==2.14.1+cu126" --index-url https://download.pytorch.org/whl/cu126
+```
+
+Deux détails relevés en installant :
+
+* le point d'entrée atterrit dans `.venv/bin/` — le `voicechat` du PATH reste celui de
+  `~/bin/` (le PATH ne contient pas `.venv/bin`), donc **le launcher existant continue
+  de fonctionner** ; les deux mènent au même code ;
+* `main()` renvoie un entier, que `sys.exit()` du point d'entrée utilise comme code de
+  sortie : `--probe` sur un serveur mort sort donc en 2, pas en 0.
+
+### 13.3 Le fichier de configuration TOML
+
+Un fichier `~/.config/voicechat/config.toml` (modèle fourni : `config.example.toml`).
+Précédence, du plus fort au plus faible :
+
+```
+arguments de la ligne de commande
+  > variables d'environnement
+  > config.toml
+  > valeurs codées en dur
+```
+
+Le TOML sert de *valeur par défaut*, ce qui est le seul ordre qui ne surprenne pas : une
+variable d'environnement posée pour une session reste prioritaire.
+
+Les réglages **par modèle** vivent au premier niveau du fichier, pas dans `[voicechat]` :
+
+```toml
+[voicechat]
+voice = "ff_siwis"
+
+[modeles.Ornith-1.5-35B-A3B-APEX-i-mini]
+voice = "ff_siwis:3+ef_dora:1"
+temperature = 0.2
+```
+
+Un nom qui contient un point doit être entre guillemets (`[modeles."..."]`), sinon TOML
+y voit une sous-table. Les noms de GGUF en contiennent presque toujours — c'est noté dans
+le fichier d'exemple.
+
+Vérification, sur le vrai chemin de code (`config_from_args`) puis avec le vrai CLI :
+
+```
+$ .venv/bin/python tests/verif_config.py
+--- A. précédence, sur le vrai chemin de code ---
+  TOML seul          : voice=af_heart speed=1.25 temperature=0.9
+  + env VOICE=if_sara: voice=if_sara (le TOML disait af_heart)
+  + args --voice     : voice=bm_george speed=0.9 (l'env disait if_sara, le TOML 1.25)
+  pour_modele        : {'voice': 'ff_siwis:3+ef_dora:1', 'temperature': 0.2}
+
+--- B. le vrai CLI affiche-t-il les réglages par modèle ? ---
+  voicechat 1.0.0  ·  serveur http://100.91.114.49:8080/v1
+  Modèle : réglages du fichier de configuration — temperature=0.2, voice=ff_siwis:3+ef_dora:1
+
+=== contrôles ===
+  OK  le TOML fournit les valeurs par défaut
+  OK  l'environnement surclasse le TOML
+  OK  les arguments surclassent l'environnement
+  OK  les réglages par modèle sont trouvés
+  OK  le CLI annonce les réglages appliqués
+```
+
+**Un trou trouvé par ce contrôle.** La première exécution a donné `temperature=0.7` au
+lieu de `0.9` : `temperature`, `max_tokens` et `timeout` figuraient bien dans `Config`,
+mais `from_env()` ne les lisait pas du tout. Conséquence incohérente : `[modeles.x]
+temperature = 0.2` fonctionnait (il passe par la surcharge par champ) alors que
+`[voicechat] temperature = 0.9` était silencieusement ignoré. Les trois sont maintenant
+lus par les trois sources, et `Config` sert de définition aux valeurs par défaut pour
+que les littéraux ne puissent plus diverger.
+
+Une clé inconnue est **signalée** plutôt qu'ignorée, avec la liste des clés valides
+tirée de la dataclass :
+
+```
+[config] /home/niko/.config/voicechat/config.toml — clé(s) inconnue(s) dans [voicechat] : voix
+```
+
+### 13.4 Le serveur TTS partagé
+
+Le poste léger envoie du **texte**, le poste à GPU renvoie de l'**audio**. Le premier
+n'a alors besoin ni de torch, ni de Kokoro, ni d'un GPU — il ne lui reste que la lecture
+du son. Le protocole tient en deux routes :
+
+```
+GET  /sante   →  {"service": "voicechat-tts/1", "pret": true, "voix": "ff_siwis",
+                  "device": "cuda", "rtf": 0.0, "reprises": 0, "appels": 0}
+POST /parle   →  corps JSON {"texte", "voix", "vitesse", "langue"}
+                 réponse  audio/wav  (float32, 24 kHz mono)
+```
+
+Sur le poste GPU :
+
+```
+$ voicechat --serveur-tts --port 8090
+Serveur TTS : chargement de Kokoro « ff_siwis »…
+GPU         : auto → GPU. torch 2.14.1+cu126 — NVIDIA GeForce GTX 1050 (4031 Mo)
+Réserve     : /home/niko/.cache/voicechat/tts
+Écoute      : http://192.168.1.22:36733
+                GET  http://192.168.1.22:36733/sante   (état)
+                POST http://192.168.1.22:36733/parle   (texte → WAV)
+
+Depuis un autre poste :
+  voicechat --tts-distant http://192.168.1.22:36733
+```
+
+Sur le poste léger : `voicechat --tts-distant http://192.168.1.22:8090` (ou la variable
+`VOICECHAT_TTS_URL`).
+
+Le WAV a été choisi pour deux raisons : float32 est exact après relecture, et le fichier
+reste écoutable dans n'importe quel lecteur si un doute apparaît.
+
+La vérification ne se contente pas de regarder si l'audio fait la bonne taille — un WAV
+valide mais muet la passerait. L'audio revenu **par le réseau** est retranscrit :
+
+```
+$ .venv/bin/python tests/verif_distant.py
+  GET /sante → 200 {"service": "voicechat-tts/1", "pret": true, "voix": "ff_siwis", "device": "cuda", ...}
+  client chargé : serveur TTS http://127.0.0.1:36733 (voix ff_siwis, device cuda)
+
+  appel 1 (froid)  : 92400 échantillons = 3.85 s d'audio en 0.85 s (RTF 0.22)
+  appel 2 (réserve): 92400 échantillons en 0.002 s
+
+  retranscription de l'audio revenu par le réseau (Whisper small)…
+  entendu : « Le serveur de synthèse répond depuis un autre processus. »
+  mots significatifs retrouvés : 6/6 (100%)
+
+=== contrôles ===
+  OK  le serveur a annoncé son adresse
+  OK  GET /sante répond 200
+  OK  le client s'est chargé
+  OK  l'audio a la bonne taille
+  OK  le second appel est plus rapide
+  OK  Whisper reconnaît la phrase
+```
+
+Trois choix à connaître :
+
+* **le GPU ne sert qu'une synthèse à la fois** (verrou côté serveur) : un client qui
+  arrive pendant une phrase attend son tour au lieu de faire échouer les deux ;
+* **la réserve vit côté serveur** : elle profite donc à *tous* les clients, et la
+  deuxième phrase identique est servie en 2 ms sans toucher au GPU ;
+* **`--port 0`** fait choisir un port libre par l'OS : pratique pour lancer deux
+  services sur la même machine, et c'est ce qu'utilisent les tests.
+
+**Limite honnête de cette section** : la vérification ci-dessus tourne en boucle locale
+sur cette machine. Le serveur écoute bien sur `0.0.0.0` et l'adresse annoncée est celle
+de l'interface par défaut (`192.168.1.22`), mais **je n'ai pas fait l'essai entre deux
+machines physiques** — un pare-feu ou une interface mal choisie reste possible. Le
+paquet, lui, est réellement installé et son point d'entrée réellement exécuté.
+
+### 13.5 Quatre erreurs, toutes de mon fait
+
+1. **`soundfile` ne peut pas deviner le format d'un fichier `.tmp`.** L'écriture
+   atomique passe par un fichier temporaire, et `sf.write("xxx.tmp", ...)` échoue sur
+   « Unknown format » — extension inconnue. Six tests sont tombés d'un coup. Corrigé en
+   passant `format="WAV"` explicitement. Le vrai enseignement est ailleurs : mon
+   `except` renvoyait `False` en silence, donc l'échec n'apparaissait que dans les
+   tests — sans eux, la réserve aurait paru fonctionner en ne gardant jamais rien.
+2. **`charset=utf-8` collé sur `audio/wav`.** Voulant que les messages d'erreur
+   français s'affichent (`synth\u00e9tiseur` → `synthétiseur`, corrigé par
+   `ensure_ascii=False`), j'ai ajouté le charset à *toutes* les réponses. Un avertissement
+   sur un type MIME audio est faux, et un test l'a attrapé.
+3. **`TTSDistant` n'est pas un `KokoroTTS`.** Le vérificateur de types refusait
+   l'affectation. Plutôt qu'un `type: ignore`, j'ai déclaré le contrat que les deux
+   respectent (`Synthetiseur`, un `Protocol`) : ça documente ce qu'un synthétiseur doit
+   fournir, et un test vérifie que le client le respecte.
+4. **Mon test d'éviction était faux.** Il rafraîchissait la date d'une entrée puis en
+   écrivait deux autres, en attendant que la première survive — sauf qu'après
+   rafraîchissement elle restait la plus ancienne des trois, donc évincée à juste titre.
+   Le test est refait dans le bon ordre (vieillir A → écrire B → relire A → écrire C) :
+   c'est B qui doit partir, et c'est ce que vérifie le test.
+
+### 13.6 Vérification
+
+```
+258 tests (46 de plus que la v0.6), dont 16 sur la réserve, 17 sur le serveur TTS
+4 scripts de vérification exécutés pour de vrai : bench_cache, verif_config,
+verif_distant, auxquels s'ajoutent les 9 contrôles de la v0.5 rejoués
+```
+
+| Fichier | Tests | Ce qu'il couvre |
+|---|---|---|
+| `tests/test_cache.py` | 16 | clé, atomicité, éviction, corrompu, branchement dans `synth` |
+| `tests/test_distant.py` | 17 | routes, erreurs HTTP, client, aller-retour audio, contrat |
+| `tests/test_config.py` | +12 | TOML, précédence, réglages par modèle, clés inconnues |
+
+---
+
+## 14. Licence
 
 MIT — voir le fichier `LICENSE`. Faire ce qu'on veut, sans garantie.

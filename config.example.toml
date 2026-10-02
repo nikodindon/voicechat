@@ -1,0 +1,55 @@
+# Configuration de voicechat (v1.0).
+#
+# Où le poser :  ~/.config/voicechat/config.toml
+#                (ou ailleurs, avec VOICECHAT_CONFIG=/chemin/vers/config.toml)
+#
+# Précédence, du plus fort au plus faible :
+#     arguments de la ligne de commande
+#   > variables d'environnement
+#   > ce fichier
+#   > valeurs codées en dur
+#
+# Toutes les clés sont optionnelles. Ce fichier n'est lu que s'il existe : sans lui,
+# rien ne change par rapport aux versions précédentes.
+
+[voicechat]
+# Serveur LLM OpenAI-compatible, avec ses secours éventuels
+base_url = "http://100.91.114.49:8080/v1"
+# secours = ["http://autre-machine:8080/v1"]
+
+# Apparence de la voix
+voice = "ff_siwis"        # ou un mélange pondéré : "ff_siwis:3+ef_dora:1"
+speed = 1.0
+lang = "f"
+
+# auto | cuda | cpu
+device = "auto"
+
+# Voix : true = le chat parle, false = muet
+tts = true
+# Réutiliser l'audio des phrases déjà synthétisées (0 re-synthétise tout)
+cache = true
+# Synthèse sur un autre poste : "http://niko-tv:8090" (le poste GPU lance
+# `voicechat --serveur-tts`). Laisser vide = synthèse locale.
+tts_url = ""
+
+# Génération
+temperature = 0.7
+# 0 = laisser le serveur décider
+max_tokens = 0
+timeout = 300.0
+
+# --- Réglages par modèle -----------------------------------------------------
+# Appliqués quand on parle à CE modèle. La clé est soit le nom court, soit le
+# chemin complet renvoyé par le serveur.
+#
+# Attention : un nom qui contient un point doit être entre guillemets, sinon TOML
+# y voit une sous-table. Les noms de GGUF en contiennent très souvent.
+
+[modeles.Ornith-1.5-35B-A3B-APEX-i-mini]
+voice = "ff_siwis:3+ef_dora:1"
+temperature = 0.2
+
+# [modeles."/mnt/data/sdc2/models/autre-modele.gguf"]
+# speed = 1.15
+# system = """Tu réponds en une phrase, jamais plus."""

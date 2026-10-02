@@ -16,6 +16,7 @@ import re
 import sys
 import threading
 import time
+from typing import Protocol, runtime_checkable
 
 import numpy as np
 
@@ -116,6 +117,44 @@ def list_voices() -> list[str]:
     )
 
 
+# ------------------------------------------------------------------ contract
+@runtime_checkable
+class Synthetiseur(Protocol):
+    """Ce que le reste du programme attend d'un synthétiseur, local ou distant.
+
+    ``KokoroTTS`` (ici même) et ``TTSDistant`` (autre poste, par le réseau) s'y
+    conforment **sans hériter de quoi que ce soit** : c'est la forme de l'objet qui
+    compte, pas sa famille. Ça évite un `type: ignore` à chaque affectation, et ça
+    documente ce qu'un nouveau synthétiseur doit fournir.
+    """
+
+    voice: str
+    speed: float
+    device: str
+    device_reason: str
+    load_error: str | None
+
+    def load(self) -> bool: ...
+
+    def set_voice(self, voice: str) -> None: ...
+
+    def set_lang(self, lang_code: str) -> None: ...
+
+    def synth(self, text: str) -> np.ndarray: ...
+
+    @property
+    def ready(self) -> bool: ...
+
+    @property
+    def rtf(self) -> float: ...
+
+    @property
+    def audio_s(self) -> float: ...
+
+    @property
+    def temps_economise_s(self) -> float: ...
+
+
 # ------------------------------------------------------------------ voix
 
 @contextlib.contextmanager
@@ -210,11 +249,14 @@ class KokoroTTS:
         lang_code: str = "f",
         speed: float = 1.0,
         device: str = "auto",
+        cache=None,
     ) -> None:
         self.voice = voice
         self.lang_code = lang_code
         self.speed = float(speed)
         self.device_pref = device
+        # Réserve disque des phrases déjà synthétisées (facultative).
+        self.cache = cache
         self.device = "cpu"
         self.device_reason = ""
         self.load_error: str | None = None
@@ -312,9 +354,25 @@ class KokoroTTS:
 
     # ------------------------------------------------------------------ synthèse
     def synth(self, text: str) -> np.ndarray:
-        """Texte → tableau float32 mono 24 kHz."""
+        """Texte → tableau float32 mono 24 kHz.
+
+        Si une réserve est branchée, on regarde d'abord dedans : les tournures que le
+        modèle répète (« Bien sûr ! », « Voici les points qui comptent : ») ne sont
+        synthétisées qu'une fois par session et par voix.
+        """
         if not self.ready:
             raise RuntimeError(self.load_error or "TTS non chargé")
+
+        cle = ""
+        # Variable locale : rend explicite pour le lecteur (et pour le vérificateur de
+        # types) que la réserve est utilisable, sans le répéter à chaque appel.
+        cache = self.cache if (self.cache is not None and self.cache.actif) else None
+        if cache is not None:
+            cle = cache.cle(text, self.voice, self.speed, self.lang_code)
+            garde = cache.lire(cle)
+            if garde is not None:
+                return garde
+
         t0 = time.monotonic()
         morceaux: list[np.ndarray] = []
         for _, _, audio in self._pipeline(text, voice=self._voix_chargee, speed=self.speed):
@@ -328,7 +386,21 @@ class KokoroTTS:
         out = np.concatenate(morceaux)
         self.synth_s += time.monotonic() - t0
         self.audio_s += len(out) / SAMPLE_RATE
+        if cache is not None and cle:
+            cache.ecrire(cle, out)
         return out
+
+    @property
+    def temps_economise_s(self) -> float:
+        """Estimation du temps de synthèse évité grâce à la réserve.
+
+        On l'estime avec le RTF réellement mesuré dans cette session (temps de
+        synthèse / durée d'audio produit) : c'est une **estimation**, pas une mesure
+        directe — on ne peut pas compter le temps qu'une synthèse n'a pas pris.
+        """
+        if self.cache is None or self.audio_s <= 0:
+            return 0.0
+        return self.cache.servis_s * (self.synth_s / self.audio_s)
 
     @property
     def rtf(self) -> float:
@@ -344,7 +416,7 @@ class SpeechPipeline:
     l'ordre est garanti et le GPU n'est jamais sollicité deux fois en même temps.
     """
 
-    def __init__(self, tts: KokoroTTS, speaker: Speaker, cleaner=None) -> None:
+    def __init__(self, tts: Synthetiseur, speaker: Speaker, cleaner=None) -> None:
         self.tts = tts
         self.speaker = speaker
         self.cleaner = cleaner or (lambda t: t)
