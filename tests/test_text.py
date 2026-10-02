@@ -44,6 +44,22 @@ def test_miette_ignoree():
     assert "Bonjour." in phrases
 
 
+def test_reste_sans_ponctuation_finit_par_etre_emis():
+    """Un modèle qui n'écrit aucun point ne doit pas bloquer la voix indéfiniment."""
+    tampon = "mot " * 200  # 800 caractères, zéro ponctuation
+    phrases, reste = split_sentences(tampon, max_chars=100)
+    assert phrases, "le reste doit être émis par morceaux, pas accumulé"
+    assert all(len(p) <= 100 for p in phrases)
+    assert len(reste) <= 100
+
+
+def test_mot_geant_sans_espace_nest_pas_emiette():
+    """Un unique « mot » très long ne peut pas être coupé : on attend la suite."""
+    phrases, reste = split_sentences("a" * 300, max_chars=100)
+    assert phrases == []
+    assert len(reste) == 300
+
+
 def test_flux_progressif():
     """Le cas réel : les morceaux arrivent un par un depuis le LLM."""
     tampon = ""

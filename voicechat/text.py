@@ -60,7 +60,21 @@ def split_sentences(
 
     reste = buffer[pos:]
 
-    return _hard_wrap(phrases, max_chars, min_chars), _cap_tail(reste, max_chars)
+    phrases = _hard_wrap(phrases, max_chars, min_chars)
+
+    # Un « reste » sans ponctuation ne doit pas grossir sans fin : sinon un modèle qui
+    # enchaîne des centaines de caractères sans point ne déclencherait jamais la voix.
+    # On émet donc un morceau dès que le reste dépasse la limite.
+    while len(reste) > max_chars:
+        cut = reste.rfind(" ", 0, max_chars)
+        if cut <= 0:
+            break  # un seul « mot » démesuré : on attend la suite du flux
+        morceau = reste[:cut].strip()
+        if len(morceau) >= min_chars:
+            phrases.append(morceau)
+        reste = reste[cut:]
+
+    return phrases, reste
 
 
 def _hard_wrap(items: list[str], max_chars: int, min_chars: int) -> list[str]:
@@ -76,18 +90,6 @@ def _hard_wrap(items: list[str], max_chars: int, min_chars: int) -> list[str]:
         if len(item) >= min_chars:
             out.append(item)
     return [p for p in out if p]
-
-
-def _cap_tail(reste: str, max_chars: int) -> str:
-    """Évite qu'un « reste » sans ponctuation ne grossisse sans fin."""
-    if len(reste) <= max_chars:
-        return reste
-    cut = reste.rfind(" ", 0, max_chars)
-    if cut <= 0:
-        cut = max_chars
-    # On ne peut pas émettre ici (pas de contexte) : on renvoie juste un morceau borné,
-    # le début ayant déjà été découpé par _hard_wrap via un appel ultérieur.
-    return reste
 
 
 def clean_for_speech(text: str) -> str:

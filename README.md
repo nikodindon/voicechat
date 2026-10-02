@@ -24,9 +24,9 @@ sur la machine avec laquelle on parle. On ne dépend donc jamais d'un service TT
 |---|---|
 | Client console + streaming SSE | ✅ implémenté et vérifié (v0.1) |
 | Kokoro TTS local + lecture audio | ✅ implémenté et vérifié (v0.1) |
-| Sélection GPU `auto/cuda/cpu` | ✅ implémenté — ⚠️ **GPU inutilisable avec le torch par défaut** (cf. §8) |
+| Sélection GPU `auto/cuda/cpu` | ✅ **GPU opérationnel** — RTF 0,09 (cf. §8 pour l'obligation de build cu126 sur Pascal) |
 | Serveur LLM `100.108.224.60:8080` | ⚠️ **injoignable au moment de l'écriture** |
-| Suite de tests hors ligne | ✅ 18 tests passent |
+| Suite de tests hors ligne | ✅ 20 tests passent |
 
 > **Constat réseau (mesuré, pas supposé)** — l'hôte `100.108.224.60` est `niko-tv` dans le tailnet :
 >
@@ -75,6 +75,31 @@ kokoro        # TTS (tire torch automatiquement)
 sounddevice   # lecture audio (PortAudio)
 numpy
 ```
+
+### ⚠️ Étape obligatoire sur GTX 1050 / Pascal (sm_61)
+
+`pip install kokoro` tire le `torch` par défaut de PyPI, construit en **CUDA 13.0**, qui ne
+contient **plus** les noyaux Pascal. Il faut le remplacer par le build `cu126` :
+
+```bash
+.venv/bin/pip uninstall -y $(.venv/bin/pip freeze | \
+    grep -iE "^(torch|triton|nvidia-|cuda-toolkit|cuda-bindings)" | cut -d= -f1)
+
+.venv/bin/pip install "torch==2.14.1+cu126" --index-url https://download.pytorch.org/whl/cu126
+
+# contrôle : la liste doit contenir sm_50 et sm_60, et le calcul doit passer
+.venv/bin/python -c "import torch; print(torch.cuda.get_arch_list()); \
+    a=torch.zeros(8,device='cuda'); print('GPU OK ->', (a+1).sum().item())"
+```
+
+Attendu :
+
+```
+['sm_50', 'sm_60', 'sm_70', 'sm_75', 'sm_80', 'sm_86', 'sm_90']
+GPU OK -> 8.0
+```
+
+Sur Turing (20xx) ou plus récent, cette étape est **facultative** : le wheel par défaut suffit.
 
 > Le premier lancement télécharge les poids Kokoro depuis Hugging Face (~350 Mo)
 > dans `~/.cache/huggingface`. C'est fait **une seule fois**.
@@ -181,10 +206,11 @@ python3 tests/fake_llm_server.py 8099          # terminal 1
 - [x] Historique de conversation + `/reset`
 - [x] Kokoro TTS local, lecture en file d'attente pendant la génération
 - [x] Sélection du périphérique `auto/cuda/cpu`, repli CPU propre
+- [x] Détection GPU par **vrai calcul** (test de fumée CUDA) — `is_available()` seul ne suffit pas
 - [x] Détection automatique du nom du modèle via `/v1/models`
 - [x] `--probe` : diagnostic réseau clair quand le serveur est éteint
 - [x] Messages d'erreur lisibles (timeout, 404 API, modèle inconnu)
-- [x] Tests unitaires hors ligne
+- [x] Tests unitaires hors ligne + faux serveur OpenAI-compatible
 
 ### v0.2 — confort d'usage
 - [ ] Interruption à chaud : `Ctrl+C` coupe la lecture **et** la génération en cours
@@ -257,13 +283,39 @@ ECHEC CUDA: AcceleratorError CUDA error: no kernel image is available for execut
 retombe sur le CPU avec un message explicite plutôt que de planter au milieu d'une réponse.
 
 Pour retrouver le GPU, il faut un build torch qui contient encore les noyaux sm_61
-(cu126 ou antérieur). Le dépôt PyTorch le suggère lui-même dans l'avertissement :
+(cu126 ou antérieur). Le dépôt PyTorch le suggère lui-même dans l'avertissement — **mais la
+commande qu'il propose ne fonctionne pas telle quelle** :
 
 ```bash
-.venv/bin/pip install "torch==2.14.1" --index-url https://download.pytorch.org/whl/cu126
-# ou, si cu126 ne contenait plus Pascal :
-.venv/bin/pip install "torch==2.6.0"          # wheel PyPI par défaut = cu124
+$ .venv/bin/pip install "torch==2.14.1" --index-url https://download.pytorch.org/whl/cu126
+Requirement already satisfied: torch==2.14.1 ... (2.14.1+cu130)
+# → pip ne fait RIEN : la version 2.14.1+cu130 satisfait déjà la contrainte "==2.14.1",
+#   le tag local (+cu130) n'entre pas dans l'égalité. On croit avoir corrigé, on n'a rien changé.
 ```
+
+Il faut viser la version exacte, avec son tag local, et désinstaller l'ancienne au préalable :
+
+```bash
+# 1. vérifier ce que l'index propose vraiment
+$ .venv/bin/pip index versions torch --index-url https://download.pytorch.org/whl/cu126
+torch (2.14.1+cu126)
+Available versions: 2.14.1+cu126, 2.14.0+cu126, 2.13.0+cu126, ... 2.6.0+cu126
+
+# 2. sortir torch ET les libs CUDA du venv (sinon cohabitation cu12/cu13)
+$ .venv/bin/pip uninstall -y $(.venv/bin/pip freeze | \
+      grep -iE "^(torch|triton|nvidia-|cuda-toolkit|cuda-bindings)" | cut -d= -f1)
+
+# 3. installer la version exacte, tag local inclus
+$ .venv/bin/pip install "torch==2.14.1+cu126" \
+      --index-url https://download.pytorch.org/whl/cu126
+
+# 4. prouver que ça marche par un vrai calcul, pas par is_available()
+$ .venv/bin/python -c "import torch; print(torch.__version__, torch.cuda.get_arch_list()); \
+      a=torch.zeros(8,device='cuda'); print((a+1).sum().item())"
+```
+
+Repli si cu126 ne contenait plus Pascal : `.venv/bin/pip install "torch==2.6.0"`
+(le wheel PyPI par défaut de cette version était construit en cu124).
 
 Repères de compatibilité : `cu118`…`cu124` → Pascal OK · `cu128` à partir de torch 2.8 →
 Pascal retiré · `cu13x` → plus rien sous Turing.
@@ -289,9 +341,9 @@ le même (`voicechat.llm`), seule la cible change.
 ### Tests hors ligne
 
 ```
-$ python3 -m pytest tests/ -q
-..................                                                       [100%]
-18 passed in 2.57s
+$ .venv/bin/python -m pytest tests/ -q
+....................                                                     [100%]
+20 passed in 2.33s
 ```
 
 ### Streaming + découpage en phrases, en direct
@@ -341,7 +393,8 @@ RTF du TTS: 1.44
   la file d'attente se remplit plus vite qu'elle ne se vide (8,45 s d'audio ont mis ~13,7 s à
   sortir). Sur ce portable, le CPU est en outre bridé par le profil économie d'énergie.
   → **le GPU n'est pas un luxe ici, c'est la condition pour que la voix suive le texte.**
-  C'est précisément ce que règle la question du build torch Pascal ci-dessus (§8).
+  C'est précisément ce que règle la question du build torch Pascal ci-dessus (§8) — et la
+  section suivante montre le résultat une fois le build corrigé.
 
 ### Détection du GPU au démarrage — désormais honnête
 
@@ -355,6 +408,42 @@ $ .venv/bin/python -m voicechat
 pour lui — ce wheel ne contient que sm_75, sm_80, sm_86, sm_90, sm_100, sm_120.
 Détail : CUDA error: no kernel image is available for execution on the device
 voicechat 0.1.0  ·  serveur http://100.108.224.60:8080/v1
+```
+
+### Le build cu126 change tout — mesure CPU vs GPU
+
+Après remplacement du wheel (procédure §3), le même calcul qui échouait passe :
+
+```
+version   : 2.14.1+cu126
+cuda      : 12.6
+arch list : ['sm_50', 'sm_60', 'sm_70', 'sm_75', 'sm_80', 'sm_86', 'sm_90']
+is_avail  : True
+GPU       : NVIDIA GeForce GTX 1050 | capability (6, 1)
+MATMUL GPU: OK en 518.8 ms -> 7210.73
+```
+
+Et l'effet sur la synthèse, mesuré sur la **même phrase** :
+
+```
+  [cpu]  4.58 s audio en 5.75 s -> RTF 1.256
+  [cuda] 4.58 s audio en 0.42 s -> RTF 0.092
+```
+
+**≈ 13× plus rapide.** Avec un RTF de 0,09, la synthèse produit 1 s d'audio en 0,09 s : la
+voix n'est plus jamais le goulot, elle suit confortablement le flux de tokens.
+
+En session réelle (faux serveur, `--debug`) :
+
+```
+[matériel] auto → GPU. torch 2.14.1+cu126 — NVIDIA GeForce GTX 1050 (4031 Mo)
+voicechat 0.1.0  ·  serveur http://127.0.0.1:8099/v1
+Modèle : fake-local-model (détecté, 1 disponible(s))
+Voix   : chargement de Kokoro « ff_siwis »…
+GPU    : auto → GPU. torch 2.14.1+cu126 — NVIDIA GeForce GTX 1050 (4031 Mo) → device=cuda
+
+vous › ia › Bonjour ! Voici une réponse de test, découpée en plusieurs phrases. […]
+   · 1er token 0.00 s | 220 car. en 1.18 s (186.9 car/s) | TTS RTF 0.13
 ```
 
 ### Attente du serveur réel
