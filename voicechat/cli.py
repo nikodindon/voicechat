@@ -22,7 +22,14 @@ from .config import (
 )
 from .distant import PORT_DEFAUT, TTSDistant
 from .editor import ClavierGeneration, LineEditor
-from .llm import Connexion, LLMError, list_models, premier_serveur, stream_with_usage
+from .llm import (
+    Connexion,
+    LLMError,
+    contexte_du_serveur,
+    list_models,
+    premier_serveur,
+    stream_with_usage,
+)
 from .micro import DetecteurParole, Ecouteur, Microphone
 from .stt import Transcriber
 from .tts import (
@@ -57,12 +64,23 @@ PROMPT_RESUME = (
     "factuel. N'invente rien — ce qui n'a pas été dit ne doit pas apparaître."
 )
 
+def _jetons_estimes(texte: str) -> int:
+    """Estimation du nombre de tokens d'un texte, en français.
+
+    ~3,5 caractères par token est l'ordre de grandeur usuel pour du français avec un
+    tokenizer BPE. Ce n'est qu'un **repli** : dès qu'un tour a eu lieu, le client prend
+    le compte exact annoncé par le serveur et n'estime que ce qui a été ajouté depuis.
+    """
+    return int(len(texte) / 3.5) + 1
+
+
 # Source unique de vérité : sert à la fois à /help et à la complétion de Tab.
 COMMANDES: list[tuple[str, str]] = [
     ("/help", "cette aide"),
     ("/quit", "quitter (alias /exit, /q)"),
     ("/reset", "vide l'historique de conversation"),
     ("/resume", "compacte les vieux échanges en un résumé (au lieu de les perdre)"),
+    ("/contexte", "où en est le contexte : tokens utilisés, place restante"),
     ("/voice <nom>", "voix Kokoro, ou mélange : « ff_siwis:3+ef_dora:1 » (ex. /voice af_heart)"),
     ("/lang <code>", "langue Kokoro : a en, b en-GB, f fr, e es, i it, p pt, j ja, z zh, h hi"),
     ("/speed <x>", "vitesse de lecture (ex. /speed 1.15)"),
@@ -410,6 +428,12 @@ class ChatSession:
         # Un seul avertissement par « vague » d'oublis : sinon l'historique plein
         # répéterait le même message à chaque tour.
         self._oubli_signale = False
+        self._contexte_signale = False
+        # Ancrage du comptage de tokens : le compte exact donné par le serveur au tour
+        # précédent, et la taille qu'avait l'historique à cet instant. On n'estime que ce
+        # qui a été ajouté depuis — deux messages, donc une erreur minuscule.
+        self._ancrage_jetons = 0
+        self._ancrage_messages = 0
 
     # ------------------------------------------------------------------ démarrage
     def setup_voice(self) -> None:
@@ -626,6 +650,7 @@ class ChatSession:
 
     def resolve_model(self) -> bool:
         if self.cfg.model:
+            self._mesurer_contexte()
             return True
         try:
             modeles, cible = premier_serveur(self.cfg.cibles, self.cfg.api_key, timeout=10.0)
@@ -644,7 +669,26 @@ class ChatSession:
         self.modeles = list(modeles)
         extra = f" ({len(modeles)} disponibles)" if len(modeles) > 1 else ""
         print(f"Modèle : {nom_court(self.cfg.model)}{extra}")
+        self._mesurer_contexte()
         return True
+
+    def _mesurer_contexte(self) -> None:
+        """Demande au serveur la taille de son contexte, pour compter juste ensuite.
+
+        Sans cette mesure, le client comptait les messages **à l'aveugle** : mesuré, 25
+        messages ne pesaient que 1 646 tokens, soit 5 % d'un contexte de 32768. Autrement
+        dit, on jetait des messages vingt fois trop tôt, et une conversation dense aurait
+        pu déborder sans que rien ne le signale.
+        """
+        cible = self.serveur_actif or self.cfg.base_url
+        if self.cfg.n_ctx:
+            print(f"Contexte : {self.cfg.n_ctx} tokens (forcé par la configuration)")
+            return
+        self.cfg.n_ctx = contexte_du_serveur(cible, self.cfg.api_key)
+        if self.cfg.n_ctx:
+            print(f"Contexte : {self.cfg.n_ctx} tokens")
+        else:
+            print("Contexte : le serveur ne l'annonce pas — repli sur l'ancienne limite en messages")
 
     # ------------------------------------------------------------ complétion
     def _voix_disponibles(self) -> list[str]:
@@ -687,6 +731,9 @@ class ChatSession:
         assert self.cfg.model
         self.messages.append({"role": "user", "content": question})
         self._trim_history()
+        # Taille de l'historique telle qu'elle part : le serveur va nous en donner le
+        # compte exact en tokens, et c'est sur ce couple qu'on s'ancrera ensuite.
+        self._ancrage_messages = len(self.messages)
 
         connexion = Connexion()
         flux, usage = stream_with_usage(
@@ -767,6 +814,11 @@ class ChatSession:
                 self.messages.append({"role": "assistant", "content": reponse})
 
         self._avis_voix_manquante()
+        if usage.prompt_tokens:
+            # Compte exact, donné par le serveur pour la liste qu'on vient d'envoyer :
+            # il servira d'ancrage aux tours suivants.
+            self._ancrage_jetons = usage.prompt_tokens
+        self._avis_contexte(usage)
 
         self.frappes = clavier.tampon
         self._maj_stats(usage, interrompu, coupee)
@@ -777,6 +829,8 @@ class ChatSession:
             self.last_stats += f" | TTS RTF {self.tts.rtf:.2f}"
         if self.cache is not None and self.cache.hits:
             self.last_stats += f" | réserve {self.cache.hits} reprise(s)"
+        if self.cfg.n_ctx:
+            self.last_stats += f" | contexte {self._jetons()}/{self.cfg.n_ctx}"
         if interrompu:
             self.last_stats += " | réponse tronquée"
         if coupee:
@@ -817,24 +871,116 @@ class ChatSession:
         if self.speech and self.cfg.tts:
             self.speech.say(phrase)
 
-    def _trim_history(self) -> None:
-        """Garde le message système + les N derniers messages.
+    # ------------------------------------------------------------- contexte
+    def _jetons(self) -> int:
+        """Tokens que pèsent les messages actuels, aussi juste que possible.
 
-        Ce qui sort n'est pas résumé, seulement jeté : c'est pourquoi on le **dit**.
+        On part du compte **exact** annoncé par le serveur au tour précédent
+        (``usage.prompt_tokens``) et on n'estime que ce qui a été ajouté depuis — deux
+        messages, donc une erreur minuscule. Sans ancrage (premier tour, ou messages
+        retirés depuis), on estime tout : ~3,5 caractères par token, plus la poignée de
+        tokens de gabarit que chaque message ajoute au prompt.
+        """
+        if self._ancrage_jetons and self._ancrage_messages <= len(self.messages):
+            ajoutes = self.messages[self._ancrage_messages :]
+            return self._ancrage_jetons + sum(
+                _jetons_estimes(m.get("content", "")) for m in ajoutes
+            )
+        return sum(_jetons_estimes(m.get("content", "")) for m in self.messages) + 4 * len(
+            self.messages
+        )
+
+    def _limite_jetons(self) -> int:
+        """Budget à ne pas dépasser : 80 % du contexte annoncé par le serveur.
+
+        Les 20 % restants sont pour la réponse. On ignore sa longueur avant de l'avoir
+        reçue, et un prompt qui remplit exactement le contexte se fait tronquer ou
+        refuser par le serveur — au pire moment, après avoir payé tout le calcul.
+        """
+        return int(self.cfg.n_ctx * 0.8) if self.cfg.n_ctx else 0
+
+    def _prevenir_oubli(self, oublies: int, details: str) -> None:
+        """Annonce une fois par vague ce qui sort du contexte.
+
         Un historique qui rétrécit en silence donne l'impression que le modèle devient
         bête, alors qu'il a simplement cessé de recevoir le début.
         """
-        limite = max(2, self.cfg.history_limit)
-        if len(self.messages) > limite + 1:
-            oublies = len(self.messages) - limite - 1
-            self.messages = [self.messages[0]] + self.messages[-limite:]
-            if not self._oubli_signale:
-                self._oubli_signale = True
-                print(
-                    f"\n[contexte] {oublies} message(s) ancien(s) ne sont plus envoyés "
-                    f"(limite : {limite})."
-                )
-                print("           /resume pour les compacter en un résumé, au lieu de les perdre.")
+        if self._oubli_signale:
+            return
+        self._oubli_signale = True
+        print(f"\n[contexte] {oublies} message(s) ancien(s) ne sont plus envoyés ({details}).")
+        print("           /resume pour les compacter en un résumé, au lieu de les perdre.")
+
+    def _trim_history(self) -> None:
+        """Garde le message système et autant d'échanges que le contexte le permet.
+
+        On compte en **tokens** dès que le serveur annonce son contexte, et non en
+        nombre de messages. L'ancienne limite fixe (24 messages) jetait des messages
+        vingt fois trop tôt sur ce serveur, et aurait laissé passer un long échange
+        dense sans rien dire.
+        """
+        limite = self._limite_jetons()
+        if not limite:
+            # Le serveur n'annonce pas son contexte : ancien comportement, en messages.
+            limite_msg = max(2, self.cfg.history_limit)
+            if len(self.messages) > limite_msg + 1:
+                oublies = len(self.messages) - limite_msg - 1
+                self.messages = [self.messages[0]] + self.messages[-limite_msg:]
+                self._prevenir_oubli(oublies, f"limite : {limite_msg} messages")
+            return
+
+        # On retire par échange complet (question + réponse) : commencer l'historique
+        # sur une réponse orpheline est déroutant pour le modèle comme pour le lecteur.
+        oublies = 0
+        while len(self.messages) > 3 and self._jetons() > limite:
+            del self.messages[1:3]
+            oublies += 2
+            self._ancrage_jetons = 0  # le compte exact ne décrit plus cette liste
+        if oublies:
+            self._prevenir_oubli(oublies, f"limite : {limite} tokens")
+
+    def _montrer_contexte(self) -> None:
+        """Où en est le contexte, et ce que ça implique concrètement.
+
+        C'est la réponse chiffrée à « est-ce qu'il me faut plus de contexte ? » : tant
+        que le pourcentage reste bas, monter la taille côté serveur ne changerait rien.
+        """
+        if not self.cfg.n_ctx:
+            print("contexte : le serveur ne l'annonce pas (pas de /props)")
+            print(f"           repli sur la limite de {self.cfg.history_limit} messages")
+            return
+        utilise = self._jetons()
+        part = utilise / self.cfg.n_ctx
+        print(f"contexte : {utilise} / {self.cfg.n_ctx} tokens ({part:.1%})")
+        print(f"           {len(self.messages)} message(s) dans l'historique")
+        if self._ancrage_jetons:
+            # Preuve que les chiffres ne sont pas devinés : c'est le compte exact que le
+            # serveur a rendu au tour précédent, pour l'historique tel qu'il est parti.
+            print(
+                f"           dernier compte exact du serveur : {self._ancrage_jetons} tokens "
+                f"pour {self._ancrage_messages} message(s)"
+            )
+        print(f"           budget d'envoi : {self._limite_jetons()} tokens (80 % du contexte)")
+        if part >= 0.8:
+            print("           → proche de la limite : /resume pour compacter")
+        else:
+            facteur = (self._limite_jetons() - utilise) / max(1, utilise)
+            print(f"           → de la place : environ {facteur:.0f} fois la conversation actuelle")
+
+    def _avis_contexte(self, usage) -> None:
+        """Prévient quand la conversation approche du contexte du serveur."""
+        if not self.cfg.n_ctx:
+            return
+        utilise = (usage.prompt_tokens or 0) + (usage.completion_tokens or 0)
+        if not utilise:
+            return
+        part = utilise / self.cfg.n_ctx
+        if part >= 0.8 and not self._contexte_signale:
+            self._contexte_signale = True
+            print(
+                f"[contexte] {utilise} / {self.cfg.n_ctx} tokens ({part:.0%}) — "
+                "/resume pour compacter avant que ça déborde"
+            )
 
     def _compacter_contexte(self) -> bool:
         """Remplace les échanges anciens par un résumé produit par le modèle.
@@ -903,6 +1049,10 @@ class ChatSession:
             *gardes,
         ]
         self._oubli_signale = False
+        self._contexte_signale = False
+        # La liste a changé du tout au tout : le compte exact d'avant ne la décrit plus.
+        self._ancrage_jetons = 0
+        self._ancrage_messages = 0
         print(
             f"[contexte] {len(conversation)} caractères résumés en {len(resume)} ; "
             f"{len(self.messages)} message(s) en contexte."
@@ -957,10 +1107,16 @@ class ChatSession:
         elif cmd == "/reset":
             self.messages = [{"role": "system", "content": self.cfg.system}]
             self._oubli_signale = False
+            self._contexte_signale = False
+            self._ancrage_jetons = 0
+            self._ancrage_messages = 0
             print("historique vidé")
 
         elif cmd == "/resume":
             self._compacter_contexte()
+
+        elif cmd == "/contexte":
+            self._montrer_contexte()
 
         elif cmd == "/voices":
             for v in list_voices():

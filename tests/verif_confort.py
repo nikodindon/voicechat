@@ -13,114 +13,17 @@ Quatre fonctions, quatre façons de les éprouver :
 from __future__ import annotations
 
 import os
-import pty
-import re
-import select
 import subprocess
 import sys
 import tempfile
-import time
 from pathlib import Path
 
-PROJ = Path(__file__).resolve().parent.parent
-PY = str(PROJ / ".venv" / "bin" / "python")
+# Le pilote de pseudo-terminal vit dans `pilote.py` : les leçons apprises (texte et
+# Entrée en deux écritures, attente par silence, tampon non cumulatif) y sont
+# expliquées, et il sert aussi à `verif_contexte.py`.
+from pilote import PROJ, PY, Session, propre
 
 TEMOIN = "zorglub"  # mot assez rare pour qu'une trouvaille ne puisse pas être un hasard
-
-
-# ------------------------------------------------------------------ utilitaires pty
-def lire(fd: int, duree: float) -> str:
-    morceaux: list[bytes] = []
-    fin = time.monotonic() + duree
-    while time.monotonic() < fin:
-        pret, _, _ = select.select([fd], [], [], 0.1)
-        if pret:
-            try:
-                morceaux.append(os.read(fd, 65536))
-            except OSError:
-                break
-    return b"".join(morceaux).decode("utf-8", "replace")
-
-
-class Session:
-    """Un vrai CLI dans un vrai pseudo-terminal."""
-
-    def __init__(self, environnement: dict[str, str]) -> None:
-        self.sortie = ""  # avant tout appel : `attendre()` s'appuie dessus
-        self.maitre, esclave = pty.openpty()
-        self.processus = subprocess.Popen(
-            [PY, "-m", "voicechat", "--no-tts"],
-            cwd=PROJ, stdin=esclave, stdout=esclave, stderr=subprocess.STDOUT,
-            env={**os.environ, **environnement}, close_fds=True,
-        )
-        os.close(esclave)
-        self.sortie = self.attendre("vous ›", 60.0)
-
-    def attendre(self, motif: str, delai: float) -> str:
-        """Lit jusqu'à voir `motif`, et rend seulement ce qui vient d'arriver.
-
-        Rendre les données **nouvelles** et non le tampon cumulatif est essentiel : le
-        tampon contient déjà « vous › » depuis le démarrage, donc chercher dedans ferait
-        rendre la main immédiatement, à chaque appel, sans rien lire du tout.
-        """
-        recu = ""
-        fin = time.monotonic() + delai
-        while motif not in recu and time.monotonic() < fin:
-            recu += lire(self.maitre, 0.5)
-        self.sortie += recu  # conservé à part, pour le rapport final
-        return recu
-
-    def attendre_calme(self, delai_max: float, calme: float = 2.0, motif: str = "") -> str:
-        """Lit jusqu'à ce que la sortie se taise — ou jusqu'à voir `motif`.
-
-        On ne peut **pas** attendre le prompt « vous › » pour savoir qu'un tour est fini :
-        l'éditeur de ligne le réaffiche à chaque frappe, donc il réapparaît aussitôt qu'on
-        a tapé la question — bien avant que la réponse soit arrivée.
-
-        Le silence marche pour une réponse qui s'écoule, mais pas pour une commande qui
-        appelle le modèle sans rien dire pendant plusieurs secondes (`/resume`). Dans ce
-        cas on passe `motif` : on attend la ligne finale, avec `delai_max` comme garde-fou.
-        """
-        recu = ""
-        dernier = time.monotonic()
-        fin = time.monotonic() + delai_max
-        while time.monotonic() < fin:
-            morceau = lire(self.maitre, 0.25)
-            if morceau:
-                recu += morceau
-                dernier = time.monotonic()
-            if motif:
-                if motif in recu:
-                    break
-            elif time.monotonic() - dernier >= calme:
-                break
-        self.sortie += recu
-        return recu
-
-    def envoyer(self, ligne: str, delai: float = 180.0, motif: str = "") -> str:
-        """Tape une ligne, l'envoie, et attend la fin du traitement.
-
-        Le texte et l'Entrée partent en **deux écritures séparées**, avec un délai :
-        c'est ce que fait un vrai clavier. Tout envoyer d'un coup ferait passer la ligne
-        pour un collage — l'éditeur attend alors une Entrée distincte avant d'envoyer,
-        exactement pour qu'un texte collé ne parte pas tout seul (cf. tests/test_editor.py).
-        """
-        os.write(self.maitre, ligne.encode("utf-8"))
-        time.sleep(0.06)
-        os.write(self.maitre, b"\r")
-        return self.attendre_calme(delai, motif=motif)
-
-    def fermer(self) -> None:
-        self.processus.terminate()
-        try:
-            self.processus.wait(timeout=10)
-        except subprocess.TimeoutExpired:
-            self.processus.kill()
-        os.close(self.maitre)
-
-
-def propre(texte: str) -> str:
-    return re.sub(r"\x1b\[[0-9;?]*[a-zA-Z]", "", texte).replace("\r", "")
 
 
 # ------------------------------------------------------------------ A. -q sans terminal

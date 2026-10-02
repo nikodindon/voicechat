@@ -155,7 +155,11 @@ class Config:
     micro_device: int | str | None = None
 
     show_stats: bool = False
-    history_limit: int = 24  # nb de messages (hors système) gardés en contexte
+    history_limit: int = 24  # nb de messages gardés si le serveur n'annonce pas son contexte
+    # Taille du contexte du serveur, en tokens. 0 = **détection automatique** au démarrage
+    # (cf. llm.contexte_du_serveur). Forcer une valeur ici a deux usages : un serveur qui
+    # ne sait pas répondre à /props, et l'essai d'un petit contexte pour éprouver l'élagage.
+    n_ctx: int = 0
 
     @classmethod
     def from_env(cls, base: dict | None = None) -> "Config":
@@ -200,6 +204,8 @@ class Config:
             stt_device=env("VOICECHAT_STT_DEVICE", "stt_device", "auto").lower(),
             stt_langue=env("VOICECHAT_STT_LANGUE", "stt_langue", "fr"),
             micro_device=env("VOICECHAT_MICRO_DEVICE", "micro_device", "") or None,
+            # 0 (défaut) = demander au serveur. Une valeur force le budget de contexte.
+            n_ctx=int(_env_float("VOICECHAT_N_CTX", float(base.get("n_ctx", defauts.n_ctx)))),
             # Ces trois-là n'étaient réglables ni par l'environnement ni par le fichier :
             # seuls les arguments les touchaient. `[modeles.x] temperature = 0.2`
             # fonctionnait, `[voicechat] temperature = 0.9` non — incohérent.

@@ -44,6 +44,7 @@ sur la machine avec laquelle on parle. On ne dépend donc jamais d'un service TT
 | **Réessais avec délai croissant** (connexion refusée, 5xx, 429) | ✅ implémenté et vérifié (v0.6) — 3 essais, 0,5 s → 1 s → 2 s |
 | **Serveurs de secours** (`--secours`, `VOICECHAT_SECOURS`) | ✅ implémenté et vérifié (v0.6) — bascule annoncée à l'écran, jamais silencieuse |
 | **Mode dégradé** : phrases non synthétisées gardées et rejouables (`/rejoue`) | ✅ implémenté et vérifié (v0.6) |
+| **`/contexte`** : tokens utilisés d'après les chiffres du serveur, alerte à 80 % | ✅ implémenté et vérifié (v1.2) — contexte lu via `/props`, cf. §15 |
 | **`--dire` / `--dire-fichier`** : lire un texte sans le LLM | ✅ implémenté et vérifié (v1.1) — par son WAV dans la réserve, cf. §14.1 |
 | **`/cherche <mot>`** dans les conversations sauvées (accents compris) | ✅ implémenté et vérifié (v1.1) — 17 tests, cf. §14.2 |
 | **`/resume`** : compacter les vieux échanges au lieu de les perdre | ✅ implémenté et vérifié (v1.1) — 1,1× à 1,6× selon la densité du texte, cf. §14.3 |
@@ -186,6 +187,7 @@ de commande (l'option gagne). Aucune clé n'est obligatoire : llama.cpp ignore `
 | `VOICECHAT_TEMPERATURE` | `0.7` | température d'échantillonnage |
 | `VOICECHAT_MAX_TOKENS` | `0` | `0` = laisser le serveur décider |
 | `VOICECHAT_TIMEOUT` | `300` | délai de lecture du flux LLM, en secondes |
+| `VOICECHAT_N_CTX` | `0` | contexte en tokens ; **0 = demandé au serveur**, valeur = forcé (cf. §15) |
 | `VOICECHAT_DATA` | `~/.local/share/voicechat` | dossier des conversations sauvegardées |
 | `VOICECHAT_PROFILS` | `~/.config/voicechat/profils` | dossier des profils de prompt système |
 | `VOICECHAT_PROFIL` | *(vide)* | profil à charger au démarrage |
@@ -255,6 +257,7 @@ de commande (l'option gagne). Aucune clé n'est obligatoire : llama.cpp ignore `
 | `/micro on\|off` | bascule le mode mains libres |
 | `/rejoue` | réentend les phrases que la synthèse n'avait pas pu produire |
 | `/resume` | compacte les vieux échanges en un résumé (au lieu de les perdre) |
+| `/contexte` | tokens utilisés, place restante, dernier compte exact du serveur |
 | `/cache` | état de la réserve d'audio déjà synthétisé (`/cache vider`) |
 | `/stats` | latences (TTFT, débit en tokens, RTF TTS) |
 | `/debug` | bascule l'affichage des stats à chaque tour |
@@ -498,6 +501,7 @@ Trois scripts de vérification bout en bout pilotent le vrai CLI dans un pseudo-
 .venv/bin/python tests/verif_reprise.py       # bascule réseau, dans le vrai CLI
 .venv/bin/python tests/verif_sans_lourds.py   # toute la suite, sans torch/Kokoro/whisper
 .venv/bin/python tests/verif_confort.py       # -q, --dire, /cherche, /resume
+.venv/bin/python tests/verif_contexte.py      # contexte lu du serveur, élagage en tokens
 .venv/bin/python tests/verif_config.py        # précédence TOML/env/arguments
 ```
 
@@ -578,11 +582,33 @@ réseau, ni au GPU, ni au découpage du texte.
       tourne **sans torch, sans Kokoro, sans faster-whisper et sans GPU** : un contrôle
       dédié le prouve et échoue si quelqu'un ajoute un import lourd en haut d'un module.
 
-### v1.2 — deux voix
+### v1.2 — contexte juste, et cap sur le navigateur (en cours)
+
+**Ordre choisi volontairement** : le client web d'abord, Android ensuite. C'est ce qui
+change *où* on peut se servir du projet, et l'appli Android viendra s'y raccrocher
+presque gratuitement. Les deux voix, plus bas, attendront : une page web sera un bien
+meilleur endroit pour les montrer.
+
+- [x] **Le client demande son contexte au serveur** (`/props`) et compte en **tokens**
+      au lieu de compter les messages à l'aveugle. Mesuré : 25 messages pèsent
+      1 646 tokens, soit 5 % d'un contexte de 32 768 — l'ancienne limite en jetait
+      vingt fois trop tôt.
+- [x] **Alerte à 80 %** et commande **`/contexte`** : combien de tokens utilisés, place
+      restante, et le dernier compte exact rendu par le serveur.
+- [ ] **Interface web** (`voicechat --web`) : une page, du SSE pour le texte, l'audio
+      synthétisé par le serveur, sans framework ni étape de build.
+- [ ] **`tailscale serve`** : HTTPS sur le tailnet. C'est ce qui rendra le micro du
+      navigateur utilisable et la page installable sur le téléphone — les trois
+      problèmes (TLS, PWA, accès restreint) réglés d'un coup.
+- [ ] **Service STT distant** (`--serveur-stt`), symétrique du serveur TTS : le téléphone
+      envoie l'**audio**, le poste GPU renvoie le **texte**. Sans ça, un client léger
+      doit embarquer Whisper.
+
+### v1.3 — deux voix (déplacé, assumé)
 
 Le « waouh » pour le moins d'effort : la plomberie existe déjà (mélange de voix pondéré,
-voix portée par le profil, réserve d'audio, serveur TTS). Il ne reste que le prompt et
-l'ordonnancement.
+voix portée par le profil, réserve d'audio, serveur TTS). Reporté après le web, où ça
+se montrera bien mieux que dans une console.
 
 - [ ] **Mode dialogue** : deux voix alternées — question/réponse, ou deux personas qui
       se relancent. Chaque voix garde son profil (voix, vitesse, prompt, modèle).
@@ -590,20 +616,6 @@ l'ordonnancement.
       déjà chaque phrase en WAV, il suffit de les recoller dans l'ordre.
 - [ ] **Voix automatique selon la langue** : Kokoro couvre 8 langues, mais `lang` est figé
       à `f` ; quand le modèle répond en anglais, c'est la voix française qui le lit.
-
-### v1.3 — l'assistant dans le navigateur, et dans la poche
-
-Le serveur TTS de la v1.0 parle déjà HTTP : cette version rend le reste du service
-accessible, et fait entrer le téléphone dans la boucle.
-
-- [ ] **Interface web** (chat + lecture audio) servie par `voicechat --web` : on ouvre une
-      page, on tape, on entend. Rayon d'action immédiat depuis n'importe quelle machine
-      du tailnet.
-- [ ] **Service STT distant** (`--serveur-stt`), symétrique du serveur TTS : le téléphone
-      envoie l'**audio**, le poste GPU renvoie le **texte**. Sans ça, un client léger doit
-      embarquer Whisper — ce qui est justement ce qu'on veut éviter.
-- [ ] **Installable depuis le navigateur** (PWA) : utilisable sur le téléphone sans store,
-      et sans rien compiler.
 
 ### v2.0 — l'assistant qui agit
 
@@ -2266,6 +2278,130 @@ $ .venv/bin/python tests/verif_confort.py
 
 ---
 
-## 15. Licence
+## 15. Contexte juste (v1.2)
+
+### 15.1 Le défaut : on comptait les messages à l'aveugle
+
+Question posée : « est-ce qu'un contexte plus gros aiderait ? ». Réponse mesurée avant
+de toucher au serveur — une conversation **pleine** (25 messages, exactement l'ancienne
+limite du client) :
+
+```
+messages envoyes : 25   (systeme + 12 echanges)
+caracteres totaux : 6468
+tokens de prompt  : 1646
+place disponible  : 32768 par slot
+=> utilisation     : 5.0 % du contexte
+=> marge            : environ 19.9 conversations de cette taille
+```
+
+**5 %.** Le client jetait des messages vingt fois trop tôt, pendant que 95 % du contexte
+restait libre. Le frein n'était donc pas le modèle : c'était une limite de **24 messages**
+codée en dur, sans rapport avec la taille réelle.
+
+Au passage, un doute levé par la mesure : le serveur tourne avec **4 slots parallèles**,
+et on pouvait craindre que le contexte soit divisé par quatre. `GET /slots` montre que
+chaque slot annonce `n_ctx: 32768` — une conversation dispose donc de tout le contexte.
+
+### 15.2 Ce qui remplace la limite en messages
+
+**Le client demande au serveur sa taille de contexte** (`/props` → `n_ctx`) et compte en
+**tokens**. Pour ne pas estimer à l'aveugle, il s'ancre sur les chiffres du serveur :
+
+* le serveur rend à chaque tour un compte **exact** (`usage.prompt_tokens`) pour la liste
+  qu'on vient de lui envoyer ;
+* on retient ce couple (tokens, nombre de messages), et au tour suivant on n'estime que
+  **ce qui a été ajouté depuis** — deux messages, donc une erreur minuscule ;
+* l'estimation en caractères (~3,5 par token) ne sert que de repli : premier tour, ou
+  après un élagage.
+
+Le budget d'envoi est fixé à **80 % du contexte** : les 20 % restants sont pour la
+réponse, dont on ignore la longueur avant de l'avoir reçue. Un prompt qui remplit
+exactement le contexte se fait tronquer ou refuser — au pire moment, après avoir payé
+tout le calcul.
+
+Quand il faut retirer, on retire par **échange complet** (question + réponse) : un
+historique qui commence sur une réponse orpheline est déroutant. Et l'élagage est
+**annoncé**, comme tout le reste :
+
+```
+[contexte] 2 message(s) ancien(s) ne sont plus envoyés (limite : 120 tokens).
+           /resume pour les compacter en un résumé, au lieu de les perdre.
+```
+
+### 15.3 `/contexte`
+
+```
+vous › /contexte
+contexte : 175 / 32768 tokens (0.5%)
+           7 message(s) dans l'historique
+           dernier compte exact du serveur : 154 tokens pour 6 message(s)
+           budget d'envoi : 26214 tokens (80 % du contexte)
+           → de la place : environ 148 fois la conversation actuelle
+```
+
+La ligne « dernier compte exact » n'est pas décorative : elle montre que les chiffres ne
+sont pas devinés. Et une alerte apparaît d'elle-même à 80 % :
+
+```
+[contexte] 130 / 150 tokens (87%) — /resume pour compacter avant que ça déborde
+```
+
+### 15.4 Faut-il monter le contexte du serveur ?
+
+Mesuré : **pas pour l'instant**. Ce que coûterait une hausse, en revanche :
+
+* le cache KV est facturé **par slot** (4 ici, déjà dimensionnés à 32 768 chacun). Doubler
+  le contexte double cette mémoire ;
+* si le cache KV déborde de la VRAM vers la RAM, on **gagne du contexte et on perd des
+  tok/s** — le piège classique ;
+* le coût ne se voit pas au repos : c'est la reprise de contexte après un cache de prompt
+  perdu qui devient lente.
+
+Deux leviers, dans cet ordre : d'abord `--parallel` (4 slots pour un utilisateur seul,
+c'est trois caches KV qui dorment), ensuite le contexte — et seulement quand une mesure
+le réclame. Maintenant que le client lit la valeur du serveur, **le jour où tu la montes,
+il suivra sans qu'on touche à une ligne**.
+
+### 15.5 Vérification
+
+```
+$ .venv/bin/python tests/verif_contexte.py
+--- A. contexte réel du serveur, et ancrage sur ses chiffres ---
+  | Contexte : 32768 tokens
+  | contexte : 175 / 32768 tokens (0.5%)
+  | dernier compte exact du serveur : 154 tokens pour 6 message(s)
+  | budget d'envoi : 26214 tokens (80 % du contexte)
+
+--- B. contexte forcé minuscule : l'élagage en vrai ---
+  | contexte forcé annoncé : True
+  | [contexte] 130 / 150 tokens (87%) — /resume pour compacter avant que ça déborde
+  | [contexte] 2 message(s) ancien(s) ne sont plus envoyés (limite : 120 tokens).
+
+=== contrôles ===
+  OK  le serveur annonce son contexte et le client s'ancre dessus
+  OK  l'estimation reste cohérente avec le texte présent
+  OK  l'élagage se déclenche et s'annonce
+  OK  le programme répond encore après avoir élagué
+```
+
+La partie B force `VOICECHAT_N_CTX=150` : c'est le seul moyen d'éprouver l'élagage sans
+tenir une conversation de 26 000 tokens. Le mécanisme est celui du vrai cas, seule la
+taille change.
+
+`tests/test_contexte.py` (25 tests) couvre le reste hors ligne : ancrage, garde-fou quand
+des messages ont été retirés (un ancrage périmé doit être ignoré), élagage par paires,
+jamais d'historique vidé, avertissement émis une seule fois, et le cas mesuré — 25
+messages doivent rester sous 10 % du contexte.
+
+*Note de méthode* : les trois premières exécutions de ce script ont échoué, et c'était
+**mon script**, pas le code. Il additionnait les chiffres de la ligne `175 / 32768` en un
+seul nombre ; il cherchait le compte du serveur dans la mauvaise sortie ; et il donnait un
+budget de 700 tokens à des réponses d'une phrase, donc rien ne débordait jamais. Trois
+fois la même leçon : un contrôle qui ne peut pas échouer ne prouve rien.
+
+---
+
+## 16. Licence
 
 MIT — voir le fichier `LICENSE`. Faire ce qu'on veut, sans garantie.

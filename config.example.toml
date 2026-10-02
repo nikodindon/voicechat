@@ -39,6 +39,11 @@ temperature = 0.7
 max_tokens = 0
 timeout = 300.0
 
+# Contexte, en tokens. 0 = le client le demande au serveur (/props) et compte en tokens
+# d'après ses chiffres. Une valeur force le budget : utile si le serveur ne répond pas
+# à /props, ou pour éprouver l'élagage avec un petit contexte en développement.
+n_ctx = 0
+
 # --- Réglages par modèle -----------------------------------------------------
 # Appliqués quand on parle à CE modèle. La clé est soit le nom court, soit le
 # chemin complet renvoyé par le serveur.

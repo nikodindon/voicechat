@@ -160,6 +160,45 @@ def list_models(base_url: str, api_key: str = "", timeout: float = 10.0) -> list
     return [m.get("id", "") for m in items if isinstance(m, dict)]
 
 
+def contexte_du_serveur(base_url: str, api_key: str = "", timeout: float = 10.0) -> int:
+    """Taille du contexte annoncée par le serveur, en tokens. 0 si inconnue.
+
+    llama.cpp expose ``/props``, qui donne ``n_ctx``. Vérifié sur le serveur du projet
+    (4 slots parallèles) : chaque slot annonce bien 32768, donc une conversation
+    dispose de tout le contexte — ce n'est pas divisé par le nombre de slots.
+
+    Cette information manquait au client, qui comptait les messages **à l'aveugle** :
+    mesuré, 25 messages (l'ancienne limite) ne pesaient que 1 646 tokens, soit 5 % d'un
+    contexte de 32768. Autrement dit, on jetait des messages vingt fois trop tôt.
+
+    Aucune exception ne sort d'ici : un serveur qui ne connaît pas ``/props`` (un autre
+    moteur OpenAI-compatible, par exemple) laisse simplement la valeur à 0, et le client
+    retombe sur son ancien comportement.
+    """
+    # /props vit à la racine du serveur, pas sous /v1.
+    racine = base_url.rstrip("/")
+    if racine.endswith("/v1"):
+        racine = racine[: -len("/v1")]
+    try:
+        req = urllib.request.Request(
+            f"{racine}/props", headers=_headers(api_key), method="GET"
+        )
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            donnees = json.loads(resp.read().decode("utf-8", "replace"))
+    except Exception:
+        return 0  # information facultative : jamais une raison d'échouer
+
+    if not isinstance(donnees, dict):
+        return 0
+    defauts = donnees.get("default_generation_settings")
+    if isinstance(defauts, dict):
+        n_ctx = defauts.get("n_ctx")
+        if isinstance(n_ctx, int) and n_ctx > 0:
+            return n_ctx
+    n_ctx = donnees.get("n_ctx")
+    return n_ctx if isinstance(n_ctx, int) and n_ctx > 0 else 0
+
+
 def premier_serveur(
     base_url: str | Sequence[str],
     api_key: str = "",
