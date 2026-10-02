@@ -549,6 +549,12 @@ def test_la_page_offre_les_mains_libres():
     assert "seuilMaxi" in page
     # Aucun chemin de transcription ne peut laisser la page coincée sur « transcrit ».
     assert "finally" in page and 'if (etatVad === "transcrit") finDeTour();' in page
+    # Le mot de réveil : un **vrai** mot (mesuré : un mot inventé, Whisper l'écrit n'importe
+    # comment), cherché au début de ce qui est entendu.
+    assert 'id="reveil"' in page
+    assert 'const REVEIL_DEFAUT = "ordinateur"' in page
+    assert "sansLeReveil" in page
+    assert "function normaliser(" in page
 
 
 def test_port_zero_du_serveur_web_va_jusqu_a_l_os(monkeypatch):

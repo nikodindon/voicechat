@@ -50,6 +50,7 @@ sur la machine avec laquelle on parle. On ne dépend donc jamais d'un service TT
 | **Micro dans la page** (parler au lieu de taper) | ✅ implémenté et vérifié (v1.4) — 13 contrôles, webm/opus d'un navigateur, transcription pendant la réponse, cf. §16.6 |
 | **Mode dialogue à deux voix** (`/dialogue alice bob <sujet>`) | ✅ implémenté et vérifié (v1.5) — 7 contrôles, voix relevée à chaque synthèse, cf. §18 |
 | **Mains libres dans la page** (∞ : arrêt sur silence, envoi seul, barge-in) | ✅ implémenté et vérifié (v1.6) — 12 contrôles dans un vrai Chromium, **et concluant sur un vrai téléphone** (cf. §19) |
+| **Mot de réveil** (🔑 : n'obéir qu'après « ordinateur … ») | ✅ implémenté et vérifié (v1.7) — 16 contrôles, dont « sans le mot, rien ne part », cf. §19.5 |
 | **`--dire` / `--dire-fichier`** : lire un texte sans le LLM | ✅ implémenté et vérifié (v1.1) — par son WAV dans la réserve, cf. §14.1 |
 | **`/cherche <mot>`** dans les conversations sauvées (accents compris) | ✅ implémenté et vérifié (v1.1) — 17 tests, cf. §14.2 |
 | **`/resume`** : compacter les vieux échanges au lieu de les perdre | ✅ implémenté et vérifié (v1.1) — 1,1× à 1,6× selon la densité du texte, cf. §14.3 |
@@ -677,7 +678,9 @@ débloquées ailleurs, dans la page, où le micro n'est pas celui de PortAudio :
 
 - la **dictée continue** (parler pour écrire, sans le LLM) — ✅ **faite dans la page** en v1.6, où le micro n'est pas celui de PortAudio (§19) ;
 - le **barge-in** (interrompre l'assistant en parlant, plutôt qu'avec `Ctrl+C`) — ✅ **fait dans la page** en v1.6 ;
-- le **mot de réveil** (« hey … ») qui rendrait le mode mains libres vraiment utilisable — reste à faire, la détection est en place.
+- le **mot de réveil** — ✅ **fait dans la page** en v1.7. Mesure qui a décidé du design : le
+  mot doit être un **vrai mot**, Whisper écrivant les mots inventés n'importe comment
+  (« Voicechat » → « Voici ça », §19.5).
 
 `tests/bench_capture.py` est prêt pour s'y attaquer : il compare notre capture à `parec`
 par corrélation. La première étape n'est pas de corriger, c'est de comprendre.
@@ -3109,6 +3112,7 @@ Trois façons de s'en servir, deux boutons :
 |---|---|
 | 🎤 (v1.4) | un appui commence, un appui arrête. Le texte arrive dans le champ, on le relit avant d'envoyer. |
 | 🎤 + ∞ | **mains libres** : un appui, on parle. Ça s'arrête tout seul après un silence, le texte part sans être relu, la réponse se joue, l'écoute reprend. Et on recommence. |
+| 🎤 + ∞ + 🔑 | **mot de réveil** : la page n'obéit que si on l'appelle (« ordinateur, quel temps… »). Sans le mot, il ne se passe rien — c'est le mode qu'on laisse ouvert dans une pièce où il y a du monde. |
 | pendant la réponse | **barge-in** : on parle par-dessus, la réponse se tait et c'est nous qu'on écoute. |
 
 Le micro reste ouvert pendant toute la session mains libres — c'est ce qui permet le
@@ -3251,11 +3255,83 @@ Le banc n'en a montré que la mécanique, et un « ça marche bien » ne dit pas
 suffit quand la réponse sort fort du haut-parleur. Si l'assistant s'interrompt tout seul, le
 premier bouton à tourner est `margeBargeIn` (seuil × 3 pendant la réponse).
 
-### 19.5 Ce qui reste
+### 19.5 Le mot de réveil
 
-Le **mot de réveil** (« hey … ») : la détection est en place, il faudrait comparer ce qui est
-entendu à un mot attendu et n'envoyer au modèle que dans ce cas. Et la même chose dans la
-console, qui attend toujours que le bruit de la v0.4 soit compris.
+En mains libres, la page répond à **tout** ce qu'elle entend. C'est ce qu'on veut quand on est
+seul, et exactement l'inverse avec une télévision allumée ou d'autres personnes dans la
+pièce. Le mot de réveil (🔑) est ce qui décide à qui l'assistant répond : sans lui, rien ne
+part.
+
+**Le mot doit être un vrai mot — et ce n'est pas un choix de goût, c'est une mesure.** Le
+premier essai utilisait « voicechat », évidemment. Whisper l'a écrit de quatre façons pour
+quatre phrases :
+
+```
+dit     : « Voicechat, quel temps fera-t-il demain à Lyon ? »
+entendu : « Voie ces chats, qu'elle t'en fera-t-il demain à Lyon ? »
+dit     : « Ok voicechat, mets un minuteur de cinq minutes. »
+entendu : « Aux qui voient ses chats, mais un minuteur de cinq minutes. »
+dit     : « Hé voicechat, raconte-moi une histoire courte. »
+entendu : « Et voici chat, raconte-moi une histoire courte. »
+dit     : « Voicechat. »
+entendu : « Voici ça. »
+```
+
+Aucune variante ne correspond : le mot de réveil tel qu'il était conçu n'aurait **jamais** pu
+se déclencher. Un mot réel, lui, passe sans faute — mesuré sur les six candidats :
+
+| mot | ce que Whisper entend |
+|---|---|
+| `ordinateur` | « Ordinateur, quel temps fera-t-il demain à Lyon ? » ✅ |
+| `assistant` | « Assistant qu'elle t'en fera-t-il demain à Lyon. » ✅ |
+| `machine` | « Machine, quel temps sera-t-il demain à Lyon ? » ✅ |
+| `allô` / `écoute` / `bonjour` | ✅ aussi — mais trop courants pour ne pas se déclencher tout seuls |
+
+Le défaut est donc **`ordinateur`** : le plus distinctif de ceux qui passent. Pour en changer,
+une fois : `?reveil=assistant` dans l'adresse (c'est retenu). Les interjections d'appel sont
+sautées sans rien coûter — « hé ordinateur… », « ok ordinateur… » fonctionnent aussi.
+
+Deux choix viennent de ce qui peut mal tourner :
+
+* Le mot est cherché **au début** de ce qui est entendu, pas n'importe où. L'assistant
+  prononce parfois ce mot lui-même, et avec le barge-in le micro reste ouvert pendant sa
+  réponse : cherché n'importe où, il se déclencherait tout seul. Il sert donc **aussi** de
+  garde-fou au barge-in — on ne l'interrompt plus par accident, il faut le rappeler.
+* Quand le mot manque, la page **le dit** (« entendu sans le mot de réveil — je continue
+  d'écouter »). Sans ce message, l'assistant silencieux ressemblerait à une panne.
+
+**La limite, dite franchement** : le mot est reconnu **après transcription**, donc l'audio de
+chaque phrase entendue part quand même au serveur et Whisper la transcrit. Un vrai moteur de
+mot de réveil (Porcupine, openWakeWord) tournerait **en local** et n'enverrait rien — mais il
+faudrait embarquer un modèle, et la page n'a aucune dépendance (un test le vérifie : elle ne
+doit rien charger depuis Internet). Le coût est acceptable ici : Whisper tourne à RTF 0,16 sur
+le poste GPU, et le micro ne s'ouvre que quand quelqu'un parle.
+
+### 19.6 Vérification du mot de réveil
+
+Les deux mêmes phrases, l'une sans le mot et l'autre avec :
+
+```
+[7/7] mot de réveil : la même phrase, avec et sans le mot
+      réveil activé, messages déjà envoyés : 2
+      phrase SANS le mot → 2 message(s) envoyé(s)
+      ce que la page a affiché : « entendu sans le mot de réveil — je continue d'écouter »
+      phrase AVEC le mot → « quel temps fera-t-il demain à Lyon? »
+
+  OK  sans le mot de réveil, rien n'est envoyé
+  OK  la page dit pourquoi elle n'a rien envoyé
+  OK  avec le mot de réveil, le message part
+  OK  le mot de réveil n'est pas transmis au modèle
+```
+
+Deux choses y sont éprouvées, et la première compte plus que la seconde : que **rien** ne
+parte quand le mot manque, et que le mot soit **retiré** de ce qui part (le modèle n'a pas à
+recevoir « ordinateur, quel temps… », il reçoit la question).
+
+### 19.7 Ce qui reste
+
+La même chose dans la **console**, qui attend toujours que le bruit de la v0.4 soit compris —
+et là il n'y a pas de porte de sortie : la console parle bien plus fort que la page.
 
 ---
 

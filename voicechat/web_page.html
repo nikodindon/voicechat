@@ -57,6 +57,8 @@
   textarea:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
   #mains { padding: .6rem .6rem; font-size: 1rem; line-height: 1; color: var(--faible); }
   #mains.actif { background: #24384a; border-color: var(--accent); color: var(--accent); }
+  #reveil { padding: .6rem .6rem; font-size: 1rem; line-height: 1; color: var(--faible); }
+  #reveil.actif { background: #33284a; border-color: #b58cf0; color: #d9c2ff; }
   /* La jauge : le niveau du micro, et le seuil de détection en rouge. Sans elle, régler le
      seuil sur un téléphone serait à l'aveugle — c'est l'outil de mise au point. */
   .jauge {
@@ -91,6 +93,7 @@
 
 <footer>
   <div class="saisie">
+    <button id="reveil" title="Mot de réveil" aria-pressed="false" hidden>🔑</button>
     <button id="mains" title="Mains libres : parler sans toucher l'écran" aria-pressed="false">∞</button>
     <button id="micro" title="Parler — le texte entendu arrive dans le champ" hidden>🎤</button>
     <textarea id="q" rows="1" placeholder="Écrivez, puis Entrée — Maj+Entrée pour un saut de ligne"></textarea>
@@ -113,6 +116,7 @@ const boutonNeuf = document.getElementById("neuf");
 const zoneModel = document.getElementById("modele");
 const aide = document.getElementById("aide");
 const boutonMicro = document.getElementById("micro");
+const boutonReveil = document.getElementById("reveil");
 
 let source = null;        // le flux SSE en cours
 let fileAudio = [];       // phrases à dire, dans l'ordre
@@ -255,6 +259,96 @@ function terminer() {
     attendreFinAudio().then(armerEcoute);
   }
 }
+
+// ------------------------------------------------------------------ le réveil
+// En mains libres, la page répond à tout ce qu'elle entend. C'est ce qu'on veut quand on
+// est seul, et exactement l'inverse avec une télévision allumée ou d'autres personnes dans
+// la pièce. Le mot de réveil est ce qui décide à qui l'assistant répond.
+//
+// **Le mot doit être un vrai mot.** Ce n'est pas une préférence, c'est une mesure : Whisper
+// écrit les mots inventés n'importe comment. « Voicechat » est ressorti « Voie ces chats »,
+// « Aux qui voient ses chats », « Et voici chat », « Voici ça » — quatre graphies pour la
+// même phrase, aucune ne correspondant au mot. Un mot réel, lui, passe sans faute :
+//
+//     « Ordinateur, quel temps fera-t-il demain à Lyon ? » → exact
+//     « Assistant, … » « Machine, … » « Allô, … » « Bonjour, … »   → exacts aussi
+//
+// Le mot est donc réglable (`?reveil=…`), et le défaut est le plus distinctif d'entre eux :
+// **ordinateur**. « Écoute » ou « bonjour » marchent aussi, mais ils sont si courants qu'ils
+// se déclencheraient tout seuls.
+//
+// Deux autres choix viennent de ce qui peut mal tourner :
+//
+// * Il est cherché **au début** de ce qui est entendu, pas n'importe où. L'assistant
+//   prononce lui-même ce mot quand on le lui demande, et avec le barge-in le micro reste
+//   ouvert pendant sa réponse : un mot cherché n'importe où se déclencherait tout seul. Il
+//   sert donc aussi de garde-fou au barge-in — on ne l'interrompt pas par accident, il faut
+//   le rappeler.
+// * Les interjections d'appel sont sautées (« hé ordinateur », « ok ordinateur »), parce que
+//   c'est ainsi qu'on parle à une machine, et qu'elles ne coûtent rien à reconnaître.
+const REVEIL_DEFAUT = "ordinateur";
+const REVEIL_VARIANTES = ["ordinateur", "ordinateurs", "ordi"];
+const REVEIL_APPELS = ["ok", "hey", "he", "salut", "dis", "allo", "bonjour"];
+
+let motReveil = REVEIL_DEFAUT;
+let exigerReveil = false;
+
+function normaliser(texte) {
+  return texte
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/[^a-z0-9 ]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+// Rend le texte débarrassé du mot de réveil, ou null s'il n'y est pas.
+//
+// On travaille sur les mots du texte **original** pour ne pas perdre les accents ni les
+// majuscules de la question : seul le repérage se fait sur une forme normalisée.
+function sansLeReveil(texte) {
+  const mots = texte.trim().split(/\s+/);
+  let i = 0;
+  while (i < mots.length && REVEIL_APPELS.includes(normaliser(mots[i]))) i++;
+  const variantes = REVEIL_VARIANTES.slice().sort((a, b) => b.length - a.length);
+  for (const variante of variantes) {
+    const combien = variante.split(" ").length;
+    if (normaliser(mots.slice(i, i + combien).join(" ")) === variante) {
+      return mots.slice(i + combien).join(" ").replace(/^[,;:.!?\s—-]+/, "").trim();
+    }
+  }
+  return null;
+}
+
+function chargerMotReveil() {
+  try {
+    const demande = new URLSearchParams(location.search).get("reveil");
+    if (demande !== null) {
+      if (demande.trim()) localStorage.setItem("voicechat-mot-reveil", demande.trim());
+      else localStorage.removeItem("voicechat-mot-reveil");
+    }
+    return localStorage.getItem("voicechat-mot-reveil") || REVEIL_DEFAUT;
+  } catch (e) {
+    return REVEIL_DEFAUT;
+  }
+}
+
+function basculerReveil(actif) {
+  exigerReveil = actif;
+  boutonReveil.classList.toggle("actif", actif);
+  boutonReveil.setAttribute("aria-pressed", actif ? "true" : "false");
+  boutonReveil.title = actif
+    ? "Mot de réveil actif : « " + motReveil + " ». Clic pour l'ignorer."
+    : "Mot de réveil désactivé. Clic pour n'obéir qu'à « " + motReveil + " ».";
+  try { localStorage.setItem("voicechat-reveil", actif ? "1" : "0"); } catch (e) {}
+  aide.style.color = "";
+  aide.textContent = actif
+    ? "mot de réveil : dis « " + motReveil + " … » pour me parler"
+    : "mot de réveil désactivé — je réponds à tout ce que j'entends";
+}
+
+boutonReveil.onclick = () => basculerReveil(!exigerReveil);
 
 // -------------------------------------------------------------------- micro
 // Parler plutôt que taper. Le navigateur enregistre, le serveur transcrit (Whisper tourne
@@ -506,10 +600,30 @@ async function transcrire(blob) {
       return;
     }
     const infos = await reponse.json();
-    const texte = (infos.texte || "").trim();
+    let texte = (infos.texte || "").trim();
     if (!texte) {
       panne("Rien entendu — réessayer en parlant plus près du micro.");
       return;
+    }
+    // Le mot de réveil ne s'applique qu'en mains libres : hors mains libres, on a
+    // explicitement appuyé sur le bouton — la question n'est pas « est-ce qu'il m'écoute »
+    // mais « qu'est-ce qu'il a entendu ».
+    if (mainsLibres && exigerReveil) {
+      const question = sansLeReveil(texte);
+      if (question === null) {
+        // Sans le mot de réveil, on n'envoie **rien** : c'est tout l'intérêt du mode. Et on
+        // le dit — sinon ça ressemble à une panne, et on ne comprend pas pourquoi
+        // l'assistant ne répond pas.
+        aide.style.color = "";
+        aide.textContent = "entendu sans le mot de réveil — je continue d'écouter";
+        return;  // le `finally` remet l'état tout seul
+      }
+      if (!question) {
+        aide.style.color = "";
+        aide.textContent = "oui ? (mot de réveil entendu, mais rien à répondre)";
+        return;
+      }
+      texte = question;
     }
     if (mainsLibres) {
       // En mains libres, on envoie sans relire : c'est tout l'intérêt du mode. Le texte
@@ -610,6 +724,12 @@ boutonMicro.onclick = async () => {
 
 boutonMains.onclick = () => basculerMainsLibres(!mainsLibres);
 
+// Mot de réveil : le mot lui-même (localStorage, réglable par `?reveil=…`), puis le fait
+// qu'on l'exige ou non. Le mot est chargé **avant** le bouton pour que son infobulle soit
+// juste dès le départ.
+motReveil = chargerMotReveil();
+try { basculerReveil(localStorage.getItem("voicechat-reveil") === "1"); } catch (e) {}
+
 // Le mode se souvient d'une visite à l'autre : sur un téléphone, le régler à chaque fois
 // serait pénible. On ne le restaure que si `mediaDevices` existe, sinon on afficherait une
 // explication « il faut HTTPS » au chargement, avant même que l'utilisateur ait demandé.
@@ -646,7 +766,10 @@ fetch("etat").then((r) => r.json()).then((e) => {
   // Le bouton n'apparaît que si le serveur est capable de transcrire. Le cas « pas de
   // HTTPS » n'est **pas** filtré ici, exprès : cliquer dessus doit expliquer pourquoi,
   // ce qu'un bouton absent n'expliquerait pas.
-  if (e.transcription && e.transcription.disponible) boutonMicro.hidden = false;
+  if (e.transcription && e.transcription.disponible) {
+    boutonMicro.hidden = false;
+    boutonReveil.hidden = false;
+  }
 }).catch(() => {});
 zone.focus();
 </script>

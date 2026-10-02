@@ -44,6 +44,8 @@ from pathlib import Path
 PROJ = Path(__file__).resolve().parent.parent
 PY = str(PROJ / ".venv" / "bin" / "python")
 PHRASE = "Quel temps fera-t-il demain à Lyon ?"
+# La même phrase, précédée du mot de réveil. Deux WAV, donc : un sans, un avec.
+PHRASE_REVEIL = "Ordinateur, quel temps fera-t-il demain à Lyon ?"
 
 # Chromium complet : le « headless shell » de Playwright n'est pas toujours installé, et il
 # gère moins bien la capture audio.
@@ -68,23 +70,28 @@ sf.write(sys.argv[1], remonte.astype(np.float32), 48000, subtype="PCM_16")
 print(f"{signal.size / 24000:.2f} s de parole")
 """
 
-# Le micro de synthèse. `__parle()` joue la phrase une fois ; entre deux appels, le flux
-# contient du vrai silence (des zéros), ce qu'aucun périphérique factice ne sait faire.
+# Le micro de synthèse. `__parle("sans")` joue la phrase, `__parle("avec")` la même précédée
+# du mot de réveil. Entre deux appels, le flux contient du vrai silence (des zéros), ce
+# qu'aucun périphérique factice ne sait faire.
 MICRO_SYNTHETIQUE = """
 window.__journal = [];
 navigator.mediaDevices.getUserMedia = async () => {
   const ctx = new AudioContext();
   await ctx.resume();
-  const buffer = await ctx.decodeAudioData(
-    await (await fetch("/__micro.wav")).arrayBuffer()
-  );
+  const charger = async (url) =>
+    ctx.decodeAudioData(await (await fetch(url)).arrayBuffer());
+  const buffers = {
+    sans: await charger("/__micro.wav"),
+    avec: await charger("/__micro-reveil.wav"),
+  };
   const sortie = ctx.createMediaStreamDestination();
-  window.__parle = () => {
+  window.__parle = (lequel) => {
+    const nom = lequel || "sans";
     const source = ctx.createBufferSource();
-    source.buffer = buffer;
+    source.buffer = buffers[nom];
     source.connect(sortie);
     source.start();
-    window.__journal.push("parle");
+    window.__journal.push("parle:" + nom);
   };
   window.__journal.push("micro ouvert");
   return sortie.stream;
@@ -131,10 +138,10 @@ def chromium() -> str:
     raise SystemExit("aucun navigateur Chromium trouvé")
 
 
-def fabriquer_voix(chemin: Path) -> str:
+def fabriquer_voix(chemin: Path, phrase: str = PHRASE) -> str:
     """Fait dire la phrase à Kokoro, via le python du venv (playwright n'y est pas forcément)."""
     resultat = subprocess.run(
-        [PY, "-c", GENERER, str(chemin), PHRASE],
+        [PY, "-c", GENERER, str(chemin), phrase],
         cwd=PROJ, capture_output=True, text=True, timeout=300,
     )
     if resultat.returncode != 0:
@@ -230,11 +237,13 @@ def main() -> int:
 
     dossier = Path(tempfile.mkdtemp(prefix="vc-mains-libres-"))
     micro_wav = dossier / "phrase.wav"
+    micro_reveil = dossier / "phrase-reveil.wav"
     print("=" * 78)
     print("Mode mains libres : vrai navigateur, vrai serveur, parole en micro synthétique")
     print("=" * 78)
-    print("\n[1/6] fabrication du micro : Kokoro dit une phrase")
-    print(f"      {fabriquer_voix(micro_wav)}")
+    print("\n[1/6] fabrication du micro : Kokoro dit deux phrases")
+    print(f"      sans le mot de réveil : {fabriquer_voix(micro_wav, PHRASE)}")
+    print(f"      avec le mot de réveil : {fabriquer_voix(micro_reveil, PHRASE_REVEIL)}")
 
     print("[2/6] démarrage du serveur…")
     base, serveur, journal = demarrer_serveur()
@@ -255,6 +264,10 @@ def main() -> int:
             page.route(
                 "**/__micro.wav",
                 lambda route: route.fulfill(path=str(micro_wav), content_type="audio/wav"),
+            )
+            page.route(
+                "**/__micro-reveil.wav",
+                lambda route: route.fulfill(path=str(micro_reveil), content_type="audio/wav"),
             )
             page.add_init_script(MICRO_SYNTHETIQUE)
             page.goto(base + "/")
@@ -333,6 +346,35 @@ def main() -> int:
                 print(f"      deuxième message, toujours sans rien toucher : « {deuxieme[:60]} »")
             controles.append(("la boucle tourne : un deuxième tour part tout seul",
                               bool(deuxieme)))
+
+            # --- 7. le mot de réveil ----------------------------------------------
+            # La même phrase, avec et sans le mot. C'est le cœur du mode : sans le mot, il ne
+            # doit **rien** se passer — sinon l'assistant répond à la télévision.
+            print("\n[7/7] mot de réveil : la même phrase, avec et sans le mot")
+            page.click("#reveil")
+            avant = len(bulles_moi(page))
+            print(f"      réveil activé, messages déjà envoyés : {avant}")
+
+            page.evaluate("() => window.__parle('sans')")
+            vus: list[str] = []
+            fin = time.monotonic() + 14
+            while time.monotonic() < fin:
+                vus.append(aide(page))
+                time.sleep(0.4)
+            apres_sans = len(bulles_moi(page))
+            explique = any("mot de réveil" in texte for texte in vus)
+            print(f"      phrase SANS le mot → {apres_sans} message(s) envoyé(s)")
+            print(f"      ce que la page a affiché : « {vus[-1] if vus else ''} »")
+            controles.append(("sans le mot de réveil, rien n'est envoyé", apres_sans == avant))
+            controles.append(("la page dit pourquoi elle n'a rien envoyé", explique))
+
+            page.evaluate("() => window.__parle('avec')")
+            envoye_reveil = attendre_message(page, avant + 1, 60)
+            if envoye_reveil:
+                print(f"      phrase AVEC le mot → « {envoye_reveil} »")
+            controles.append(("avec le mot de réveil, le message part", bool(envoye_reveil)))
+            controles.append(("le mot de réveil n'est pas transmis au modèle",
+                              bool(envoye_reveil) and "ordinateur" not in envoye_reveil.lower()))
 
             etat_final = attendre_etat(page, ("ecoute", "parle", "transcrit"), 60)
             chronologie.append(etat_final)
